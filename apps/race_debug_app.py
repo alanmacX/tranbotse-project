@@ -148,7 +148,7 @@ HTML = """
     async function saveConfig(){ const body={line:{},vision:{},corner:{},gap:{},camera:{}}; body.camera.crop=[getVal("camera.crop.0"),getVal("camera.crop.1"),getVal("camera.crop.2"),getVal("camera.crop.3")]; for(const id of ids){ if(id==="live_max_sec"||id.startsWith("camera.crop"))continue; writeCfgValue(body,id,getVal(id)); } body.corner.mode=document.getElementById("corner.mode").value; await api("/api/config",body); log("CONFIG saved"); }
     async function analyze(){ await saveConfig(); const d=await api("/api/analyze",{image_path:document.getElementById("image_path").value}); document.getElementById("image").src="data:image/jpeg;base64,"+d.image; log(JSON.stringify(d.summary,null,2)); }
     async function deploy(){ await saveConfig(); const d=await api("/api/deploy",{ssh_target:document.getElementById("ssh_target").value}); log("DEPLOY OK: "+d.message); }
-    async function startProfile(profile){ await saveConfig(); const d=await api("/api/live/start",{profile,ssh_target:document.getElementById("ssh_target").value,max_sec:getVal("live_max_sec")}); log("START "+profile+": "+d.message); setTimeout(refreshLogs,800); }
+    async function startProfile(profile){ await saveConfig(); const d=await api("/api/live/start",{profile,ssh_target:document.getElementById("ssh_target").value,max_sec:getVal("live_max_sec")}); log("RUNNING "+profile+": "+d.message); setTimeout(refreshLogs,800); }
     async function stopRace(){ const d=await api("/api/live/stop",{ssh_target:document.getElementById("ssh_target").value}); log(d.message); }
     async function resetLegacyDefaults(){ const d=await api("/api/defaults/legacy",{}); log(d.message); await loadConfig(); }
     async function refreshLogs(){ const d=await (await fetch("/api/live/logs")).json(); if(d.logs&&d.logs.length){ document.getElementById("log").textContent=d.logs.join("\\n"); } }
@@ -227,6 +227,27 @@ def _track_process_logs(proc: subprocess.Popen) -> None:
     for stream_name in ("stdout", "stderr"):
         thread = threading.Thread(target=_read_process_stream, args=(proc, stream_name), daemon=True)
         thread.start()
+
+
+def _check_ssh_ready(ssh_target: str) -> None:
+    res = subprocess.run(
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=4",
+            ssh_target,
+            "echo transbot_ssh_ready",
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=7,
+    )
+    if res.returncode != 0 or "transbot_ssh_ready" not in res.stdout:
+        detail = (res.stderr or res.stdout or "ssh probe failed").strip()
+        raise RuntimeError(f"SSH CHECK FAILED for {ssh_target}: {detail}")
 
 
 def _apply_profile(profile: str) -> str:
@@ -407,11 +428,16 @@ class Handler(BaseHTTPRequestHandler):
     def _deploy(self, data: dict) -> dict:
         _write_config_file()
         ssh_target = _ssh_target(data)
+        with LOG_LOCK:
+            RUN_LOGS.clear()
+        _log_event(f"SSH CHECK: target={ssh_target}")
+        _check_ssh_ready(ssh_target)
         package = "transbot_race apps/race_runner.py configs/race_config.json requirements.txt"
         cmd = f"tar -czf - {package} | ssh {ssh_target} 'mkdir -p {REMOTE_ROOT} && tar -xzf - -C {REMOTE_ROOT}'"
         res = subprocess.run(cmd, cwd=ROOT, shell=True, text=True, capture_output=True, timeout=45)
         if res.returncode != 0:
             raise RuntimeError(res.stderr.strip() or res.stdout.strip() or "deploy failed")
+        _log_event(f"DEPLOYED: {ssh_target}:{REMOTE_ROOT}")
         return {"ok": True, "message": f"deployed integrated race code to {ssh_target}:{REMOTE_ROOT}"}
 
     def _start_live(self, data: dict) -> dict:
@@ -419,10 +445,11 @@ class Handler(BaseHTTPRequestHandler):
         max_sec = max(1.0, min(300.0, float(data.get("max_sec", 60))))
         profile_note = _apply_profile(str(data.get("profile", "final")))
         _write_config_file()
-        stop_live_processes(ssh_target)
         with LOG_LOCK:
             RUN_LOGS.clear()
-        _log_event(f"START: {profile_note}, max_sec={max_sec:.1f}, target={ssh_target}")
+        _log_event(f"SSH CHECK: target={ssh_target}")
+        _check_ssh_ready(ssh_target)
+        stop_live_processes(ssh_target)
         command = (
             f"cd {REMOTE_ROOT} && "
             f"python3 -u apps/race_runner.py --config configs/race_config.json --max-sec {max_sec:.1f}"
@@ -441,6 +468,7 @@ class Handler(BaseHTTPRequestHandler):
         with RUN_LOCK:
             RUN_PROCS.add(proc)
         _track_process_logs(proc)
+        _log_event(f"RUNNING: {profile_note}, max_sec={max_sec:.1f}, target={ssh_target}")
         return {"ok": True, "message": f"{profile_note}; runner on {ssh_target} for {max_sec:.1f}s"}
 
     def _stop_live(self, data: dict) -> dict:
