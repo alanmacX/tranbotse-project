@@ -19,10 +19,16 @@ New clean logic lives in:
 - `transbot_race/state_machine.py`: one owner for line follow, gap blind drive,
   timed turns, and line reacquisition.
 - `transbot_race/config.py`: typed configuration.
-- `apps/race_debug_app.py`: no-SSH debug frontend for saved images.
+- `apps/race_debug_app.py`: merged debug frontend for saved-image analysis plus
+  optional live deploy/start/stop/video controls.
 - `apps/race_runner.py`: integrated on-robot runner for camera + Transbot motion.
 - `tests/test_race_state_machine.py`: unit tests for straight line, left/right
   corners, dashed-line recovery, and thin-noise rejection.
+
+The known-good tuner in `apps/robot_tune_app.py` is treated as the preserved
+baseline. New race behavior should be integrated through `transbot_race/*`,
+`apps/race_debug_app.py`, and `apps/race_runner.py` so the proven straight-line
+workflow remains untouched.
 
 Run the no-SSH debug frontend:
 

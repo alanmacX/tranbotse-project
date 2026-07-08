@@ -29,6 +29,8 @@ The car has one active controller at a time:
 
 This priority prevents "left brain fights right brain" behavior. For example,
 corner detection cannot keep firing while a timed turn is already active.
+Live web controls call the same runner/state-machine path; the legacy tuning
+app remains a preserved baseline rather than a second race controller.
 
 ## Normal Line Following
 
@@ -55,6 +57,11 @@ Corner detection is now symmetric:
 The branch must cross the trigger line before it can start a timed maneuver.
 This makes the trigger point stable and avoids reacting to the first distant
 glimpse of a branch.
+
+Corner detection only decides "a corner is close enough and which side it is".
+The actual turn then runs as a timed maneuver with the configured speed and
+duration, so left/right handling is centralized in one state instead of being
+spread across web code and robot code.
 
 ## Dashed / Missing Line
 
@@ -103,4 +110,3 @@ Legacy baseline:
 
 The legacy app is preserved but should not be the place for new race logic.
 Use the package modules for new behavior and keep tests in `tests/`.
-
