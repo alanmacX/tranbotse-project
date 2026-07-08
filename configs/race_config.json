@@ -2,7 +2,12 @@
   "camera": {
     "frame_width": 640,
     "frame_height": 480,
-    "crop": [311, 336, 432, 398],
+    "crop": [
+      300,
+      265,
+      430,
+      455
+    ],
     "expand_left_px": 20,
     "expand_right_px": 140
   },
@@ -19,7 +24,7 @@
     "trigger_y_frac": 0.35
   },
   "line": {
-    "speed": 0.06,
+    "speed": 0.035,
     "kp": 0.24,
     "max_w": 0.24,
     "slow_on_error": 0.45,
@@ -31,7 +36,7 @@
     "confirm_frames": 2,
     "forward_sec": 1.2,
     "turn_w": 0.38,
-    "turn_sec": 2.55,
+    "turn_sec": 2.45,
     "right_turn_dir": -1.0,
     "left_turn_dir": 1.0,
     "reacquire_confirm_frames": 3,
@@ -46,4 +51,3 @@
     "search_w": 0.16
   }
 }
-

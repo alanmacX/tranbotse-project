@@ -9,7 +9,7 @@ class CameraConfig:
 
     frame_width: int = 640
     frame_height: int = 480
-    crop: tuple[int, int, int, int] = (311, 336, 432, 398)
+    crop: tuple[int, int, int, int] = (300, 265, 430, 455)
     expand_left_px: int = 20
     expand_right_px: int = 140
 
@@ -34,7 +34,7 @@ class VisionConfig:
 class LineControlConfig:
     """Line-following controller parameters."""
 
-    speed: float = 0.06
+    speed: float = 0.035
     kp: float = 0.24
     max_w: float = 0.24
     slow_on_error: float = 0.45

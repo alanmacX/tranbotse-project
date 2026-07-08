@@ -59,6 +59,12 @@ def make_bot(dry_run: bool):
     return Transbot()
 
 
+def stop_chassis(bot, count: int = 20, delay: float = 0.04) -> None:
+    for _ in range(count):
+        bot.set_car_motion(0.0, 0.0)
+        time.sleep(delay)
+
+
 def crop_frame(frame, cfg: RaceConfig):
     x0, y0, x1, y1 = cfg.camera.crop
     ex0 = max(0, x0 - cfg.camera.expand_left_px)
@@ -83,6 +89,7 @@ def run(args: argparse.Namespace) -> int:
     start = time.monotonic()
     last_log = 0.0
     try:
+        stop_chassis(bot, count=3, delay=0.03)
         while time.monotonic() - start < args.max_sec:
             ok, frame = cap.read()
             if not ok:
@@ -123,7 +130,7 @@ def run(args: argparse.Namespace) -> int:
                     break
             time.sleep(args.period)
     finally:
-        bot.set_car_motion(0.0, 0.0)
+        stop_chassis(bot)
         cap.release()
         if args.display:
             cv.destroyAllWindows()
@@ -145,4 +152,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
