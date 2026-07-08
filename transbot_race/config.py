@@ -4,6 +4,17 @@ from dataclasses import dataclass, field
 
 
 @dataclass(slots=True)
+class CameraConfig:
+    """Camera crop used by the race runner."""
+
+    frame_width: int = 640
+    frame_height: int = 480
+    crop: tuple[int, int, int, int] = (311, 336, 432, 398)
+    expand_left_px: int = 20
+    expand_right_px: int = 140
+
+
+@dataclass(slots=True)
 class VisionConfig:
     """Image preprocessing and scan-line feature extraction knobs."""
 
@@ -62,8 +73,8 @@ class GapConfig:
 class RaceConfig:
     """Single source of truth for the integrated course state machine."""
 
+    camera: CameraConfig = field(default_factory=CameraConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
     line: LineControlConfig = field(default_factory=LineControlConfig)
     corner: CornerConfig = field(default_factory=CornerConfig)
     gap: GapConfig = field(default_factory=GapConfig)
-

@@ -20,6 +20,7 @@ New clean logic lives in:
   timed turns, and line reacquisition.
 - `transbot_race/config.py`: typed configuration.
 - `apps/race_debug_app.py`: no-SSH debug frontend for saved images.
+- `apps/race_runner.py`: integrated on-robot runner for camera + Transbot motion.
 - `tests/test_race_state_machine.py`: unit tests for straight line, left/right
   corners, dashed-line recovery, and thin-noise rejection.
 
@@ -33,6 +34,19 @@ Open:
 
 ```text
 http://127.0.0.1:8776
+```
+
+Run the integrated controller on the robot, once SSH/live access is available
+and the code is copied to the robot:
+
+```bash
+python3 apps/race_runner.py --config configs/race_config.json --max-sec 60
+```
+
+For import/config smoke tests without touching motors:
+
+```bash
+python3 apps/race_runner.py --dry-run --max-sec 1
 ```
 
 ## Known Status
