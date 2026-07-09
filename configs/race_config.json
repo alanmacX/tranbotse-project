@@ -1,0 +1,53 @@
+{
+  "camera": {
+    "frame_width": 640,
+    "frame_height": 480,
+    "crop": [
+      336,
+      391,
+      429,
+      415
+    ],
+    "expand_left_px": 20,
+    "expand_right_px": 140
+  },
+  "vision": {
+    "percentile": 32,
+    "threshold_min": 25,
+    "threshold_max": 120,
+    "band_count": 5,
+    "active_col_ratio": 0.18,
+    "min_run_width_px": 10,
+    "min_run_area_px": 30,
+    "branch_width_ratio": 2.2,
+    "branch_min_crop_ratio": 0.22,
+    "trigger_y_frac": 0.25
+  },
+  "line": {
+    "speed": 0.06,
+    "kp": 0.24,
+    "max_w": 0.24,
+    "slow_on_error": 0.45,
+    "max_slowdown": 0.55,
+    "invert_turn": false
+  },
+  "corner": {
+    "mode": "auto",
+    "confirm_frames": 2,
+    "forward_sec": 5.0,
+    "turn_w": 0.38,
+    "turn_sec": 2.35,
+    "right_turn_dir": 1.0,
+    "left_turn_dir": 1.0,
+    "reacquire_confirm_frames": 3,
+    "reacquire_err_norm": 0.5
+  },
+  "gap": {
+    "enabled": true,
+    "missing_frames": 4,
+    "blind_sec": 1.2,
+    "blind_speed_factor": 0.7,
+    "blind_turn_factor": 0.35,
+    "search_w": 0.16
+  }
+}
