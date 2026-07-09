@@ -88,6 +88,7 @@ def run(args: argparse.Namespace) -> int:
 
     start = time.monotonic()
     last_log = 0.0
+    corner_started = False
     try:
         stop_chassis(bot, count=3, delay=0.03)
         while time.monotonic() - start < args.max_sec:
@@ -100,6 +101,23 @@ def run(args: argparse.Namespace) -> int:
             mask = preprocess_blackline(crop, cfg.vision)
             features = scan_line_features(mask, cfg.vision, crop_center=track_center)
             command = sm.step(features, now=time.monotonic())
+            if command.reason in {"corner_forward", "turn_start", "timed_turn", "reacquire_turn"}:
+                corner_started = True
+            if args.stop_after_corner and corner_started and sm.last_event == "reacquired":
+                stop_chassis(bot, count=8, delay=0.035)
+                print(
+                    json.dumps(
+                        {
+                            "t": round(time.monotonic() - start, 2),
+                            "state": sm.state.value,
+                            "reason": "corner_done_stop",
+                            "found": features.found,
+                            "err": round(features.err_norm, 3),
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                break
             bot.set_car_motion(command.v, command.w)
 
             now = time.monotonic()
@@ -147,6 +165,7 @@ def main() -> int:
     parser.add_argument("--light", type=int, default=80)
     parser.add_argument("--display", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--stop-after-corner", action="store_true")
     return run(parser.parse_args())
 
 

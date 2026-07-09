@@ -396,28 +396,13 @@ def _check_remote_runner(ssh_target: str) -> None:
         raise RuntimeError(f"DEPLOY REQUIRED on {ssh_target}: {detail}")
 
 
-def _push_config_to_remote(ssh_target: str) -> None:
-    remote_config_dir = f"{REMOTE_ROOT}/configs"
-    mkdir = subprocess.run(
-        ["ssh", ssh_target, f"mkdir -p {remote_config_dir}"],
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-        timeout=8,
-    )
-    if mkdir.returncode != 0:
-        raise RuntimeError((mkdir.stderr or mkdir.stdout or "remote config mkdir failed").strip())
-    local_config = ROOT / "configs/race_config.json"
-    copy = subprocess.run(
-        ["scp", str(local_config), f"{ssh_target}:{remote_config_dir}/race_config.json"],
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-        timeout=12,
-    )
-    if copy.returncode != 0:
-        raise RuntimeError((copy.stderr or copy.stdout or "remote config copy failed").strip())
-    _log_event(f"CONFIG SYNCED: {ssh_target}:{remote_config_dir}/race_config.json")
+def _sync_live_files(ssh_target: str) -> None:
+    package = "transbot_race apps/race_runner.py configs/race_config.json"
+    cmd = f"tar -czf - {package} | ssh {ssh_target} 'mkdir -p {REMOTE_ROOT} && tar -xzf - -C {REMOTE_ROOT}'"
+    res = subprocess.run(cmd, cwd=ROOT, shell=True, text=True, capture_output=True, timeout=45)
+    if res.returncode != 0:
+        raise RuntimeError(res.stderr.strip() or res.stdout.strip() or "live code sync failed")
+    _log_event(f"CODE SYNCED: runner/state/config -> {ssh_target}:{REMOTE_ROOT}")
 
 
 def _apply_profile(profile: str) -> str:
@@ -688,29 +673,27 @@ class Handler(BaseHTTPRequestHandler):
             RUN_LOGS.clear()
         _log_event(f"SSH CHECK: target={ssh_target}")
         _check_ssh_ready(ssh_target)
-        package = "transbot_race apps/race_runner.py configs/race_config.json requirements.txt"
-        cmd = f"tar -czf - {package} | ssh {ssh_target} 'mkdir -p {REMOTE_ROOT} && tar -xzf - -C {REMOTE_ROOT}'"
-        res = subprocess.run(cmd, cwd=ROOT, shell=True, text=True, capture_output=True, timeout=45)
-        if res.returncode != 0:
-            raise RuntimeError(res.stderr.strip() or res.stdout.strip() or "deploy failed")
+        _sync_live_files(ssh_target)
         _log_event(f"DEPLOYED: {ssh_target}:{REMOTE_ROOT}")
         return {"ok": True, "message": f"deployed integrated race code to {ssh_target}:{REMOTE_ROOT}"}
 
     def _start_live(self, data: dict) -> dict:
         ssh_target = _ssh_target(data)
         max_sec = max(1.0, min(300.0, float(data.get("max_sec", 60))))
+        profile = str(data.get("profile", "final"))
         with LOG_LOCK:
             RUN_LOGS.clear()
         _log_event(f"SSH CHECK: target={ssh_target}")
         _check_ssh_ready(ssh_target)
         _check_remote_runner(ssh_target)
-        profile_note = _apply_profile(str(data.get("profile", "final")))
+        profile_note = _apply_profile(profile)
         _write_config_file()
-        _push_config_to_remote(ssh_target)
+        _sync_live_files(ssh_target)
         stop_live_processes(ssh_target)
+        corner_stop_flag = " --stop-after-corner" if profile in {"corner_right", "corner_left"} else ""
         command = (
             f"cd {REMOTE_ROOT} && "
-            f"python3 -u apps/race_runner.py --config configs/race_config.json --max-sec {max_sec:.1f}"
+            f"python3 -u apps/race_runner.py --config configs/race_config.json --max-sec {max_sec:.1f}{corner_stop_flag}"
         )
         proc = subprocess.Popen(
             ["ssh", ssh_target, command],
