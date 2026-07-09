@@ -21,10 +21,10 @@
     "min_run_area_px": 30,
     "branch_width_ratio": 2.2,
     "branch_min_crop_ratio": 0.22,
-    "trigger_y_frac": 0.35
+    "trigger_y_frac": 0.4
   },
   "line": {
-    "speed": 0.035,
+    "speed": 0.06,
     "kp": 0.24,
     "max_w": 0.24,
     "slow_on_error": 0.45,
@@ -32,11 +32,11 @@
     "invert_turn": false
   },
   "corner": {
-    "mode": "auto",
+    "mode": "right",
     "confirm_frames": 2,
-    "forward_sec": 1.2,
+    "forward_sec": 3.75,
     "turn_w": 0.38,
-    "turn_sec": 2.45,
+    "turn_sec": 2.6,
     "right_turn_dir": -1.0,
     "left_turn_dir": 1.0,
     "reacquire_confirm_frames": 3,

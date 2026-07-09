@@ -36,9 +36,12 @@ UI_STATE = {
     "j2": 205,
     "j3": 45,
     "arm_ms": 1200,
+    "live_max_sec": 60,
 }
 RUN_PROCS: set[subprocess.Popen] = set()
+VIDEO_PROCS: set[subprocess.Popen] = set()
 RUN_LOCK = threading.Lock()
+VIDEO_LOCK = threading.Lock()
 RUN_LOGS: deque[str] = deque(maxlen=240)
 LOG_LOCK = threading.Lock()
 
@@ -121,7 +124,7 @@ HTML = """
         <div class="row"><label>Image path</label><input id="image_path" type="text" value="artifacts/baseline/line_follow_demo_result.jpg"><button class="primary" onclick="analyze()">Analyze</button></div>
         <p class="hint">只用于检查预处理/状态机判断，不作为主流程。</p>
       </section>
-      <img id="video" alt="live video" style="max-width:100%; border-radius:8px; border:1px solid #d9dee8; background:#111; margin-bottom:12px;" />
+      <img id="video" alt="live video" onerror="log('VIDEO FAILED: 请确认 SSH、摄像头、或点击 Reload Video')" style="max-width:100%; border-radius:8px; border:1px solid #d9dee8; background:#111; margin-bottom:12px;" />
       <img id="image" />
     </div>
     <aside>
@@ -200,8 +203,8 @@ HTML = """
     function flatten(cfg){ return {line:cfg.line, vision:cfg.vision, corner:cfg.corner, gap:cfg.gap}; }
     function readCfgValue(cfg,id){ const parts=id.split("."); let cur=cfg; for(const p of parts){ cur=Array.isArray(cur)?cur[Number(p)]:cur[p]; } return cur; }
     function writeCfgValue(body,id,value){ const parts=id.split("."); let cur=body; for(let i=0;i<parts.length-1;i++){ const p=parts[i]; if(cur[p]===undefined)cur[p]={}; cur=cur[p]; } cur[parts[parts.length-1]]=value; }
-    async function loadConfig(){ const cfg=await (await fetch("/api/config")).json(); for(const id of ids){ if(id==="live_max_sec")continue; setVal(id, readCfgValue(cfg,id)); } setVal("live_max_sec",60); document.getElementById("corner.mode").value=cfg.corner.mode; log("CONFIG loaded"); }
-    async function saveConfig(){ const body={line:{},vision:{},corner:{},gap:{},camera:{}}; body.camera.crop=[getVal("camera.crop.0"),getVal("camera.crop.1"),getVal("camera.crop.2"),getVal("camera.crop.3")]; for(const id of ids){ if(id==="live_max_sec"||id.startsWith("camera.crop"))continue; writeCfgValue(body,id,getVal(id)); } body.corner.mode=document.getElementById("corner.mode").value; await api("/api/config",body); log("CONFIG saved"); }
+    async function loadConfig(){ const cfg=await (await fetch("/api/config")).json(); for(const id of ids){ setVal(id, id==="live_max_sec" ? cfg.ui.live_max_sec : readCfgValue(cfg,id)); } document.getElementById("corner.mode").value=cfg.corner.mode; log("CONFIG loaded"); reloadVideo(); }
+    async function saveConfig(){ const body={line:{},vision:{},corner:{},gap:{},camera:{},ui:{}}; body.camera.crop=[getVal("camera.crop.0"),getVal("camera.crop.1"),getVal("camera.crop.2"),getVal("camera.crop.3")]; for(const id of ids){ if(id.startsWith("camera.crop"))continue; if(id==="live_max_sec"){ body.ui.live_max_sec=getVal(id); continue; } writeCfgValue(body,id,getVal(id)); } body.corner.mode=document.getElementById("corner.mode").value; await api("/api/config",body); log("CONFIG saved"); }
     async function analyze(){ await showError("ANALYZE", async()=>{ await saveConfig(); const d=await api("/api/analyze",{image_path:document.getElementById("image_path").value}); document.getElementById("image").src="data:image/jpeg;base64,"+d.image; log(JSON.stringify(d.summary,null,2)); }); }
     async function deploy(){ await showError("DEPLOY", async()=>{ await saveConfig(); const d=await api("/api/deploy",{ssh_target:document.getElementById("ssh_target").value}); log("DEPLOY OK: "+d.message); }); }
     async function startProfile(profile){ await showError("START "+profile, async()=>{ await saveConfig(); const d=await api("/api/live/start",{profile,ssh_target:document.getElementById("ssh_target").value,max_sec:getVal("live_max_sec")}); log("RUNNING "+profile+": "+d.message); setTimeout(refreshLogs,800); }); }
@@ -209,7 +212,7 @@ HTML = """
     async function resetLegacyDefaults(){ await showError("DEFAULTS", async()=>{ const d=await api("/api/defaults/legacy",{}); log(d.message); await loadConfig(); }); }
     async function applyCamera(){ await showError("CAMERA", async()=>{ const d=await api("/api/camera",{ssh_target:document.getElementById("ssh_target").value,cam1:getVal("ui.cam1"),cam2:getVal("ui.cam2")}); log(d.message); }); }
     async function applyArm(){ await showError("ARM", async()=>{ const d=await api("/api/arm",{ssh_target:document.getElementById("ssh_target").value,j1:getVal("ui.j1"),j2:getVal("ui.j2"),j3:getVal("ui.j3"),arm_ms:getVal("ui.arm_ms")}); log(d.message); }); }
-    async function saveDefaults(){ await showError("SAVE DEFAULTS", async()=>{ await saveConfig(); const d=await api("/api/defaults/save",{ui:{cam1:getVal("ui.cam1"),cam2:getVal("ui.cam2"),j1:getVal("ui.j1"),j2:getVal("ui.j2"),j3:getVal("ui.j3"),arm_ms:getVal("ui.arm_ms")}}); log(d.message); }); }
+    async function saveDefaults(){ await showError("SAVE DEFAULTS", async()=>{ await saveConfig(); const d=await api("/api/defaults/save",{ui:{cam1:getVal("ui.cam1"),cam2:getVal("ui.cam2"),j1:getVal("ui.j1"),j2:getVal("ui.j2"),j3:getVal("ui.j3"),arm_ms:getVal("ui.arm_ms"),live_max_sec:getVal("live_max_sec")}}); log(d.message); }); }
     function presetCrop(x0,y0,x1,y1){ setVal("camera.crop.0",x0); setVal("camera.crop.1",y0); setVal("camera.crop.2",x1); setVal("camera.crop.3",y1); log(`box=[${x0},${y0},${x1},${y1}]`); }
     async function refreshLogs(){ try { const d=await (await fetch("/api/live/logs")).json(); if(d.logs&&d.logs.length){ document.getElementById("log").textContent=d.logs.join("\\n"); } } catch(e) { log("LOG REFRESH FAILED: "+e.message); } }
     function reloadVideo(){ document.getElementById("video").src="/video?ssh_target="+encodeURIComponent(document.getElementById("ssh_target").value)+"&ts="+Date.now(); log("video reconnect"); }
@@ -319,7 +322,10 @@ def _read_process_stream(proc: subprocess.Popen, stream_name: str) -> None:
     if stream is None:
         return
     for line in stream:
-        text = line.rstrip()
+        if isinstance(line, bytes):
+            text = line.decode("utf-8", errors="replace").rstrip()
+        else:
+            text = line.rstrip()
         if text:
             _log_event(f"{stream_name}: {text}")
 
@@ -422,7 +428,7 @@ def _apply_profile(profile: str) -> str:
 
 
 def _reset_legacy_single_state_defaults() -> None:
-    UI_STATE.update({"cam1": 90, "cam2": 12, "j1": 55, "j2": 205, "j3": 45, "arm_ms": 1200})
+    UI_STATE.update({"cam1": 90, "cam2": 12, "j1": 55, "j2": 205, "j3": 45, "arm_ms": 1200, "live_max_sec": 60})
     CONFIG.camera.crop = (300, 265, 430, 455)
     CONFIG.camera.expand_left_px = 20
     CONFIG.camera.expand_right_px = 140
@@ -459,6 +465,7 @@ def _reset_legacy_single_state_defaults() -> None:
 
 
 def stop_live_processes(ssh_target: str) -> None:
+    release_video_processes()
     with RUN_LOCK:
         for proc in list(RUN_PROCS):
             if proc.poll() is None:
@@ -486,6 +493,33 @@ def stop_live_processes(ssh_target: str) -> None:
         _log_event("STOP: remote runner/video killed, chassis zeroed 30x")
     except Exception:
         _log_event("STOP: local runner stopped; remote stop command failed")
+
+
+def release_video_processes(ssh_target: str | None = None) -> None:
+    with VIDEO_LOCK:
+        procs = list(VIDEO_PROCS)
+        VIDEO_PROCS.clear()
+    for proc in procs:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=0.8)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    if ssh_target:
+        subprocess.run(
+            [
+                "ssh",
+                ssh_target,
+                "sh",
+                "-lc",
+                "ps -eo pid=,args= | awk '$0 ~ /python3 -u -/ {print $1}' | xargs -r kill",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=4,
+        )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -689,6 +723,8 @@ class Handler(BaseHTTPRequestHandler):
 
             query = parse_qs(urlparse(self.path).query)
             ssh_target = _ssh_target({"ssh_target": query.get("ssh_target", [SSH_TARGET])[0]})
+        release_video_processes(ssh_target)
+        _log_event(f"VIDEO: connecting {ssh_target}")
         code = r"""
 import cv2 as cv, sys, time
 cap = cv.VideoCapture(0)
@@ -710,11 +746,14 @@ while True:
     time.sleep(0.08)
 """
         proc = subprocess.Popen(
-            ["ssh", ssh_target, "python3", "-u", "-"],
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4", ssh_target, "python3", "-u", "-"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
+        with VIDEO_LOCK:
+            VIDEO_PROCS.add(proc)
+        threading.Thread(target=_read_process_stream, args=(proc, "stderr"), daemon=True).start()
         assert proc.stdin is not None
         proc.stdin.write(code.encode("utf-8"))
         proc.stdin.close()
@@ -732,6 +771,8 @@ while True:
                 self.wfile.flush()
         finally:
             proc.terminate()
+            with VIDEO_LOCK:
+                VIDEO_PROCS.discard(proc)
 
 
 def main() -> None:
