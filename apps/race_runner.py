@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from transbot_race.config import RaceConfig  # noqa: E402
-from transbot_race.state_machine import RaceStateMachine  # noqa: E402
+from transbot_race.state_machine import RaceState, RaceStateMachine  # noqa: E402
 from transbot_race.vision import draw_debug_overlay, preprocess_blackline, scan_line_features  # noqa: E402
 
 
@@ -101,6 +101,11 @@ def run(args: argparse.Namespace) -> int:
             mask = preprocess_blackline(crop, cfg.vision)
             features = scan_line_features(mask, cfg.vision, crop_center=track_center)
             command = sm.step(features, now=time.monotonic())
+            if command.reason == "corner_forward" and args.force_turn_dir:
+                sm.active_turn_dir = args.force_turn_dir
+            cmd_v, cmd_w = command.v, command.w
+            if args.force_turn_dir and command.state in (RaceState.TIMED_TURN, RaceState.REACQUIRE):
+                cmd_w = args.force_turn_dir * cfg.corner.turn_w
             if command.reason in {"corner_forward", "turn_start", "timed_turn", "reacquire_turn"}:
                 corner_started = True
             if args.stop_after_corner and corner_started and sm.last_event == "reacquired":
@@ -118,7 +123,7 @@ def run(args: argparse.Namespace) -> int:
                     )
                 )
                 break
-            bot.set_car_motion(command.v, command.w)
+            bot.set_car_motion(cmd_v, cmd_w)
 
             now = time.monotonic()
             if now - last_log >= args.log_period:
@@ -128,8 +133,9 @@ def run(args: argparse.Namespace) -> int:
                             "t": round(now - start, 2),
                             "state": sm.state.value,
                             "reason": command.reason,
-                            "v": round(command.v, 4),
-                            "w": round(command.w, 4),
+                            "v": round(cmd_v, 4),
+                            "w": round(cmd_w, 4),
+                            "force_turn_dir": args.force_turn_dir,
                             "found": features.found,
                             "err": round(features.err_norm, 3),
                             "left": None if features.branch_left is None else round(features.branch_left.y, 1),
@@ -166,6 +172,7 @@ def main() -> int:
     parser.add_argument("--display", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--stop-after-corner", action="store_true")
+    parser.add_argument("--force-turn-dir", type=float, default=0.0)
     return run(parser.parse_args())
 
 

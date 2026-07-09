@@ -699,6 +699,7 @@ class Handler(BaseHTTPRequestHandler):
         ssh_target = _ssh_target(data)
         max_sec = max(1.0, min(300.0, float(data.get("max_sec", 60))))
         profile = str(data.get("profile", "final"))
+        force_turn_dir = 0.0
         with LOG_LOCK:
             RUN_LOGS.clear()
         _log_event(f"SSH CHECK: target={ssh_target}")
@@ -709,9 +710,14 @@ class Handler(BaseHTTPRequestHandler):
         _sync_live_files(ssh_target)
         stop_live_processes(ssh_target)
         corner_stop_flag = " --stop-after-corner" if profile in {"corner_right", "corner_left"} else ""
+        if profile == "corner_right":
+            force_turn_dir = -1.0
+        elif profile == "corner_left":
+            force_turn_dir = 1.0
+        force_turn_flag = f" --force-turn-dir {force_turn_dir:.1f}" if force_turn_dir else ""
         command = (
             f"cd {REMOTE_ROOT} && "
-            f"python3 -u apps/race_runner.py --config configs/race_config.json --max-sec {max_sec:.1f}{corner_stop_flag}"
+            f"python3 -u apps/race_runner.py --config configs/race_config.json --max-sec {max_sec:.1f}{corner_stop_flag}{force_turn_flag}"
         )
         proc = subprocess.Popen(
             ["ssh", ssh_target, command],
@@ -727,7 +733,7 @@ class Handler(BaseHTTPRequestHandler):
         with RUN_LOCK:
             RUN_PROCS.add(proc)
         _track_process_logs(proc)
-        _log_event(f"RUNNING: {profile_note}, max_sec={max_sec:.1f}, target={ssh_target}")
+        _log_event(f"RUNNING: {profile_note}, max_sec={max_sec:.1f}, force_turn_dir={force_turn_dir:.1f}, target={ssh_target}")
         return {"ok": True, "message": f"{profile_note}; runner on {ssh_target} for {max_sec:.1f}s"}
 
     def _stop_live(self, data: dict) -> dict:
