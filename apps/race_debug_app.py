@@ -422,19 +422,27 @@ def _apply_profile(profile: str) -> str:
         CONFIG.gap.enabled = False
         return "直线单状态机：corner=off, gap=off"
     if profile == "corner_right":
-        CONFIG.corner.mode = "right"
+        # Single-corner tests use the first-commit behavior: detect a corner,
+        # then force the physical turn direction from the button.
+        CONFIG.corner.mode = "auto"
+        CONFIG.corner.right_turn_dir = -1.0
+        CONFIG.corner.left_turn_dir = -1.0
         CONFIG.gap.enabled = True
-        return "右直角单状态机：corner=right, gap=on"
+        return "右直角单状态机：检测任意直角后强制右转"
     if profile == "corner_left":
-        CONFIG.corner.mode = "left"
+        CONFIG.corner.mode = "auto"
+        CONFIG.corner.right_turn_dir = 1.0
+        CONFIG.corner.left_turn_dir = 1.0
         CONFIG.gap.enabled = True
-        return "左直角单状态机：corner=left, gap=on"
+        return "左直角单状态机：检测任意直角后强制左转"
     if profile == "gap":
         CONFIG.corner.mode = "off"
         CONFIG.gap.enabled = True
         return "虚线/丢线单状态机：corner=off, gap=on"
     if profile == "final":
         CONFIG.corner.mode = "auto"
+        CONFIG.corner.right_turn_dir = -1.0
+        CONFIG.corner.left_turn_dir = 1.0
         CONFIG.gap.enabled = True
         return "最终全流程：corner=auto, gap=on"
     raise ValueError(f"unknown run profile: {profile}")
