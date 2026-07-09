@@ -53,6 +53,22 @@ def right_angle(line_w=18, corner_y=90):
     return mask
 
 
+def straight_with_far_distractors(line_w=18):
+    mask = straight(line_w=line_w)
+    # Tile seams / glare blobs far from the accepted near-field path should not
+    # be stitched into the line estimate.
+    cv.rectangle(mask, (145, 20), (170, 120), 255, -1)
+    cv.rectangle(mask, (135, 0), (178, 18), 255, -1)
+    return mask
+
+
+def blind_zone_split(line_w=18):
+    mask = np.zeros((H, W), dtype=np.uint8)
+    cv.rectangle(mask, (CENTER - line_w // 2, 150), (CENTER + line_w // 2, H - 1), 255, -1)
+    cv.rectangle(mask, (145, 0), (170, 90), 255, -1)
+    return mask
+
+
 class TrajectoryFitTests(unittest.TestCase):
     def test_straight_is_centered_low_curvature(self):
         fit = _fit(straight(), RaceConfig())
@@ -89,6 +105,21 @@ class TrajectoryFitTests(unittest.TestCase):
         fit = _fit(right_angle(), RaceConfig())
         self.assertTrue(fit.found)
         self.assertGreater(abs(fit.theta) + abs(fit.kappa), 0.2)
+
+    def test_far_distractors_do_not_drive_fit(self):
+        fit = _fit(straight_with_far_distractors(), RaceConfig())
+        self.assertTrue(fit.found)
+        self.assertLess(abs(fit.e0), 0.15)
+        self.assertLess(abs(fit.theta), 0.25)
+        self.assertLess(abs(fit.kappa), 0.25)
+
+    def test_blind_zone_split_lowers_confidence(self):
+        fit = _fit(blind_zone_split(), RaceConfig())
+        self.assertTrue(fit.found)
+        self.assertTrue(fit.disconnected)
+        self.assertLess(fit.conf, 0.4)
+        self.assertLess(abs(fit.theta), 0.25)
+        self.assertLess(abs(fit.kappa), 0.25)
 
 
 if __name__ == "__main__":

@@ -44,6 +44,7 @@ def command_summary(command: MotionCommand, fit: TrajectoryFit) -> dict:
         "kappa": round(fit.kappa, 4),
         "conf": round(fit.conf, 4),
         "n_bands": fit.n_bands,
+        "disconnected": fit.disconnected,
     }
 
 

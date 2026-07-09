@@ -113,6 +113,58 @@ def _best_run(runs: Iterable[Run], crop_center: float) -> Run | None:
     return min(runs, key=lambda run: abs(run.cx - crop_center) - min(run.area, 800) * 0.001)
 
 
+def _path_best_runs(bands: list[ScanBand], crop_center: float, width: int) -> list[Run | None]:
+    """Choose one continuous near-field path through band candidates.
+
+    The binary mask may contain tile seams, glare edges, or crop-border blobs.
+    Picking each band independently lets those false runs become a fake curve.
+    Instead, anchor near the car and only accept upper-band runs that stay
+    geometrically close to the accepted path.
+    """
+
+    bests: list[Run | None] = [None] * len(bands)
+    anchor_index = next((band.index for band in bands[:2] if band.runs), None)
+    if anchor_index is None:
+        anchor_index = next((band.index for band in bands if band.runs), None)
+    if anchor_index is None:
+        return bests
+
+    anchor_band = bands[anchor_index]
+    anchor = _best_run(anchor_band.runs, crop_center)
+    if anchor is None:
+        return bests
+
+    bests[anchor_index] = anchor
+    accepted: list[tuple[int, Run]] = [(anchor_index, anchor)]
+    max_jump = max(32.0, min(72.0, width * 0.24))
+
+    for band in bands[anchor_index + 1 :]:
+        if not band.runs:
+            continue
+
+        prev_index, prev = accepted[-1]
+        if len(accepted) >= 2:
+            prev2_index, prev2 = accepted[-2]
+            di = max(1, prev_index - prev2_index)
+            pred = prev.cx + (prev.cx - prev2.cx) * ((band.index - prev_index) / di)
+        else:
+            pred = prev.cx
+
+        gap_scale = max(1, band.index - prev_index)
+        allowed_jump = max_jump * min(1.6, gap_scale)
+        candidates = [run for run in band.runs if abs(run.cx - pred) <= allowed_jump]
+        if not candidates:
+            # A visible but discontinuous upper segment is likely across a blind
+            # zone; stop before stitching it into the near-field path.
+            break
+
+        chosen = min(candidates, key=lambda run: abs(run.cx - pred) - min(run.area, 800) * 0.001)
+        bests[band.index] = chosen
+        accepted.append((band.index, chosen))
+
+    return bests
+
+
 def scan_line_features(mask: np.ndarray, cfg: VisionConfig, crop_center: float | None = None) -> LineFeatures:
     """Extract line-center and left/right branch features from a black-line mask."""
 
@@ -120,11 +172,17 @@ def scan_line_features(mask: np.ndarray, cfg: VisionConfig, crop_center: float |
     if crop_center is None:
         crop_center = width / 2.0
 
-    bands: list[ScanBand] = []
+    raw_bands: list[ScanBand] = []
     for index in range(cfg.band_count):
         y0, y1 = _band_bounds(index, height, cfg.band_count)
         runs = _runs_from_band(mask, y0, y1, cfg)
-        bands.append(ScanBand(index=index, y0=y0, y1=y1, runs=runs, best=_best_run(runs, crop_center)))
+        raw_bands.append(ScanBand(index=index, y0=y0, y1=y1, runs=runs, best=None))
+
+    path_bests = _path_best_runs(raw_bands, crop_center, width)
+    bands = [
+        ScanBand(index=band.index, y0=band.y0, y1=band.y1, runs=band.runs, best=path_bests[band.index])
+        for band in raw_bands
+    ]
 
     valid = [band for band in bands if band.best is not None]
     if not valid:
@@ -195,6 +253,7 @@ class TrajectoryFit:
     conf: float = 0.0        # overall fit confidence [0, 1]
     n_bands: int = 0         # number of bands that contributed
     quadratic: bool = False  # whether the quadratic term was used
+    disconnected: bool = False  # visible bands were split by a large jump
 
 
 def _band_confidence(run: Run, band_height: float, line_width: float, cfg: VisionConfig) -> float:
@@ -232,9 +291,7 @@ def fit_line_trajectory(
 
     visible_bands = max(1, cfg.band_count - len(occluded_band_indices))
 
-    ys: list[float] = []
-    xs: list[float] = []
-    ws: list[float] = []
+    samples: list[tuple[int, float, float, float]] = []
     y_min = float("inf")
     for band in features.bands:
         if band.index in occluded_band_indices or band.best is None:
@@ -247,31 +304,72 @@ def fit_line_trajectory(
         y_min = min(y_min, float(band.y0))
         # Weight the bottom of the crop (nearest the car) more heavily.
         near_bias = 1.0 + 0.5 * (band.index == 0)
-        ys.append(y_mid)
-        xs.append(band.best.cx)
-        ws.append(conf * near_bias)
+        samples.append((band.index, y_mid, band.best.cx, conf * near_bias))
 
-    n = len(ys)
+    n = len(samples)
     if n == 0:
         return TrajectoryFit(found=False)
+
+    samples.sort(key=lambda item: item[0])
+    # The crop can lose the connecting arc during tight roundabout turns. In
+    # that case far bands may belong to a different visible segment; do not let
+    # a polynomial stitch that gap and invent a huge heading for pivot assist.
+    max_jump_px = max(40.0, crop_width * 0.16)
+    near_samples = [samples[0]]
+    disconnected = False
+    for sample in samples[1:]:
+        prev_index, _prev_y, prev_x, _prev_w = near_samples[-1]
+        index, _y, x, _w = sample
+        if index == prev_index + 1 and abs(x - prev_x) <= max_jump_px:
+            near_samples.append(sample)
+        else:
+            disconnected = True
+            break
+
+    if disconnected and len(near_samples) >= 2:
+        fit_samples = near_samples
+    else:
+        fit_samples = samples
+
+    ys = [sample[1] for sample in fit_samples]
+    xs = [sample[2] for sample in fit_samples]
+    ws = [sample[3] for sample in fit_samples]
+    fit_n = len(fit_samples)
 
     y_arr = np.asarray(ys, dtype=np.float64)
     x_arr = np.asarray(xs, dtype=np.float64)
     w_arr = np.asarray(ws, dtype=np.float64)
 
+    if fit_n == 1:
+        e0 = max(-1.0, min(1.0, (float(x_arr[0]) - crop_center) / half_width))
+        conf = float(min(1.0, w_arr.sum() / (visible_bands * 0.9)))
+        if disconnected:
+            conf *= 0.45
+        return TrajectoryFit(
+            found=True,
+            e0=e0,
+            e_look=e0,
+            theta=0.0,
+            kappa=0.0,
+            conf=conf,
+            n_bands=fit_n,
+            quadratic=False,
+            disconnected=disconnected,
+        )
+
     # RANSAC-lite: with enough bands, drop the single worst residual once so a
     # roundabout entry/exit stub or a corner branch cannot drag the whole fit.
-    degree = 2 if n >= 4 else 1
+    degree = 2 if fit_n >= 4 else 1
     use_quadratic = degree == 2
     coeffs = np.polyfit(y_arr, x_arr, degree, w=w_arr)
-    if n >= 5:
+    if fit_n >= 5:
         resid = np.abs(np.polyval(coeffs, y_arr) - x_arr)
         drop = int(np.argmax(resid))
-        keep = np.ones(n, dtype=bool)
+        keep = np.ones(fit_n, dtype=bool)
         keep[drop] = False
         y_arr, x_arr, w_arr = y_arr[keep], x_arr[keep], w_arr[keep]
-        n = int(keep.sum())
-        degree = 2 if n >= 4 else 1
+        fit_n = int(keep.sum())
+        degree = 2 if fit_n >= 4 else 1
         use_quadratic = degree == 2
         coeffs = np.polyfit(y_arr, x_arr, degree, w=w_arr)
 
@@ -302,6 +400,14 @@ def fit_line_trajectory(
         e_look = e0
 
     conf = float(min(1.0, w_arr.sum() / (visible_bands * 0.9)))
+    if disconnected:
+        # This is still a usable near-field observation, but not a trustworthy
+        # whole-trajectory fit. Let the temporal filter/predictor carry history
+        # instead of treating a blind-zone bridge as high-confidence curvature.
+        if fit_n < 3:
+            theta = 0.0
+        kappa = 0.0
+        conf *= 0.55
     return TrajectoryFit(
         found=True,
         e0=e0,
@@ -309,8 +415,9 @@ def fit_line_trajectory(
         theta=theta,
         kappa=kappa,
         conf=conf,
-        n_bands=n,
+        n_bands=fit_n,
         quadratic=use_quadratic,
+        disconnected=disconnected,
     )
 
 
@@ -327,12 +434,13 @@ def draw_debug_overlay(frame_bgr: np.ndarray, features: LineFeatures, trigger_y_
         yy = (band.y0 + band.y1) // 2
         cv.line(out, (0, yy), (width, yy), (80, 80, 80), 1)
         for run in band.runs:
-            color = (0, 220, 0) if band.best == run else (180, 180, 0)
-            cv.rectangle(out, (run.x0, band.y0), (run.x1, band.y1 - 1), color, 1)
+            if band.best == run:
+                cv.rectangle(out, (run.x0, band.y0), (run.x1, band.y1 - 1), (0, 220, 0), 2)
+            else:
+                cv.line(out, (int(run.cx), yy - 3), (int(run.cx), yy + 3), (90, 90, 90), 1)
     for branch in [features.branch_left, features.branch_right]:
         if branch is None:
             continue
         band = features.bands[branch.band_index]
         cv.rectangle(out, (branch.run.x0, band.y0), (branch.run.x1, band.y1 - 1), (0, 165, 255), 2)
     return out
-

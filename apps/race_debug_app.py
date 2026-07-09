@@ -464,53 +464,68 @@ def _append_debug_log(path: Path | None, message: str) -> None:
             f.write(f"[{stamp}] {message}\n")
 
 
-def _pull_remote_debug(ssh_target: str, remote_rel: str | None) -> None:
+def _pull_remote_debug(ssh_target: str, remote_rel: str | None, debug_log_path: Path | None = None) -> None:
     if not remote_rel:
         return
     remote_path = f"{REMOTE_ROOT}/{remote_rel}"
     local_path = ROOT / remote_rel
     local_path.parent.mkdir(parents=True, exist_ok=True)
+    _append_debug_log(debug_log_path, f"debug pull start: {ssh_target}:{remote_path}")
 
-    check = subprocess.run(
-        ["ssh", ssh_target, "sh", "-lc", f"test -d {shlex.quote(remote_path)}"],
-        cwd=ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=8,
-    )
-    if check.returncode != 0:
-        _log_event(f"DEBUG PULL SKIPPED: remote dir missing {remote_path}")
-        return
+    try:
+        check = subprocess.run(
+            ["ssh", ssh_target, "sh", "-lc", f"test -d {shlex.quote(remote_path)}"],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        if check.returncode != 0:
+            message = f"DEBUG PULL SKIPPED: remote dir missing {remote_path}"
+            _log_event(message)
+            _append_debug_log(debug_log_path, message)
+            return
 
-    pack = subprocess.run(
-        [
-            "ssh",
-            ssh_target,
-            "sh",
-            "-lc",
-            f"cd {shlex.quote(REMOTE_ROOT)} && tar -czf - {shlex.quote(remote_rel)}",
-        ],
-        cwd=ROOT,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=45,
-    )
-    if pack.returncode != 0:
-        _log_event(f"DEBUG PULL FAILED: {(pack.stderr or pack.stdout).decode('utf-8', errors='replace').strip()}")
-        return
+        pack = subprocess.run(
+            [
+                "ssh",
+                ssh_target,
+                "sh",
+                "-lc",
+                f"cd {shlex.quote(REMOTE_ROOT)} && tar -czf - {shlex.quote(remote_rel)}",
+            ],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=90,
+        )
+        if pack.returncode != 0:
+            detail = (pack.stderr or pack.stdout).decode("utf-8", errors="replace").strip()
+            message = f"DEBUG PULL FAILED: {detail}"
+            _log_event(message)
+            _append_debug_log(debug_log_path, message)
+            return
 
-    extract = subprocess.run(
-        ["tar", "-xzf", "-", "-C", str(ROOT)],
-        input=pack.stdout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=45,
-    )
-    if extract.returncode != 0:
-        _log_event(f"DEBUG EXTRACT FAILED: {extract.stderr.decode('utf-8', errors='replace').strip()}")
+        extract = subprocess.run(
+            ["tar", "-xzf", "-", "-C", str(ROOT)],
+            input=pack.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=90,
+        )
+        if extract.returncode != 0:
+            message = f"DEBUG EXTRACT FAILED: {extract.stderr.decode('utf-8', errors='replace').strip()}"
+            _log_event(message)
+            _append_debug_log(debug_log_path, message)
+            return
+    except Exception as exc:
+        message = f"DEBUG PULL ERROR: {exc}"
+        _log_event(message)
+        _append_debug_log(debug_log_path, message)
         return
     _log_event(f"DEBUG SAVED: {local_path}")
+    _append_debug_log(debug_log_path, f"debug saved: {local_path}")
 
 
 def _watch_runner_exit(
@@ -527,7 +542,7 @@ def _watch_runner_exit(
     if debug_remote_rel:
         # Give the runner's finally block a moment to flush manifest/telemetry.
         time.sleep(0.5)
-        _pull_remote_debug(ssh_target, debug_remote_rel)
+        _pull_remote_debug(ssh_target, debug_remote_rel, debug_log_path)
 
 
 def _read_process_stream(proc: subprocess.Popen, stream_name: str, debug_log_path: Path | None = None) -> None:
