@@ -49,7 +49,6 @@ class OcclusionConfig:
     rects: tuple[tuple[int, int, int, int], ...] = ()
 
 
-
 @dataclass(slots=True)
 class VisionConfig:
     """Image preprocessing and scan-line feature extraction knobs."""

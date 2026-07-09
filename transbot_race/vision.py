@@ -75,6 +75,13 @@ def preprocess_blackline(frame_bgr: np.ndarray, cfg: VisionConfig) -> np.ndarray
     return mask
 
 
+def _band_bounds(index: int, height: int, band_count: int) -> tuple[int, int]:
+    """(y0, y1) of scan band `index`, counting from the bottom of the frame."""
+    y1 = height - int(index * height / band_count)
+    y0 = height - int((index + 1) * height / band_count)
+    return y0, y1
+
+
 def _runs_from_band(mask: np.ndarray, y0: int, y1: int, cfg: VisionConfig) -> tuple[Run, ...]:
     band = mask[y0:y1, :]
     if band.size == 0:
@@ -115,8 +122,7 @@ def scan_line_features(mask: np.ndarray, cfg: VisionConfig, crop_center: float |
 
     bands: list[ScanBand] = []
     for index in range(cfg.band_count):
-        y1 = height - int(index * height / cfg.band_count)
-        y0 = height - int((index + 1) * height / cfg.band_count)
+        y0, y1 = _band_bounds(index, height, cfg.band_count)
         runs = _runs_from_band(mask, y0, y1, cfg)
         bands.append(ScanBand(index=index, y0=y0, y1=y1, runs=runs, best=_best_run(runs, crop_center)))
 

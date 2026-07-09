@@ -21,6 +21,7 @@ from transbot_race.geometry import (  # noqa: E402
 )
 from transbot_race.state_machine import RaceStateMachine, command_summary  # noqa: E402
 from transbot_race.vision import (  # noqa: E402
+    _band_bounds,
     draw_debug_overlay,
     fit_line_trajectory,
     preprocess_blackline,
@@ -104,8 +105,7 @@ def occluded_band_indices(height: int, width: int, cfg: RaceConfig) -> frozenset
     n = cfg.vision.band_count
     indices = []
     for index in range(n):
-        y1 = height - int(index * height / n)
-        y0 = height - int((index + 1) * height / n)
+        y0, y1 = _band_bounds(index, height, n)
         if band_is_occluded(y0, y1, width, cfg.occlusion):
             indices.append(index)
     return frozenset(indices)
@@ -127,6 +127,7 @@ def run(args: argparse.Namespace) -> int:
 
     start = time.monotonic()
     last_log = 0.0
+    occluded = frozenset()  # computed once from the first crop; static per run
     try:
         stop_chassis(bot, count=3, delay=0.03)
         while time.monotonic() - start < args.max_sec:
@@ -143,7 +144,8 @@ def run(args: argparse.Namespace) -> int:
             crop_w = crop.shape[1]
             mask = preprocess_blackline(crop, cfg.vision)
             mask = apply_occlusion(mask, cfg.occlusion)
-            occluded = occluded_band_indices(crop.shape[0], crop.shape[1], cfg)
+            if not occluded and cfg.occlusion.enabled:
+                occluded = occluded_band_indices(crop.shape[0], crop.shape[1], cfg)
             features = scan_line_features(mask, cfg.vision, crop_center=track_center)
             fit = fit_line_trajectory(
                 features,

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import json
+import mimetypes
 import queue
 import re
 import subprocess
@@ -22,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 from transbot_race.config import RaceConfig, TrackerConfig  # noqa: E402
 from transbot_race.state_machine import RaceStateMachine, command_summary  # noqa: E402
 from transbot_race.vision import (  # noqa: E402
+    TrajectoryFit,
     draw_debug_overlay,
     fit_line_trajectory,
     preprocess_blackline,
@@ -76,29 +78,29 @@ def _publish_telemetry(sample: dict) -> None:
 
 
 def _mock_telemetry_loop() -> None:
-    """Emit synthetic telemetry so the dashboard can be developed offline."""
+    """Emit synthetic telemetry so the dashboard can be developed offline.
+
+    Drives real synthetic fits through a real RaceStateMachine so the mock
+    exercises the actual control law and command_summary schema rather than a
+    hand-rolled copy that would drift.
+    """
     import math
 
+    sm = RaceStateMachine(CONFIG)
     t = 0.0
     while not MOCK_STOP.is_set():
-        e0 = 0.4 * math.sin(t * 0.9)
-        theta = 0.3 * math.sin(t * 0.9 + 0.4)
-        kappa = 0.2 * math.cos(t * 0.6)
-        pivot = abs(e0) > CONFIG.tracker.e_pivot
-        sample = {
-            "state": "track",
-            "mode": "pivot" if pivot else "follow",
-            "reason": "mock",
-            "v": round(CONFIG.tracker.v_max * (0.0 if pivot else 0.8), 4),
-            "w": round(-(CONFIG.tracker.k_e * e0 + CONFIG.tracker.k_theta * theta), 4),
-            "found": True,
-            "e0": round(e0, 4),
-            "theta": round(theta, 4),
-            "kappa": round(kappa, 4),
-            "conf": round(0.7 + 0.2 * math.sin(t), 4),
-            "n_bands": 6,
-            "t": round(t, 2),
-        }
+        fit = TrajectoryFit(
+            found=True,
+            e0=0.4 * math.sin(t * 0.9),
+            e_look=0.4 * math.sin(t * 0.9 + 0.5),
+            theta=0.3 * math.sin(t * 0.9 + 0.4),
+            kappa=0.2 * math.cos(t * 0.6),
+            conf=0.7 + 0.2 * math.sin(t),
+            n_bands=6,
+        )
+        command = sm.step(fit, now=t)
+        sample = command_summary(command, fit)
+        sample["t"] = round(t, 2)
         _publish_telemetry(sample)
         t += 0.1
         MOCK_STOP.wait(0.1)
@@ -863,12 +865,12 @@ class Handler(BaseHTTPRequestHandler):
         if target != root and root not in target.parents:
             self.send_error(403)
             return
-        if not target.is_file():
+        try:
+            raw = target.read_bytes()
+        except OSError:
             self.send_error(404)
             return
-        ctypes = {".html": "text/html", ".js": "text/javascript", ".css": "text/css"}
-        ctype = ctypes.get(target.suffix, "application/octet-stream")
-        raw = target.read_bytes()
+        ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
         self.send_response(200)
         self.send_header("Content-Type", f"{ctype}; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))

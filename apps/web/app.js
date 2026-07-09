@@ -51,7 +51,17 @@ function render(s) {
     series[key].push(Number(s[key] || 0));
     if (series[key].length > HISTORY) series[key].shift();
   }
-  drawChart();
+  scheduleChart();
+}
+
+let chartPending = false;
+function scheduleChart() {
+  if (chartPending) return;
+  chartPending = true;
+  requestAnimationFrame(() => {
+    chartPending = false;
+    drawChart();
+  });
 }
 
 function drawChart() {
