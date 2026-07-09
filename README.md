@@ -15,15 +15,18 @@ and course-state-machine experiments for the July 2026 race-track task.
 
 New clean logic lives in:
 
-- `transbot_race/vision.py`: black-line preprocessing and scan-line features.
-- `transbot_race/state_machine.py`: one owner for line follow, gap blind drive,
-  timed turns, and line reacquisition.
-- `transbot_race/config.py`: typed configuration.
+- `transbot_race/vision.py`: black-line preprocessing, scan-line features, and
+  `fit_line_trajectory()` (continuous e0/theta/kappa/conf estimate).
+- `transbot_race/state_machine.py`: unified continuous tracker with only three
+  states (TRACK / LOST / STOPPED). Corners of any angle, dashed lines and
+  roundabouts emerge from one control law plus a confidence filter, not from
+  per-case states or timed open-loop maneuvers.
+- `transbot_race/config.py`: typed configuration (single `tracker` section).
 - `apps/race_debug_app.py`: merged debug frontend for saved-image analysis plus
   optional live deploy/start/stop/video controls.
 - `apps/race_runner.py`: integrated on-robot runner for camera + Transbot motion.
-- `tests/test_race_state_machine.py`: unit tests for straight line, left/right
-  corners, dashed-line recovery, and thin-noise rejection.
+- `tests/test_race_state_machine.py` and `tests/test_trajectory_fit.py`: unit
+  tests for the tracker (straight/offset/pivot/gap/lost) and the fitter.
 
 The known-good tuner in `apps/robot_tune_app.py` is treated as the preserved
 baseline. New race behavior should be integrated through `transbot_race/*`,
@@ -58,11 +61,16 @@ python3 apps/race_runner.py --dry-run --max-sec 1
 ## Known Status
 
 - Straight-line navigation is the most reliable component.
-- Curves and circles can be handled by the same local line-center tracking loop.
-- Right-angle detection is now symmetric for left/right branches in the clean
-  state machine.
-- Dashed-line behavior is represented by `GAP_BLIND`.
+- Curves, circles and corners are all handled by the same continuous
+  trajectory tracker (line-center + heading + curvature feedback).
+- Sharp bends (including right angles) trigger the `pivot` sub-mode of TRACK:
+  near-zero speed + strong steering until re-aligned. There is no separate
+  corner state and no timed open-loop turn.
+- Dashed / missing line is carried by the confidence filter's predict mode;
+  only a sustained loss drops into LOST (search sweep, then STOPPED on timeout).
 - No SSH or live robot access is assumed for the next refactor phase.
+- Remaining tuning is field calibration only (see
+  `docs/architecture/unified_tracker_plan.md`, Phase 4).
 
 ## Run Local Tuning App
 

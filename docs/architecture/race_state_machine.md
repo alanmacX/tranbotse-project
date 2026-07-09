@@ -1,5 +1,9 @@
 # Race State Machine Architecture
 
+> Superseded by `unified_tracker_plan.md`. The corner/gap/reacquire discrete
+> states described below were replaced by a single continuous TRACK/LOST/STOPPED
+> tracker. This file is kept for the PDF-requirement mapping and design rationale.
+
 This document maps the race-track PDF requirements to a single controller
 architecture. The goal is to keep straight-line tracking as the stable base
 behavior and let special cases take control only through explicit events.

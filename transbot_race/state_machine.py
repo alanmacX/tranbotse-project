@@ -4,16 +4,21 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .config import RaceConfig
-from .vision import BranchFeature, LineFeatures
+from .vision import TrajectoryFit
 
 
 class RaceState(str, Enum):
-    LINE_FOLLOW = "line_follow"
-    GAP_BLIND = "gap_blind"
-    TIMED_FORWARD = "timed_forward"
-    TIMED_TURN = "timed_turn"
-    REACQUIRE = "reacquire"
+    TRACK = "track"
+    LOST = "lost"
     STOPPED = "stopped"
+
+
+class TrackMode(str, Enum):
+    """Sub-behavior within TRACK, reported for logging only (not a state)."""
+
+    FOLLOW = "follow"
+    PREDICT = "predict"   # running on the confidence filter through a gap
+    PIVOT = "pivot"       # saturation branch: near-zero v, strong w (sharp bend)
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,143 +27,146 @@ class MotionCommand:
     w: float
     reason: str
     state: RaceState
+    mode: TrackMode | None = None
+
+
+def command_summary(command: MotionCommand, fit: TrajectoryFit) -> dict:
+    """Flat JSON-friendly view of a control step, shared by runner and debug app."""
+    return {
+        "state": command.state.value,
+        "mode": None if command.mode is None else command.mode.value,
+        "reason": command.reason,
+        "v": round(command.v, 4),
+        "w": round(command.w, 4),
+        "found": fit.found,
+        "e0": round(fit.e0, 4),
+        "theta": round(fit.theta, 4),
+        "kappa": round(fit.kappa, 4),
+        "conf": round(fit.conf, 4),
+        "n_bands": fit.n_bands,
+    }
 
 
 class RaceStateMachine:
-    """Single controller for line following and mutually exclusive special states."""
+    """Single continuous controller: TRACK / LOST / STOPPED.
+
+    All curve, corner (any angle), dashed-line and roundabout behavior emerges
+    from one control law over the trajectory fit plus a confidence filter. There
+    are no per-case states or timed open-loop maneuvers.
+    """
 
     def __init__(self, cfg: RaceConfig | None = None) -> None:
         self.cfg = cfg or RaceConfig()
-        self.state = RaceState.LINE_FOLLOW
+        self.state = RaceState.TRACK
         self.state_started_at = 0.0
-        self.last_err_norm = 0.0
-        self.missing_count = 0
-        self.corner_count = 0
-        self.corner_direction: str | None = None
-        self.active_turn_dir = 0.0
-        self.reacquire_count = 0
-        self.search_started_at: float | None = None
-        self.last_search_sign = 1.0
+        # Filtered trajectory estimate.
+        self.f_e0 = 0.0
+        self.f_theta = 0.0
+        self.f_kappa = 0.0
+        self.f_conf = 0.0
+        self.d_e0 = 0.0
+        self.in_pivot = False
         self.last_event = "init"
 
     def reset(self) -> None:
         self.__init__(self.cfg)
 
-    def step(self, features: LineFeatures, now: float, obstacle: bool = False) -> MotionCommand:
+    # -- public API -------------------------------------------------------
+    def step(self, fit: TrajectoryFit, now: float, obstacle: bool = False) -> MotionCommand:
         if obstacle:
             self._enter(RaceState.STOPPED, now, "obstacle")
-            return MotionCommand(0.0, 0.0, "obstacle", self.state)
+            return MotionCommand(0.0, 0.0, "obstacle", self.state, None)
 
         if self.state == RaceState.STOPPED:
-            return MotionCommand(0.0, 0.0, "stopped", self.state)
+            return MotionCommand(0.0, 0.0, "stopped", self.state, None)
 
-        if self.state == RaceState.TIMED_FORWARD:
-            if now - self.state_started_at >= self.cfg.corner.forward_sec:
-                self._enter(RaceState.TIMED_TURN, now, "turn_start")
-                return MotionCommand(0.0, self.active_turn_dir * self.cfg.corner.turn_w, "turn_start", self.state)
-            return MotionCommand(self.cfg.line.speed, 0.0, "timed_forward", self.state)
+        self._update_filter(fit)
 
-        if self.state == RaceState.TIMED_TURN:
-            if now - self.state_started_at >= self.cfg.corner.turn_sec:
-                self._enter(RaceState.REACQUIRE, now, "reacquire")
-            return MotionCommand(0.0, self.active_turn_dir * self.cfg.corner.turn_w, "timed_turn", self.state)
+        if self.state == RaceState.LOST:
+            return self._lost_step(now)
 
-        if self.state == RaceState.REACQUIRE:
-            if features.found and abs(features.err_norm) <= self.cfg.corner.reacquire_err_norm:
-                self.reacquire_count += 1
-                if self.reacquire_count >= self.cfg.corner.reacquire_confirm_frames:
-                    self._enter(RaceState.LINE_FOLLOW, now, "reacquired")
-                    self.reacquire_count = 0
-                    return self._line_follow(features)
+        # TRACK.
+        if self.f_conf <= self.cfg.tracker.conf_lost:
+            self._enter(RaceState.LOST, now, "line_lost")
+            return self._lost_step(now)
+
+        return self._track_step(now)
+
+    # -- filtering --------------------------------------------------------
+    def _update_filter(self, fit: TrajectoryFit) -> None:
+        t = self.cfg.tracker
+        if fit.found and fit.conf > 0.0:
+            prev_e0 = self.f_e0
+            a, b = t.filter_alpha, t.filter_beta
+            self.f_e0 = (1 - a) * (self.f_e0 + self.d_e0) + a * fit.e0
+            self.d_e0 = (1 - b) * self.d_e0 + b * (self.f_e0 - prev_e0)
+            self.f_theta = (1 - a) * self.f_theta + a * fit.theta
+            self.f_kappa = (1 - a) * self.f_kappa + a * fit.kappa
+            # Fast-attack, slow-release: snap up to a stronger fit, ease down.
+            if self.f_conf < fit.conf:
+                self.f_conf = fit.conf
             else:
-                self.reacquire_count = 0
-            if now - self.state_started_at >= self.cfg.corner.reacquire_timeout_sec:
-                self._enter(RaceState.STOPPED, now, "reacquire_timeout")
-                return MotionCommand(0.0, 0.0, "reacquire_timeout", self.state)
-            return MotionCommand(0.0, self.active_turn_dir * self.cfg.corner.turn_w, "reacquire_turn", self.state)
-
-        if not features.found:
-            self.missing_count += 1
-            if self.cfg.gap.enabled and self.missing_count >= self.cfg.gap.missing_frames:
-                if self.state != RaceState.GAP_BLIND:
-                    self._enter(RaceState.GAP_BLIND, now, "gap_start")
-                if now - self.state_started_at <= self.cfg.gap.blind_sec:
-                    w = -self.last_err_norm * self.cfg.line.max_w * self.cfg.gap.blind_turn_factor
-                    return MotionCommand(self.cfg.line.speed * self.cfg.gap.blind_speed_factor, w, "gap_blind", self.state)
-            # Search sweep. Guarantee a non-zero angular velocity so a line lost
-            # near the crop center does not stall the chassis at w=0. Track a
-            # start time so the sweep terminates in STOPPED instead of forever.
-            if self.search_started_at is None:
-                self.search_started_at = now
-            if now - self.search_started_at >= self.cfg.gap.search_timeout_sec:
-                self._enter(RaceState.STOPPED, now, "search_timeout")
-                return MotionCommand(0.0, 0.0, "search_timeout", self.state)
-            sign = self.last_err_norm
-            if abs(sign) < 1e-3:
-                sign = self.last_search_sign
-            sign = -1.0 if sign > 0 else 1.0
-            self.last_search_sign = sign
-            w = sign * max(abs(self.last_err_norm) * self.cfg.gap.search_w, self.cfg.gap.search_w_min)
-            return MotionCommand(0.0, w, "line_missing", self.state)
-
-        self.missing_count = 0
-        self.search_started_at = None
-        self.last_err_norm = features.err_norm
-        if self.state == RaceState.GAP_BLIND:
-            self._enter(RaceState.LINE_FOLLOW, now, "gap_recovered")
-
-        branch = self._corner_branch(features)
-        if branch is not None:
-            if self.corner_direction == branch.direction:
-                self.corner_count += 1
-            else:
-                self.corner_direction = branch.direction
-                self.corner_count = 1
-            if self.corner_count >= self.cfg.corner.confirm_frames:
-                self.active_turn_dir = self._turn_dir(branch.direction)
-                self._enter(RaceState.TIMED_FORWARD, now, f"{branch.direction}_corner")
-                self.corner_count = 0
-                return MotionCommand(self.cfg.line.speed, 0.0, "corner_forward", self.state)
+                self.f_conf = (1 - a) * self.f_conf + a * fit.conf
         else:
-            self.corner_count = 0
-            self.corner_direction = None
+            # Predict: extrapolate position by its rate, decay confidence.
+            self.f_e0 = max(-1.0, min(1.0, self.f_e0 + self.d_e0))
+            self.f_conf = max(0.0, self.f_conf - t.conf_decay)
 
-        return self._line_follow(features)
+    # -- TRACK ------------------------------------------------------------
+    def _track_step(self, now: float) -> MotionCommand:
+        t = self.cfg.tracker
+        predicting = self.f_conf < t.conf_predict
 
-    def _line_follow(self, features: LineFeatures) -> MotionCommand:
-        sign = 1.0 if self.cfg.line.invert_turn else -1.0
-        w = sign * self.cfg.line.kp * features.err_norm
-        w = max(-self.cfg.line.max_w, min(self.cfg.line.max_w, w))
-        slowdown = min(self.cfg.line.max_slowdown, abs(features.err_norm) * self.cfg.line.slow_on_error)
-        v = self.cfg.line.speed * (1.0 - slowdown)
-        return MotionCommand(v, w, "line_follow", self.state)
+        e0 = self.f_e0 + t.e_bias
+        theta = self.f_theta
+        kappa = self.f_kappa
 
-    def _corner_branch(self, features: LineFeatures) -> BranchFeature | None:
-        mode = self.cfg.corner.mode
-        if mode == "off":
-            return None
-        trigger_y = self.cfg.vision.trigger_y_frac
-        candidates = []
-        if mode in ("auto", "left") and features.branch_left and features.branch_left.y >= self._feature_height(features) * trigger_y:
-            candidates.append(features.branch_left)
-        if mode in ("auto", "right") and features.branch_right and features.branch_right.y >= self._feature_height(features) * trigger_y:
-            candidates.append(features.branch_right)
-        if not candidates:
-            return None
-        return max(candidates, key=lambda branch: branch.run.area)
+        sign = 1.0 if t.invert_turn else -1.0
+        w = sign * (t.k_e * e0 + t.k_theta * theta + t.k_ff * kappa)
 
-    def _feature_height(self, features: LineFeatures) -> float:
-        if not features.bands:
-            return 1.0
-        return float(max(band.y1 for band in features.bands))
+        # Pivot assist: saturation branch for sharp bends / corners of any angle.
+        enter = abs(e0) > t.e_pivot or abs(theta) > t.theta_pivot
+        exit_thr_e = t.e_pivot * (1.0 - t.pivot_hysteresis)
+        exit_thr_th = t.theta_pivot * (1.0 - t.pivot_hysteresis)
+        stay = abs(e0) > exit_thr_e or abs(theta) > exit_thr_th
+        self.in_pivot = enter if not self.in_pivot else stay
 
-    def _turn_dir(self, direction: str) -> float:
-        if direction == "left":
-            return self.cfg.corner.left_turn_dir
-        return self.cfg.corner.right_turn_dir
+        if self.in_pivot:
+            pivot_sign = -1.0 if w < 0 else 1.0
+            w = pivot_sign * t.w_pivot
+            v = t.v_max * t.v_pivot_ratio
+            mode = TrackMode.PIVOT
+        else:
+            w = max(-t.max_w, min(t.max_w, w))
+            slowdown = t.slow_gain * min(1.0, abs(w) / max(t.max_w, 1e-6))
+            v = t.v_max * max(t.v_min_ratio, 1.0 - slowdown)
+            if predicting:
+                v *= t.predict_speed_factor
+                mode = TrackMode.PREDICT
+            else:
+                mode = TrackMode.FOLLOW
+
+        return MotionCommand(v, w, f"track_{mode.value}", self.state, mode)
+
+    # -- LOST -------------------------------------------------------------
+    def _lost_step(self, now: float) -> MotionCommand:
+        t = self.cfg.tracker
+        # Recovered?
+        if self.f_conf > t.conf_predict:
+            self._enter(RaceState.TRACK, now, "reacquired")
+            return self._track_step(now)
+        if now - self.state_started_at >= t.search_timeout_sec:
+            self._enter(RaceState.STOPPED, now, "search_timeout")
+            return MotionCommand(0.0, 0.0, "search_timeout", self.state, None)
+        # Sweep toward the last known side; never stall at w=0.
+        hint = self.f_e0 if abs(self.f_e0) > 1e-3 else (1.0 if self.d_e0 >= 0 else -1.0)
+        sign = -1.0 if hint > 0 else 1.0
+        w = sign * max(abs(self.f_e0) * t.w_search, t.w_search_min)
+        return MotionCommand(0.0, w, "line_search", self.state, None)
 
     def _enter(self, state: RaceState, now: float, event: str) -> None:
         self.state = state
         self.state_started_at = now
         self.last_event = event
-
+        if state != RaceState.TRACK:
+            self.in_pivot = False

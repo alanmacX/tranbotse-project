@@ -14,8 +14,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from transbot_race.config import RaceConfig  # noqa: E402
-from transbot_race.state_machine import RaceState, RaceStateMachine  # noqa: E402
-from transbot_race.vision import draw_debug_overlay, preprocess_blackline, scan_line_features  # noqa: E402
+from transbot_race.state_machine import RaceStateMachine, command_summary  # noqa: E402
+from transbot_race.vision import (  # noqa: E402
+    draw_debug_overlay,
+    fit_line_trajectory,
+    preprocess_blackline,
+    scan_line_features,
+)
 
 
 def update_dataclass(obj: object, values: dict) -> None:
@@ -102,7 +107,6 @@ def run(args: argparse.Namespace) -> int:
 
     start = time.monotonic()
     last_log = 0.0
-    corner_started = False
     try:
         stop_chassis(bot, count=3, delay=0.03)
         while time.monotonic() - start < args.max_sec:
@@ -112,52 +116,19 @@ def run(args: argparse.Namespace) -> int:
                 time.sleep(0.05)
                 continue
             crop, (x0, y0, x1, y1), track_center = crop_frame(frame, cfg)
+            crop_w = x1 - x0
             mask = preprocess_blackline(crop, cfg.vision)
             features = scan_line_features(mask, cfg.vision, crop_center=track_center)
-            command = sm.step(features, now=time.monotonic())
-            if command.reason == "corner_forward" and args.force_turn_dir:
-                sm.active_turn_dir = args.force_turn_dir
+            fit = fit_line_trajectory(features, cfg.vision, crop_center=track_center, crop_width=crop_w)
+            command = sm.step(fit, now=time.monotonic())
             cmd_v, cmd_w = command.v, command.w
-            if args.force_turn_dir and command.state in (RaceState.TIMED_TURN, RaceState.REACQUIRE):
-                cmd_w = args.force_turn_dir * cfg.corner.turn_w
-            if command.reason in {"corner_forward", "turn_start", "timed_turn", "reacquire_turn"}:
-                corner_started = True
-            if args.stop_after_corner and corner_started and sm.last_event == "reacquired":
-                stop_chassis(bot, count=8, delay=0.035)
-                print(
-                    json.dumps(
-                        {
-                            "t": round(time.monotonic() - start, 2),
-                            "state": sm.state.value,
-                            "reason": "corner_done_stop",
-                            "found": features.found,
-                            "err": round(features.err_norm, 3),
-                        },
-                        ensure_ascii=False,
-                    )
-                )
-                break
             bot.set_car_motion(cmd_v, cmd_w)
 
             now = time.monotonic()
             if now - last_log >= args.log_period:
-                print(
-                    json.dumps(
-                        {
-                            "t": round(now - start, 2),
-                            "state": sm.state.value,
-                            "reason": command.reason,
-                            "v": round(cmd_v, 4),
-                            "w": round(cmd_w, 4),
-                            "force_turn_dir": args.force_turn_dir,
-                            "found": features.found,
-                            "err": round(features.err_norm, 3),
-                            "left": None if features.branch_left is None else round(features.branch_left.y, 1),
-                            "right": None if features.branch_right is None else round(features.branch_right.y, 1),
-                        },
-                        ensure_ascii=False,
-                    )
-                )
+                summary = command_summary(command, fit)
+                summary["t"] = round(now - start, 2)
+                print(json.dumps(summary, ensure_ascii=False))
                 last_log = now
 
             if args.display:
@@ -176,7 +147,7 @@ def run(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run the integrated Transbot race controller.")
+    parser = argparse.ArgumentParser(description="Run the unified Transbot race tracker.")
     parser.add_argument("--config", default=str(ROOT / "configs/race_config.json"))
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--max-sec", type=float, default=60.0)
@@ -185,8 +156,6 @@ def main() -> int:
     parser.add_argument("--light", type=int, default=80)
     parser.add_argument("--display", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--stop-after-corner", action="store_true")
-    parser.add_argument("--force-turn-dir", type=float, default=0.0)
     return run(parser.parse_args())
 
 

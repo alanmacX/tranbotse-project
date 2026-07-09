@@ -18,9 +18,14 @@ import cv2 as cv
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from transbot_race.config import RaceConfig  # noqa: E402
-from transbot_race.state_machine import RaceStateMachine  # noqa: E402
-from transbot_race.vision import draw_debug_overlay, preprocess_blackline, scan_line_features  # noqa: E402
+from transbot_race.config import RaceConfig, TrackerConfig  # noqa: E402
+from transbot_race.state_machine import RaceStateMachine, command_summary  # noqa: E402
+from transbot_race.vision import (  # noqa: E402
+    draw_debug_overlay,
+    fit_line_trajectory,
+    preprocess_blackline,
+    scan_line_features,
+)
 
 
 HOST = "127.0.0.1"
@@ -114,9 +119,8 @@ HTML = """
         <div class="row"><label>SSH</label><input id="ssh_target" type="text" value="yahboom"><button onclick="deploy()">Deploy</button></div>
         <div class="row"><label>最长秒</label><input id="live_max_sec" type="range" min="2" max="120" step="1"><input id="live_max_secn" type="number" step="1"></div>
         <div class="buttons">
-          <button class="primary" onclick="startProfile('line')">直线单测</button>
-          <button class="primary" onclick="startProfile('corner_right')">右直角单测</button>
-          <button class="primary" onclick="startProfile('corner_left')">左直角单测</button>
+          <button class="primary" onclick="startProfile('line')">巡线单测</button>
+          <button class="primary" onclick="startProfile('corner')">拐点单测</button>
           <button class="primary" onclick="startProfile('gap')">虚线/丢线单测</button>
           <button class="final" onclick="startProfile('final')">最终超级运行</button>
           <button class="danger" onclick="stopRace()">强制停车</button>
@@ -137,11 +141,13 @@ HTML = """
     </div>
     <aside>
       <section>
-        <h2>巡线 / 直角共用参数</h2>
-        <div class="row"><label>速度</label><input id="line.speed" type="range" min="0.01" max="0.06" step="0.005"><input id="line.speedn" type="number" step="0.005"></div>
-        <div class="row"><label>转向Kp</label><input id="line.kp" type="range" min="0.05" max="0.6" step="0.01"><input id="line.kpn" type="number" step="0.01"></div>
-        <div class="row"><label>最大转向</label><input id="line.max_w" type="range" min="0.05" max="0.6" step="0.01"><input id="line.max_wn" type="number" step="0.01"></div>
-        <button onclick="resetLegacyDefaults()">恢复旧版实测默认</button>
+        <h2>巡线 / 控制律参数</h2>
+        <div class="row"><label>速度</label><input id="tracker.v_max" type="range" min="0.01" max="0.12" step="0.005"><input id="tracker.v_maxn" type="number" step="0.005"></div>
+        <div class="row"><label>k_e(偏差)</label><input id="tracker.k_e" type="range" min="0.05" max="0.6" step="0.01"><input id="tracker.k_en" type="number" step="0.01"></div>
+        <div class="row"><label>k_theta(朝向)</label><input id="tracker.k_theta" type="range" min="0.0" max="0.8" step="0.01"><input id="tracker.k_thetan" type="number" step="0.01"></div>
+        <div class="row"><label>k_ff(曲率)</label><input id="tracker.k_ff" type="range" min="0.0" max="0.6" step="0.01"><input id="tracker.k_ffn" type="number" step="0.01"></div>
+        <div class="row"><label>最大转向</label><input id="tracker.max_w" type="range" min="0.05" max="0.6" step="0.01"><input id="tracker.max_wn" type="number" step="0.01"></div>
+        <button onclick="resetLegacyDefaults()">恢复实测默认</button>
       </section>
       <section>
         <h2>相机云台</h2>
@@ -164,20 +170,21 @@ HTML = """
         </div>
       </section>
       <section>
-        <h2>直角弯参数</h2>
-        <div class="row"><label>方向</label><select id="corner.mode"><option value="auto">自动</option><option value="right">右转</option><option value="left">左转</option><option value="off">关闭</option></select><button onclick="saveConfig()">应用</button></div>
-        <div class="row"><label>直走秒</label><input id="corner.forward_sec" type="range" min="0" max="5" step="0.05"><input id="corner.forward_secn" type="number" step="0.05"></div>
-        <div class="row"><label>转弯秒</label><input id="corner.turn_sec" type="range" min="0.5" max="4" step="0.05"><input id="corner.turn_secn" type="number" step="0.05"></div>
+        <h2>拐点(pivot-assist)参数</h2>
+        <div class="row"><label>触发偏差</label><input id="tracker.e_pivot" type="range" min="0.2" max="2.0" step="0.05"><input id="tracker.e_pivotn" type="number" step="0.05"></div>
+        <div class="row"><label>触发朝向</label><input id="tracker.theta_pivot" type="range" min="0.2" max="2.0" step="0.05"><input id="tracker.theta_pivotn" type="number" step="0.05"></div>
+        <div class="row"><label>pivot角速</label><input id="tracker.w_pivot" type="range" min="0.1" max="0.6" step="0.01"><input id="tracker.w_pivotn" type="number" step="0.01"></div>
+        <div class="row"><label>pivot速度比</label><input id="tracker.v_pivot_ratio" type="range" min="0.0" max="0.5" step="0.02"><input id="tracker.v_pivot_ration" type="number" step="0.02"></div>
         <div class="row"><label>触发线</label><input id="vision.trigger_y_frac" type="range" min="0.1" max="0.8" step="0.05"><input id="vision.trigger_y_fracn" type="number" step="0.05"></div>
-        <div class="row"><label>确认帧</label><input id="corner.confirm_frames" type="range" min="1" max="6" step="1"><input id="corner.confirm_framesn" type="number" step="1"></div>
-        <div class="row"><label>转弯角速</label><input id="corner.turn_w" type="range" min="0.05" max="0.6" step="0.01"><input id="corner.turn_wn" type="number" step="0.01"></div>
-        <p class="hint">旧版逻辑：分支跨过触发线后，直走指定秒数，再转弯指定秒数。</p>
+        <button onclick="saveConfig()">应用</button>
+        <p class="hint">连续控制:偏差/朝向超过阈值即近零速原地对准,任意角度拐点统一处理,无独立状态。</p>
       </section>
       <section>
-        <h2>虚线/细线预处理</h2>
+        <h2>虚线/丢线 + 圆环偏置</h2>
         <div class="row"><label>min_width</label><input id="vision.min_run_width_px" type="range" min="1" max="40" step="1"><input id="vision.min_run_width_pxn" type="number" step="1"></div>
         <div class="row"><label>min_area</label><input id="vision.min_run_area_px" type="range" min="1" max="200" step="1"><input id="vision.min_run_area_pxn" type="number" step="1"></div>
-        <div class="row"><label>blind_s</label><input id="gap.blind_sec" type="range" min="0" max="3" step="0.05"><input id="gap.blind_secn" type="number" step="0.05"></div>
+        <div class="row"><label>conf衰减</label><input id="tracker.conf_decay" type="range" min="0.02" max="0.4" step="0.01"><input id="tracker.conf_decayn" type="number" step="0.01"></div>
+        <div class="row"><label>圆环偏置</label><input id="tracker.e_bias" type="range" min="-0.5" max="0.5" step="0.02"><input id="tracker.e_biasn" type="number" step="0.02"></div>
       </section>
       <section>
         <h2>Crop / 视野</h2>
@@ -200,7 +207,7 @@ HTML = """
     </aside>
   </main>
   <script>
-    const ids = ["line.speed","line.kp","line.max_w","vision.trigger_y_frac","corner.confirm_frames","corner.forward_sec","corner.turn_w","corner.turn_sec","vision.min_run_width_px","vision.min_run_area_px","gap.blind_sec","camera.crop.0","camera.crop.1","camera.crop.2","camera.crop.3","ui.cam1","ui.cam2","ui.j1","ui.j2","ui.j3","ui.arm_ms","live_max_sec"];
+    const ids = ["tracker.v_max","tracker.k_e","tracker.k_theta","tracker.k_ff","tracker.max_w","tracker.e_pivot","tracker.theta_pivot","tracker.w_pivot","tracker.v_pivot_ratio","tracker.conf_decay","tracker.e_bias","vision.trigger_y_frac","vision.min_run_width_px","vision.min_run_area_px","camera.crop.0","camera.crop.1","camera.crop.2","camera.crop.3","ui.cam1","ui.cam2","ui.j1","ui.j2","ui.j3","ui.arm_ms","live_max_sec"];
     function log(msg){ const el=document.getElementById("log"); el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}\\n` + el.textContent; }
     function bind(id){ const r=document.getElementById(id), n=document.getElementById(id+"n"); if(!r||!n)return; const sync=(from)=>{ if(from===r)n.value=r.value; else r.value=n.value; if(id.startsWith("camera.crop")) updateCropBox(); }; r.addEventListener("input",()=>sync(r)); n.addEventListener("input",()=>sync(n)); }
     ids.forEach(bind);
@@ -208,11 +215,10 @@ HTML = """
     function getVal(id){ return Number(document.getElementById(id).value); }
     async function api(path, body){ const res=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})}); const data=await res.json(); if(!res.ok||!data.ok) throw new Error(data.error||res.statusText); return data; }
     async function showError(label, fn){ try { return await fn(); } catch(e) { log(label+" FAILED: "+e.message); setTimeout(refreshLogs,500); } }
-    function flatten(cfg){ return {line:cfg.line, vision:cfg.vision, corner:cfg.corner, gap:cfg.gap}; }
     function readCfgValue(cfg,id){ const parts=id.split("."); let cur=cfg; for(const p of parts){ cur=Array.isArray(cur)?cur[Number(p)]:cur[p]; } return cur; }
     function writeCfgValue(body,id,value){ const parts=id.split("."); let cur=body; for(let i=0;i<parts.length-1;i++){ const p=parts[i]; if(cur[p]===undefined)cur[p]={}; cur=cur[p]; } cur[parts[parts.length-1]]=value; }
-    async function loadConfig(){ const cfg=await (await fetch("/api/config")).json(); for(const id of ids){ setVal(id, id==="live_max_sec" ? cfg.ui.live_max_sec : readCfgValue(cfg,id)); } document.getElementById("corner.mode").value=cfg.corner.mode; log("CONFIG loaded"); reloadVideo(); }
-    async function saveConfig(){ const body={line:{},vision:{},corner:{},gap:{},camera:{},ui:{}}; body.camera.crop=[getVal("camera.crop.0"),getVal("camera.crop.1"),getVal("camera.crop.2"),getVal("camera.crop.3")]; for(const id of ids){ if(id.startsWith("camera.crop"))continue; if(id==="live_max_sec"){ body.ui.live_max_sec=getVal(id); continue; } writeCfgValue(body,id,getVal(id)); } body.corner.mode=document.getElementById("corner.mode").value; await api("/api/config",body); log("CONFIG saved"); }
+    async function loadConfig(){ const cfg=await (await fetch("/api/config")).json(); for(const id of ids){ setVal(id, id==="live_max_sec" ? cfg.ui.live_max_sec : readCfgValue(cfg,id)); } log("CONFIG loaded"); reloadVideo(); }
+    async function saveConfig(){ const body={tracker:{},vision:{},camera:{},ui:{}}; body.camera.crop=[getVal("camera.crop.0"),getVal("camera.crop.1"),getVal("camera.crop.2"),getVal("camera.crop.3")]; for(const id of ids){ if(id.startsWith("camera.crop"))continue; if(id==="live_max_sec"){ body.ui.live_max_sec=getVal(id); continue; } writeCfgValue(body,id,getVal(id)); } await api("/api/config",body); log("CONFIG saved"); }
     async function analyze(){ await showError("ANALYZE", async()=>{ await saveConfig(); const d=await api("/api/analyze",{image_path:document.getElementById("image_path").value}); document.getElementById("image").src="data:image/jpeg;base64,"+d.image; log(JSON.stringify(d.summary,null,2)); }); }
     async function deploy(){ await showError("DEPLOY", async()=>{ await saveConfig(); const d=await api("/api/deploy",{ssh_target:document.getElementById("ssh_target").value}); log("DEPLOY OK: "+d.message); }); }
     async function startProfile(profile){ await showError("START "+profile, async()=>{ await saveConfig(); const d=await api("/api/live/start",{profile,ssh_target:document.getElementById("ssh_target").value,max_sec:getVal("live_max_sec")}); log("RUNNING "+profile+": "+d.message); setTimeout(refreshLogs,800); }); }
@@ -243,7 +249,7 @@ HTML = """
 
 
 def _deep_update_cfg(cfg: RaceConfig, data: dict) -> None:
-    for section_name in ("camera", "vision", "line", "corner", "gap"):
+    for section_name in ("camera", "vision", "tracker"):
         section = getattr(cfg, section_name)
         values = data.get(section_name)
         if not isinstance(values, dict):
@@ -442,33 +448,23 @@ def _sync_live_files(ssh_target: str) -> None:
 def _apply_profile(profile: str) -> str:
     profile = (profile or "final").strip()
     if profile == "line":
-        CONFIG.corner.mode = "off"
-        CONFIG.gap.enabled = False
-        return "直线单状态机：corner=off, gap=off"
-    if profile == "corner_right":
-        # Single-corner tests use the first-commit behavior: detect a corner,
-        # then force the physical turn direction from the button.
-        CONFIG.corner.mode = "auto"
-        CONFIG.corner.right_turn_dir = -1.0
-        CONFIG.corner.left_turn_dir = -1.0
-        CONFIG.gap.enabled = True
-        return "右直角单状态机：检测任意直角后强制右转"
-    if profile == "corner_left":
-        CONFIG.corner.mode = "auto"
-        CONFIG.corner.right_turn_dir = 1.0
-        CONFIG.corner.left_turn_dir = 1.0
-        CONFIG.gap.enabled = True
-        return "左直角单状态机：检测任意直角后强制左转"
+        # Pure follow: disable pivot/bias so straight + gentle curve is isolated.
+        CONFIG.tracker.e_pivot = 2.0
+        CONFIG.tracker.theta_pivot = 2.0
+        CONFIG.tracker.e_bias = 0.0
+        return "巡线单测:关闭 pivot/bias,仅连续跟踪"
+    if profile == "corner":
+        # Exercise the pivot-assist branch for sharp bends of any angle.
+        CONFIG.tracker.e_pivot = 0.55
+        CONFIG.tracker.theta_pivot = 0.65
+        return "拐点单测:开启 pivot-assist(任意角度)"
     if profile == "gap":
-        CONFIG.corner.mode = "off"
-        CONFIG.gap.enabled = True
-        return "虚线/丢线单状态机：corner=off, gap=on"
+        # Bias the confidence filter toward carrying through longer gaps.
+        CONFIG.tracker.conf_decay = 0.10
+        CONFIG.tracker.predict_speed_factor = 0.7
+        return "虚线/丢线单测:延长预测穿越"
     if profile == "final":
-        CONFIG.corner.mode = "auto"
-        CONFIG.corner.right_turn_dir = -1.0
-        CONFIG.corner.left_turn_dir = 1.0
-        CONFIG.gap.enabled = True
-        return "最终全流程：corner=auto, gap=on"
+        return "最终全流程:统一跟踪器默认参数"
     raise ValueError(f"unknown run profile: {profile}")
 
 
@@ -480,33 +476,14 @@ def _reset_legacy_single_state_defaults() -> None:
     CONFIG.vision.percentile = 32
     CONFIG.vision.threshold_min = 25
     CONFIG.vision.threshold_max = 120
+    CONFIG.vision.band_count = 7
     CONFIG.vision.active_col_ratio = 0.18
     CONFIG.vision.min_run_width_px = 10
     CONFIG.vision.min_run_area_px = 30
     CONFIG.vision.branch_width_ratio = 2.2
     CONFIG.vision.branch_min_crop_ratio = 0.22
     CONFIG.vision.trigger_y_frac = 0.30
-    CONFIG.line.speed = 0.06
-    CONFIG.line.kp = 0.24
-    CONFIG.line.max_w = 0.24
-    CONFIG.line.slow_on_error = 0.45
-    CONFIG.line.max_slowdown = 0.55
-    CONFIG.line.invert_turn = False
-    CONFIG.corner.mode = "right"
-    CONFIG.corner.confirm_frames = 2
-    CONFIG.corner.forward_sec = 5.0
-    CONFIG.corner.turn_w = 0.38
-    CONFIG.corner.turn_sec = 2.3
-    CONFIG.corner.right_turn_dir = -1.0
-    CONFIG.corner.left_turn_dir = 1.0
-    CONFIG.corner.reacquire_confirm_frames = 3
-    CONFIG.corner.reacquire_err_norm = 0.50
-    CONFIG.gap.enabled = True
-    CONFIG.gap.missing_frames = 4
-    CONFIG.gap.blind_sec = 1.2
-    CONFIG.gap.blind_speed_factor = 0.70
-    CONFIG.gap.blind_turn_factor = 0.35
-    CONFIG.gap.search_w = 0.16
+    CONFIG.tracker = TrackerConfig()
 
 
 def stop_live_processes(ssh_target: str) -> None:
@@ -650,24 +627,16 @@ class Handler(BaseHTTPRequestHandler):
         if frame is None:
             raise RuntimeError(f"cannot read image: {path}")
         mask = preprocess_blackline(frame, CONFIG.vision)
+        crop_w = float(frame.shape[1])
         features = scan_line_features(mask, CONFIG.vision)
+        fit = fit_line_trajectory(features, CONFIG.vision, crop_center=crop_w / 2.0, crop_width=crop_w)
         sm = RaceStateMachine(CONFIG)
-        command = sm.step(features, now=time.monotonic())
+        command = sm.step(fit, now=time.monotonic())
         overlay = draw_debug_overlay(frame, features, CONFIG.vision.trigger_y_frac)
         ok, buf = cv.imencode(".jpg", overlay, [int(cv.IMWRITE_JPEG_QUALITY), 82])
         if not ok:
             raise RuntimeError("failed to encode debug image")
-        summary = {
-            "state": command.state.value,
-            "reason": command.reason,
-            "v": round(command.v, 4),
-            "w": round(command.w, 4),
-            "found": features.found,
-            "err_norm": round(features.err_norm, 4),
-            "line_width_px": round(features.line_width_px, 2),
-            "branch_left": None if features.branch_left is None else features.branch_left.y,
-            "branch_right": None if features.branch_right is None else features.branch_right.y,
-        }
+        summary = command_summary(command, fit)
         return {"ok": True, "summary": summary, "image": base64.b64encode(buf).decode("ascii")}
 
     def _camera(self, data: dict) -> dict:
@@ -723,7 +692,6 @@ class Handler(BaseHTTPRequestHandler):
         ssh_target = _ssh_target(data)
         max_sec = max(1.0, min(300.0, float(data.get("max_sec", 60))))
         profile = str(data.get("profile", "final"))
-        force_turn_dir = 0.0
         with LOG_LOCK:
             RUN_LOGS.clear()
         _log_event(f"SSH CHECK: target={ssh_target}")
@@ -740,15 +708,9 @@ class Handler(BaseHTTPRequestHandler):
             _config_restore(snapshot)
         _sync_live_files(ssh_target)
         stop_live_processes(ssh_target)
-        corner_stop_flag = " --stop-after-corner" if profile in {"corner_right", "corner_left"} else ""
-        if profile == "corner_right":
-            force_turn_dir = -1.0
-        elif profile == "corner_left":
-            force_turn_dir = 1.0
-        force_turn_flag = f" --force-turn-dir {force_turn_dir:.1f}" if force_turn_dir else ""
         command = (
             f"cd {REMOTE_ROOT} && "
-            f"python3 -u apps/race_runner.py --config {LIVE_CONFIG_REL} --max-sec {max_sec:.1f}{corner_stop_flag}{force_turn_flag}"
+            f"python3 -u apps/race_runner.py --config {LIVE_CONFIG_REL} --max-sec {max_sec:.1f}"
         )
         proc = subprocess.Popen(
             ["ssh", ssh_target, command],
@@ -764,7 +726,7 @@ class Handler(BaseHTTPRequestHandler):
         with RUN_LOCK:
             RUN_PROCS.add(proc)
         _track_process_logs(proc)
-        _log_event(f"RUNNING: {profile_note}, max_sec={max_sec:.1f}, force_turn_dir={force_turn_dir:.1f}, target={ssh_target}")
+        _log_event(f"RUNNING: {profile_note}, max_sec={max_sec:.1f}, target={ssh_target}")
         return {"ok": True, "message": f"{profile_note}; runner on {ssh_target} for {max_sec:.1f}s"}
 
     def _stop_live(self, data: dict) -> dict:

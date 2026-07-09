@@ -21,7 +21,7 @@ class VisionConfig:
     percentile: int = 32
     threshold_min: int = 25
     threshold_max: int = 120
-    band_count: int = 5
+    band_count: int = 7
     active_col_ratio: float = 0.18
     min_run_width_px: int = 10
     min_run_area_px: int = 30
@@ -31,55 +31,56 @@ class VisionConfig:
 
 
 @dataclass(slots=True)
-class LineControlConfig:
-    """Line-following controller parameters."""
+class TrackerConfig:
+    """Unified continuous line tracker.
 
-    speed: float = 0.06
-    kp: float = 0.24
-    max_w: float = 0.24
-    slow_on_error: float = 0.45
-    max_slowdown: float = 0.55
+    Corners (any angle), dashed lines and roundabouts are handled by one control
+    law over the trajectory fit (e0, theta, kappa) plus a confidence filter,
+    rather than by per-case states.
+    """
+
+    # Base motion.
+    v_max: float = 0.06
+    v_min_ratio: float = 0.35        # floor on v as a fraction of v_max
     invert_turn: bool = False
 
+    # Control law: w = k_e*e0 + k_theta*theta + k_ff*kappa.
+    k_e: float = 0.24
+    k_theta: float = 0.30
+    k_ff: float = 0.20
+    max_w: float = 0.30
+    slow_gain: float = 0.55          # how much |w| cuts speed (0..1)
 
-@dataclass(slots=True)
-class CornerConfig:
-    """Timed right-angle maneuver parameters."""
+    # Confidence filter: below conf_predict the controller runs on prediction
+    # only, carrying the car through dashed/occluded gaps.
+    filter_alpha: float = 0.55       # position blend when a fit is present
+    filter_beta: float = 0.25        # rate blend
+    conf_predict: float = 0.35       # below this, run on prediction only
+    conf_decay: float = 0.15         # conf lost per predicted frame
+    conf_lost: float = 0.12          # predicted conf that trips LOST
+    predict_speed_factor: float = 0.7
 
-    mode: str = "right"  # "auto", "left", "right", or "off"
-    confirm_frames: int = 2
-    forward_sec: float = 5.0
-    turn_w: float = 0.38
-    turn_sec: float = 2.3
-    right_turn_dir: float = -1.0
-    left_turn_dir: float = 1.0
-    reacquire_confirm_frames: int = 3
-    reacquire_err_norm: float = 0.50
-    reacquire_timeout_sec: float = 3.0
+    # Pivot assist: a saturation branch of the same controller, entered when the
+    # line is far off / sharply angled (covers corners of any angle).
+    e_pivot: float = 0.55
+    theta_pivot: float = 0.65        # radians
+    pivot_hysteresis: float = 0.12   # fractional widening to exit pivot
+    v_pivot_ratio: float = 0.0       # v during pivot, fraction of v_max
+    w_pivot: float = 0.34
 
-
-@dataclass(slots=True)
-class GapConfig:
-    """Dashed or missing line behavior."""
-
-    enabled: bool = True
-    missing_frames: int = 4
-    blind_sec: float = 1.2
-    blind_speed_factor: float = 0.70
-    blind_turn_factor: float = 0.35
-    search_w: float = 0.16
-    # Minimum |w| while searching, so a line lost near the crop center
-    # (last_err_norm ~= 0) still sweeps instead of stalling at w=0.
-    search_w_min: float = 0.10
+    # LOST search sweep.
+    w_search: float = 0.16
+    w_search_min: float = 0.10
     search_timeout_sec: float = 3.0
+
+    # Optional branch bias for roundabout / fork exit selection.
+    e_bias: float = 0.0              # + biases toward right side, - toward left
 
 
 @dataclass(slots=True)
 class RaceConfig:
-    """Single source of truth for the integrated course state machine."""
+    """Single source of truth for the unified course tracker."""
 
     camera: CameraConfig = field(default_factory=CameraConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
-    line: LineControlConfig = field(default_factory=LineControlConfig)
-    corner: CornerConfig = field(default_factory=CornerConfig)
-    gap: GapConfig = field(default_factory=GapConfig)
+    tracker: TrackerConfig = field(default_factory=TrackerConfig)

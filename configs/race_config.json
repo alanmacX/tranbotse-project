@@ -15,39 +15,37 @@
     "percentile": 32,
     "threshold_min": 25,
     "threshold_max": 120,
-    "band_count": 5,
+    "band_count": 7,
     "active_col_ratio": 0.18,
     "min_run_width_px": 10,
     "min_run_area_px": 30,
     "branch_width_ratio": 2.2,
     "branch_min_crop_ratio": 0.22,
-    "trigger_y_frac": 0.25
+    "trigger_y_frac": 0.3
   },
-  "line": {
-    "speed": 0.06,
-    "kp": 0.24,
-    "max_w": 0.24,
-    "slow_on_error": 0.45,
-    "max_slowdown": 0.55,
-    "invert_turn": false
-  },
-  "corner": {
-    "mode": "auto",
-    "confirm_frames": 2,
-    "forward_sec": 5.0,
-    "turn_w": 0.38,
-    "turn_sec": 2.35,
-    "right_turn_dir": -1.0,
-    "left_turn_dir": 1.0,
-    "reacquire_confirm_frames": 3,
-    "reacquire_err_norm": 0.5
-  },
-  "gap": {
-    "enabled": true,
-    "missing_frames": 4,
-    "blind_sec": 1.2,
-    "blind_speed_factor": 0.7,
-    "blind_turn_factor": 0.35,
-    "search_w": 0.16
+  "tracker": {
+    "v_max": 0.06,
+    "v_min_ratio": 0.35,
+    "invert_turn": false,
+    "k_e": 0.24,
+    "k_theta": 0.3,
+    "k_ff": 0.2,
+    "max_w": 0.3,
+    "slow_gain": 0.55,
+    "filter_alpha": 0.55,
+    "filter_beta": 0.25,
+    "conf_predict": 0.35,
+    "conf_decay": 0.15,
+    "conf_lost": 0.12,
+    "predict_speed_factor": 0.7,
+    "e_pivot": 0.55,
+    "theta_pivot": 0.65,
+    "pivot_hysteresis": 0.12,
+    "v_pivot_ratio": 0.0,
+    "w_pivot": 0.34,
+    "w_search": 0.16,
+    "w_search_min": 0.1,
+    "search_timeout_sec": 3.0,
+    "e_bias": 0.0
   }
 }

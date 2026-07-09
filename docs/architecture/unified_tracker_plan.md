@@ -1,8 +1,8 @@
 # 统一巡线控制器改造方案(Implementation Doc)
 
-状态:设计稿,尚未实施。
-基线:当前工作区(`transbot_race/*` + `apps/race_runner.py` + `apps/race_debug_app.py`),
-在其上重构;首先把现状 commit 作为回退锚点。
+状态:已实施(Phase 0-3 落地)。Phase 4 实机标定待现场进行。
+基线:branch `unified-tracker`,anchor commit 保存了改造前的旧状态机。
+本文既是设计说明,也是标定与回退参考。
 
 ## 1. 动机
 
