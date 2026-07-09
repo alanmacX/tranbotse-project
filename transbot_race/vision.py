@@ -171,6 +171,123 @@ def scan_line_features(mask: np.ndarray, cfg: VisionConfig, crop_center: float |
     )
 
 
+@dataclass(frozen=True, slots=True)
+class TrajectoryFit:
+    """Continuous estimate of the line as seen in the crop.
+
+    Angle-agnostic: gentle curves, sharp/right-angle corners, dashed lines and
+    roundabouts are all expressed through (e0, theta, kappa, conf) instead of
+    discrete states. e0/theta/kappa are normalized so the controller gains are
+    resolution-independent.
+    """
+
+    found: bool
+    e0: float = 0.0          # bottom lateral error, normalized to [-1, 1]
+    theta: float = 0.0       # line heading vs car forward, radians (approx)
+    kappa: float = 0.0       # normalized curvature (0 straight, >0 bends right)
+    conf: float = 0.0        # overall fit confidence [0, 1]
+    n_bands: int = 0         # number of bands that contributed
+    quadratic: bool = False  # whether the quadratic term was used
+
+
+def _band_confidence(run: Run, band_height: float, line_width: float, cfg: VisionConfig) -> float:
+    """Per-band confidence from area adequacy and width plausibility."""
+    if run is None or line_width <= 0:
+        return 0.0
+    area_conf = min(1.0, run.area / max(1.0, cfg.min_run_area_px * 3.0))
+    width_ratio = run.width / line_width
+    # Peak confidence when width ~= expected line width; a branch/junction run
+    # is much wider, so it is down-weighted rather than trusted as the center.
+    width_conf = max(0.0, 1.0 - abs(width_ratio - 1.0))
+    return max(0.0, min(1.0, 0.5 * area_conf + 0.5 * width_conf))
+
+
+def fit_line_trajectory(
+    features: LineFeatures,
+    cfg: VisionConfig,
+    crop_center: float,
+    crop_width: float,
+) -> TrajectoryFit:
+    """Weighted polynomial fit of the line centerline across scan bands.
+
+    Uses each band's best run as a sample (y_mid, cx) weighted by a per-band
+    confidence. Falls back from quadratic to linear when fewer than 4 bands are
+    available, so dashed lines (sparse bands) still yield a stable estimate.
+    """
+    half_width = max(crop_width / 2.0, 1.0)
+    line_width = features.line_width_px if features.line_width_px > 0 else 8.0
+
+    ys: list[float] = []
+    xs: list[float] = []
+    ws: list[float] = []
+    for band in features.bands:
+        if band.best is None:
+            continue
+        band_h = float(max(1, band.y1 - band.y0))
+        conf = _band_confidence(band.best, band_h, line_width, cfg)
+        if conf <= 0.0:
+            continue
+        y_mid = (band.y0 + band.y1) / 2.0
+        # Weight the bottom of the crop (nearest the car) more heavily.
+        near_bias = 1.0 + 0.5 * (band.index == 0)
+        ys.append(y_mid)
+        xs.append(band.best.cx)
+        ws.append(conf * near_bias)
+
+    n = len(ys)
+    if n == 0:
+        return TrajectoryFit(found=False)
+
+    y_arr = np.asarray(ys, dtype=np.float64)
+    x_arr = np.asarray(xs, dtype=np.float64)
+    w_arr = np.asarray(ws, dtype=np.float64)
+
+    # RANSAC-lite: with enough bands, drop the single worst residual once so a
+    # roundabout entry/exit stub or a corner branch cannot drag the whole fit.
+    degree = 2 if n >= 4 else 1
+    use_quadratic = degree == 2
+    coeffs = np.polyfit(y_arr, x_arr, degree, w=w_arr)
+    if n >= 5:
+        resid = np.abs(np.polyval(coeffs, y_arr) - x_arr)
+        drop = int(np.argmax(resid))
+        keep = np.ones(n, dtype=bool)
+        keep[drop] = False
+        y_arr, x_arr, w_arr = y_arr[keep], x_arr[keep], w_arr[keep]
+        n = int(keep.sum())
+        degree = 2 if n >= 4 else 1
+        use_quadratic = degree == 2
+        coeffs = np.polyfit(y_arr, x_arr, degree, w=w_arr)
+
+    y_bottom = float(y_arr.max())
+    cx_bottom = float(np.polyval(coeffs, y_bottom))
+    e0 = max(-1.0, min(1.0, (cx_bottom - crop_center) / half_width))
+
+    if use_quadratic:
+        a2, a1, _a0 = coeffs
+        slope = 2.0 * a2 * y_bottom + a1        # dcx/dy at the bottom
+        curvature = 2.0 * a2
+    else:
+        a1, _a0 = coeffs
+        slope = a1
+        curvature = 0.0
+
+    # Car forward is "up" the image (decreasing y). Positive theta => line bends
+    # toward +x (right) as we look ahead. Sign chosen so theta and e0 agree.
+    theta = float(np.arctan2(-slope, 1.0))
+    kappa = max(-1.0, min(1.0, curvature * half_width))
+
+    conf = float(min(1.0, w_arr.sum() / (cfg.band_count * 0.9)))
+    return TrajectoryFit(
+        found=True,
+        e0=e0,
+        theta=theta,
+        kappa=kappa,
+        conf=conf,
+        n_bands=n,
+        quadratic=use_quadratic,
+    )
+
+
 def draw_debug_overlay(frame_bgr: np.ndarray, features: LineFeatures, trigger_y_frac: float, crop_center: float | None = None) -> np.ndarray:
     """Draw scan bands, line center, branches, and the corner trigger line."""
 
