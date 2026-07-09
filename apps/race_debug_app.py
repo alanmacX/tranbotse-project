@@ -141,17 +141,18 @@ HTML = """
     function setVal(id,v){ document.getElementById(id).value=v; const n=document.getElementById(id+"n"); if(n)n.value=v; }
     function getVal(id){ return Number(document.getElementById(id).value); }
     async function api(path, body){ const res=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})}); const data=await res.json(); if(!res.ok||!data.ok) throw new Error(data.error||res.statusText); return data; }
+    async function showError(label, fn){ try { return await fn(); } catch(e) { log(label+" FAILED: "+e.message); setTimeout(refreshLogs,500); } }
     function flatten(cfg){ return {line:cfg.line, vision:cfg.vision, corner:cfg.corner, gap:cfg.gap}; }
     function readCfgValue(cfg,id){ const parts=id.split("."); let cur=cfg; for(const p of parts){ cur=Array.isArray(cur)?cur[Number(p)]:cur[p]; } return cur; }
     function writeCfgValue(body,id,value){ const parts=id.split("."); let cur=body; for(let i=0;i<parts.length-1;i++){ const p=parts[i]; if(cur[p]===undefined)cur[p]={}; cur=cur[p]; } cur[parts[parts.length-1]]=value; }
     async function loadConfig(){ const cfg=await (await fetch("/api/config")).json(); for(const id of ids){ if(id==="live_max_sec")continue; setVal(id, readCfgValue(cfg,id)); } setVal("live_max_sec",60); document.getElementById("corner.mode").value=cfg.corner.mode; log("CONFIG loaded"); }
     async function saveConfig(){ const body={line:{},vision:{},corner:{},gap:{},camera:{}}; body.camera.crop=[getVal("camera.crop.0"),getVal("camera.crop.1"),getVal("camera.crop.2"),getVal("camera.crop.3")]; for(const id of ids){ if(id==="live_max_sec"||id.startsWith("camera.crop"))continue; writeCfgValue(body,id,getVal(id)); } body.corner.mode=document.getElementById("corner.mode").value; await api("/api/config",body); log("CONFIG saved"); }
-    async function analyze(){ await saveConfig(); const d=await api("/api/analyze",{image_path:document.getElementById("image_path").value}); document.getElementById("image").src="data:image/jpeg;base64,"+d.image; log(JSON.stringify(d.summary,null,2)); }
-    async function deploy(){ await saveConfig(); const d=await api("/api/deploy",{ssh_target:document.getElementById("ssh_target").value}); log("DEPLOY OK: "+d.message); }
-    async function startProfile(profile){ await saveConfig(); const d=await api("/api/live/start",{profile,ssh_target:document.getElementById("ssh_target").value,max_sec:getVal("live_max_sec")}); log("RUNNING "+profile+": "+d.message); setTimeout(refreshLogs,800); }
-    async function stopRace(){ const d=await api("/api/live/stop",{ssh_target:document.getElementById("ssh_target").value}); log(d.message); }
-    async function resetLegacyDefaults(){ const d=await api("/api/defaults/legacy",{}); log(d.message); await loadConfig(); }
-    async function refreshLogs(){ const d=await (await fetch("/api/live/logs")).json(); if(d.logs&&d.logs.length){ document.getElementById("log").textContent=d.logs.join("\\n"); } }
+    async function analyze(){ await showError("ANALYZE", async()=>{ await saveConfig(); const d=await api("/api/analyze",{image_path:document.getElementById("image_path").value}); document.getElementById("image").src="data:image/jpeg;base64,"+d.image; log(JSON.stringify(d.summary,null,2)); }); }
+    async function deploy(){ await showError("DEPLOY", async()=>{ await saveConfig(); const d=await api("/api/deploy",{ssh_target:document.getElementById("ssh_target").value}); log("DEPLOY OK: "+d.message); }); }
+    async function startProfile(profile){ await showError("START "+profile, async()=>{ await saveConfig(); const d=await api("/api/live/start",{profile,ssh_target:document.getElementById("ssh_target").value,max_sec:getVal("live_max_sec")}); log("RUNNING "+profile+": "+d.message); setTimeout(refreshLogs,800); }); }
+    async function stopRace(){ await showError("STOP", async()=>{ const d=await api("/api/live/stop",{ssh_target:document.getElementById("ssh_target").value}); log(d.message); }); }
+    async function resetLegacyDefaults(){ await showError("DEFAULTS", async()=>{ const d=await api("/api/defaults/legacy",{}); log(d.message); await loadConfig(); }); }
+    async function refreshLogs(){ try { const d=await (await fetch("/api/live/logs")).json(); if(d.logs&&d.logs.length){ document.getElementById("log").textContent=d.logs.join("\\n"); } } catch(e) { log("LOG REFRESH FAILED: "+e.message); } }
     function reloadVideo(){ document.getElementById("video").src="/video?ssh_target="+encodeURIComponent(document.getElementById("ssh_target").value)+"&ts="+Date.now(); log("video reconnect"); }
     setInterval(refreshLogs,1200);
     loadConfig();
@@ -248,6 +249,51 @@ def _check_ssh_ready(ssh_target: str) -> None:
     if res.returncode != 0 or "transbot_ssh_ready" not in res.stdout:
         detail = (res.stderr or res.stdout or "ssh probe failed").strip()
         raise RuntimeError(f"SSH CHECK FAILED for {ssh_target}: {detail}")
+
+
+def _check_remote_runner(ssh_target: str) -> None:
+    res = subprocess.run(
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=4",
+            ssh_target,
+            f"test -f {REMOTE_ROOT}/apps/race_runner.py && echo transbot_runner_ready",
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=7,
+    )
+    if res.returncode != 0 or "transbot_runner_ready" not in res.stdout:
+        detail = (res.stderr or res.stdout or f"{REMOTE_ROOT}/apps/race_runner.py not found").strip()
+        raise RuntimeError(f"DEPLOY REQUIRED on {ssh_target}: {detail}")
+
+
+def _push_config_to_remote(ssh_target: str) -> None:
+    remote_config_dir = f"{REMOTE_ROOT}/configs"
+    mkdir = subprocess.run(
+        ["ssh", ssh_target, f"mkdir -p {remote_config_dir}"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=8,
+    )
+    if mkdir.returncode != 0:
+        raise RuntimeError((mkdir.stderr or mkdir.stdout or "remote config mkdir failed").strip())
+    local_config = ROOT / "configs/race_config.json"
+    copy = subprocess.run(
+        ["scp", str(local_config), f"{ssh_target}:{remote_config_dir}/race_config.json"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=12,
+    )
+    if copy.returncode != 0:
+        raise RuntimeError((copy.stderr or copy.stdout or "remote config copy failed").strip())
+    _log_event(f"CONFIG SYNCED: {ssh_target}:{remote_config_dir}/race_config.json")
 
 
 def _apply_profile(profile: str) -> str:
@@ -395,6 +441,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_error(404)
         except Exception as exc:
+            _log_event(f"ERROR: {exc}")
             _json_response(self, 500, {"ok": False, "error": str(exc)})
 
     def _analyze(self, data: dict) -> dict:
@@ -443,12 +490,14 @@ class Handler(BaseHTTPRequestHandler):
     def _start_live(self, data: dict) -> dict:
         ssh_target = _ssh_target(data)
         max_sec = max(1.0, min(300.0, float(data.get("max_sec", 60))))
-        profile_note = _apply_profile(str(data.get("profile", "final")))
-        _write_config_file()
         with LOG_LOCK:
             RUN_LOGS.clear()
         _log_event(f"SSH CHECK: target={ssh_target}")
         _check_ssh_ready(ssh_target)
+        _check_remote_runner(ssh_target)
+        profile_note = _apply_profile(str(data.get("profile", "final")))
+        _write_config_file()
+        _push_config_to_remote(ssh_target)
         stop_live_processes(ssh_target)
         command = (
             f"cd {REMOTE_ROOT} && "
@@ -461,7 +510,7 @@ class Handler(BaseHTTPRequestHandler):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        time.sleep(0.5)
+        time.sleep(1.25)
         if proc.poll() is not None:
             out, err = proc.communicate(timeout=1)
             raise RuntimeError((err or out or "race runner exited immediately").strip())
