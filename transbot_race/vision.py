@@ -81,22 +81,115 @@ class LineFeatures:
         return self.branch_left is not None or self.branch_right is not None
 
 
+def _raw_dark_cap(gray: np.ndarray) -> int:
+    """Dynamic raw-gray cap that keeps black tape and rejects gray shadows."""
+
+    p50 = float(np.percentile(gray, 50))
+    p35 = float(np.percentile(gray, 35))
+    p08 = float(np.percentile(gray, 8))
+    return int(min(112, max(58, min(p50 - 5, p35 + 12, p08 + 24))))
+
+
+def _reflection_guards(frame_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Build hard and near guards around bright specular reflections."""
+
+    gray = cv.cvtColor(frame_bgr, cv.COLOR_BGR2GRAY)
+    hsv = cv.cvtColor(frame_bgr, cv.COLOR_BGR2HSV)
+    bright_threshold = max(150, min(220, int(np.percentile(gray, 98))))
+    core = (
+        (gray >= bright_threshold)
+        | ((hsv[:, :, 2] >= bright_threshold) & (hsv[:, :, 1] <= 75))
+    ).astype(np.uint8) * 255
+    core = cv.morphologyEx(
+        core,
+        cv.MORPH_OPEN,
+        cv.getStructuringElement(cv.MORPH_RECT, (3, 3)),
+        iterations=1,
+    )
+    hard_guard = cv.dilate(
+        core,
+        cv.getStructuringElement(cv.MORPH_ELLIPSE, (27, 23)),
+        iterations=1,
+    )
+    hard_guard = cv.dilate(
+        hard_guard,
+        cv.getStructuringElement(cv.MORPH_RECT, (11, 3)),
+        iterations=1,
+    )
+    near_guard = cv.dilate(
+        hard_guard,
+        cv.getStructuringElement(cv.MORPH_ELLIPSE, (25, 21)),
+        iterations=1,
+    )
+    return hard_guard, near_guard
+
+
+def _filter_preprocess_components(mask: np.ndarray, hard_guard: np.ndarray, near_guard: np.ndarray) -> np.ndarray:
+    """Remove reflection rims, tile seams, and border slivers from a raw mask."""
+
+    height, width = mask.shape[:2]
+    count, labels, stats, _centroids = cv.connectedComponentsWithStats(mask, 8)
+    clean = np.zeros_like(mask)
+    hard_bool = hard_guard > 0
+    near_bool = near_guard > 0
+    for component_id in range(1, count):
+        x = int(stats[component_id, cv.CC_STAT_LEFT])
+        y = int(stats[component_id, cv.CC_STAT_TOP])
+        w = int(stats[component_id, cv.CC_STAT_WIDTH])
+        h = int(stats[component_id, cv.CC_STAT_HEIGHT])
+        area = int(stats[component_id, cv.CC_STAT_AREA])
+        if w <= 0 or h <= 0 or area < 30:
+            continue
+
+        fill = area / float(max(1, w * h))
+        aspect = max(w / float(max(1, h)), h / float(max(1, w)))
+        touches_right = x + w >= width - 1
+        touches_any = x <= 1 or y <= 1 or touches_right or y + h >= height - 1
+
+        if area < 60 and (touches_any or aspect > 3.4):
+            continue
+        if h > height * 0.55 and w < width * 0.11 and fill < 0.42:
+            continue
+        if aspect > 7.5 and min(w, h) <= 9 and area < 420:
+            continue
+        if touches_right and area < 360 and w < width * 0.16:
+            continue
+        if touches_any and aspect > 8.5 and area < 900:
+            continue
+
+        component = labels == component_id
+        hard_overlap = float(np.count_nonzero(component & hard_bool)) / float(max(1, area))
+        near_overlap = float(np.count_nonzero(component & near_bool)) / float(max(1, area))
+        if hard_overlap > 0.18 and fill < 0.65:
+            continue
+        if near_overlap > 0.16 and fill < 0.50:
+            continue
+
+        clean[component] = 255
+    return clean
+
+
 def preprocess_blackline(frame_bgr: np.ndarray, cfg: VisionConfig) -> np.ndarray:
     """Return a binary mask where likely black track pixels are 255."""
+
     gray = cv.cvtColor(frame_bgr, cv.COLOR_BGR2GRAY)
-    
-    # Adaptive threshold:
-    # 81x81 block size is large enough to cover the line width (10-30px) + surrounding floor
-    # C=5 is a small threshold offset to be sensitive to the tape even in low contrast
+    hard_guard, near_guard = _reflection_guards(frame_bgr)
+
+    work = gray.copy()
+    work[hard_guard > 0] = 255
+    work[work > getattr(cfg, "glare_rejection_threshold", 140)] = 255
+
     mask = cv.adaptiveThreshold(
-        gray, 
-        255, 
-        cv.ADAPTIVE_THRESH_GAUSSIAN_C, 
-        cv.THRESH_BINARY_INV, 
-        81, 
-        5
+        work,
+        255,
+        cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv.THRESH_BINARY_INV,
+        81,
+        5,
     )
-    
+    mask[gray > _raw_dark_cap(gray)] = 0
+    mask[hard_guard > 0] = 0
+
     mask = cv.morphologyEx(
         mask,
         cv.MORPH_OPEN,
@@ -106,10 +199,10 @@ def preprocess_blackline(frame_bgr: np.ndarray, cfg: VisionConfig) -> np.ndarray
     mask = cv.morphologyEx(
         mask,
         cv.MORPH_CLOSE,
-        cv.getStructuringElement(cv.MORPH_RECT, (3, 9)),
+        cv.getStructuringElement(cv.MORPH_RECT, (3, 7)),
         iterations=1,
     )
-    return mask
+    return _filter_preprocess_components(mask, hard_guard, near_guard)
 
 
 def _band_bounds(index: int, height: int, band_count: int) -> tuple[int, int]:
