@@ -60,6 +60,7 @@ class RaceStateMachineTests(unittest.TestCase):
     def test_left_corner_triggers_opposite_turn(self):
         cfg = RaceConfig()
         cfg.vision.trigger_y_frac = 0.30
+        cfg.corner.mode = "left"
         sm = RaceStateMachine(cfg)
         mask = add_branch(mask_with_vertical_line(), "left", y=50)
         features = scan_line_features(mask, cfg.vision, crop_center=90)

@@ -27,14 +27,14 @@ class VisionConfig:
     min_run_area_px: int = 30
     branch_width_ratio: float = 2.2
     branch_min_crop_ratio: float = 0.22
-    trigger_y_frac: float = 0.35
+    trigger_y_frac: float = 0.30
 
 
 @dataclass(slots=True)
 class LineControlConfig:
     """Line-following controller parameters."""
 
-    speed: float = 0.035
+    speed: float = 0.06
     kp: float = 0.24
     max_w: float = 0.24
     slow_on_error: float = 0.45
@@ -46,11 +46,11 @@ class LineControlConfig:
 class CornerConfig:
     """Timed right-angle maneuver parameters."""
 
-    mode: str = "auto"  # "auto", "left", "right", or "off"
+    mode: str = "right"  # "auto", "left", "right", or "off"
     confirm_frames: int = 2
-    forward_sec: float = 1.2
+    forward_sec: float = 5.0
     turn_w: float = 0.38
-    turn_sec: float = 2.45
+    turn_sec: float = 2.3
     right_turn_dir: float = -1.0
     left_turn_dir: float = 1.0
     reacquire_confirm_frames: int = 3

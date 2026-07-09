@@ -263,6 +263,16 @@ def _deep_update_cfg(cfg: RaceConfig, data: dict) -> None:
                     setattr(section, key, str(value))
 
 
+def _load_config_file() -> None:
+    path = ROOT / "configs/race_config.json"
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        _deep_update_cfg(CONFIG, data)
+
+
 def _clamp_int(value: object, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(value)))
 
@@ -443,18 +453,18 @@ def _reset_legacy_single_state_defaults() -> None:
     CONFIG.vision.min_run_area_px = 30
     CONFIG.vision.branch_width_ratio = 2.2
     CONFIG.vision.branch_min_crop_ratio = 0.22
-    CONFIG.vision.trigger_y_frac = 0.35
-    CONFIG.line.speed = 0.035
+    CONFIG.vision.trigger_y_frac = 0.30
+    CONFIG.line.speed = 0.06
     CONFIG.line.kp = 0.24
     CONFIG.line.max_w = 0.24
     CONFIG.line.slow_on_error = 0.45
     CONFIG.line.max_slowdown = 0.55
     CONFIG.line.invert_turn = False
-    CONFIG.corner.mode = "auto"
+    CONFIG.corner.mode = "right"
     CONFIG.corner.confirm_frames = 2
-    CONFIG.corner.forward_sec = 1.2
+    CONFIG.corner.forward_sec = 5.0
     CONFIG.corner.turn_w = 0.38
-    CONFIG.corner.turn_sec = 2.45
+    CONFIG.corner.turn_sec = 2.3
     CONFIG.corner.right_turn_dir = -1.0
     CONFIG.corner.left_turn_dir = 1.0
     CONFIG.corner.reacquire_confirm_frames = 3
@@ -780,6 +790,7 @@ while True:
 
 
 def main() -> None:
+    _load_config_file()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Race debug app: http://{HOST}:{PORT}")
     server.serve_forever()
