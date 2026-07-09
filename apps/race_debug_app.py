@@ -104,7 +104,7 @@ HTML = """
       <section>
         <h2>实机运行入口 <span class="pill">single-state + final</span></h2>
         <div class="row"><label>SSH</label><input id="ssh_target" type="text" value="yahboom"><button onclick="deploy()">Deploy</button></div>
-        <div class="row"><label>run sec</label><input id="live_max_sec" type="range" min="2" max="120" step="1"><input id="live_max_secn" type="number" step="1"></div>
+        <div class="row"><label>最长秒</label><input id="live_max_sec" type="range" min="2" max="120" step="1"><input id="live_max_secn" type="number" step="1"></div>
         <div class="buttons">
           <button class="primary" onclick="startProfile('line')">直线单测</button>
           <button class="primary" onclick="startProfile('corner_right')">右直角单测</button>
@@ -126,10 +126,10 @@ HTML = """
     </div>
     <aside>
       <section>
-        <h2>直线状态机参数</h2>
-        <div class="row"><label>speed</label><input id="line.speed" type="range" min="0.01" max="0.08" step="0.005"><input id="line.speedn" type="number" step="0.005"></div>
-        <div class="row"><label>kp</label><input id="line.kp" type="range" min="0.05" max="0.6" step="0.01"><input id="line.kpn" type="number" step="0.01"></div>
-        <div class="row"><label>max_w</label><input id="line.max_w" type="range" min="0.05" max="0.6" step="0.01"><input id="line.max_wn" type="number" step="0.01"></div>
+        <h2>巡线 / 直角共用参数</h2>
+        <div class="row"><label>速度</label><input id="line.speed" type="range" min="0.01" max="0.06" step="0.005"><input id="line.speedn" type="number" step="0.005"></div>
+        <div class="row"><label>转向Kp</label><input id="line.kp" type="range" min="0.05" max="0.6" step="0.01"><input id="line.kpn" type="number" step="0.01"></div>
+        <div class="row"><label>最大转向</label><input id="line.max_w" type="range" min="0.05" max="0.6" step="0.01"><input id="line.max_wn" type="number" step="0.01"></div>
         <button onclick="resetLegacyDefaults()">恢复旧版实测默认</button>
       </section>
       <section>
@@ -153,13 +153,14 @@ HTML = """
         </div>
       </section>
       <section>
-        <h2>直角状态机参数</h2>
-        <div class="row"><label>mode</label><select id="corner.mode"><option>auto</option><option>right</option><option>left</option><option>off</option></select><button onclick="saveConfig()">Apply</button></div>
-        <div class="row"><label>trigger</label><input id="vision.trigger_y_frac" type="range" min="0.1" max="0.8" step="0.05"><input id="vision.trigger_y_fracn" type="number" step="0.05"></div>
-        <div class="row"><label>confirm</label><input id="corner.confirm_frames" type="range" min="1" max="6" step="1"><input id="corner.confirm_framesn" type="number" step="1"></div>
-        <div class="row"><label>forward_s</label><input id="corner.forward_sec" type="range" min="0" max="5" step="0.05"><input id="corner.forward_secn" type="number" step="0.05"></div>
-        <div class="row"><label>turn_w</label><input id="corner.turn_w" type="range" min="0.05" max="0.6" step="0.01"><input id="corner.turn_wn" type="number" step="0.01"></div>
-        <div class="row"><label>turn_s</label><input id="corner.turn_sec" type="range" min="0.5" max="4" step="0.05"><input id="corner.turn_secn" type="number" step="0.05"></div>
+        <h2>直角弯参数</h2>
+        <div class="row"><label>方向</label><select id="corner.mode"><option value="auto">自动</option><option value="right">右转</option><option value="left">左转</option><option value="off">关闭</option></select><button onclick="saveConfig()">应用</button></div>
+        <div class="row"><label>直走秒</label><input id="corner.forward_sec" type="range" min="0" max="5" step="0.05"><input id="corner.forward_secn" type="number" step="0.05"></div>
+        <div class="row"><label>转弯秒</label><input id="corner.turn_sec" type="range" min="0.5" max="4" step="0.05"><input id="corner.turn_secn" type="number" step="0.05"></div>
+        <div class="row"><label>触发线</label><input id="vision.trigger_y_frac" type="range" min="0.1" max="0.8" step="0.05"><input id="vision.trigger_y_fracn" type="number" step="0.05"></div>
+        <div class="row"><label>确认帧</label><input id="corner.confirm_frames" type="range" min="1" max="6" step="1"><input id="corner.confirm_framesn" type="number" step="1"></div>
+        <div class="row"><label>转弯角速</label><input id="corner.turn_w" type="range" min="0.05" max="0.6" step="0.01"><input id="corner.turn_wn" type="number" step="0.01"></div>
+        <p class="hint">旧版逻辑：分支跨过触发线后，直走指定秒数，再转弯指定秒数。</p>
       </section>
       <section>
         <h2>虚线/细线预处理</h2>
