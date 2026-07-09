@@ -11,4 +11,4 @@ logs/
 *.pid
 line_seg_data/
 configs/race_config.live.json
-
+artifacts/live_debug/

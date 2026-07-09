@@ -17,6 +17,31 @@
   </header>
 
   <main>
+    <section class="panel controls">
+      <h2>Run controls</h2>
+      <div class="ctlRow">
+        <label>SSH</label>
+        <input id="ssh" type="text" value="yahboom" />
+        <button id="deployBtn">Deploy</button>
+      </div>
+      <div class="ctlRow">
+        <label>Max s</label>
+        <input id="maxSec" type="range" min="2" max="120" step="1" value="60" />
+        <input id="maxSecN" type="number" min="2" max="120" step="1" value="60" />
+      </div>
+      <div class="ctlRow checkRow">
+        <label>Debug</label>
+        <label class="check"><input id="debugCapture" type="checkbox" /> capture frames + logs</label>
+      </div>
+      <div class="btnGrid">
+        <button class="run final" data-profile="final">统一运行</button>
+        <button id="stopBtn" class="stop">强制停车</button>
+        <button id="reloadVideoBtn">重连视频</button>
+      </div>
+      <div id="msg" class="msg"></div>
+      <p class="hint">先 Deploy 同步代码，再统一运行；拐点、虚线、圆环都走同一套连续跟踪器。</p>
+    </section>
+
     <section class="panel video">
       <h2>Live view</h2>
       <div class="videoWrap">

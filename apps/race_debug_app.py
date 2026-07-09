@@ -6,6 +6,7 @@ import json
 import mimetypes
 import queue
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -52,10 +53,13 @@ RUN_LOCK = threading.Lock()
 VIDEO_LOCK = threading.Lock()
 RUN_LOGS: deque[str] = deque(maxlen=240)
 LOG_LOCK = threading.Lock()
+DEBUG_LOG_LOCK = threading.Lock()
 
 # Live telemetry parsed from the runner's JSON stdout (command_summary lines),
 # fanned out to browser dashboards over Server-Sent Events.
 WEB_ROOT = ROOT / "apps/web"
+DEBUG_REMOTE_ROOT_REL = "artifacts/live_debug"
+DEBUG_FRAME_PERIOD = 0.5
 TELEMETRY_LOCK = threading.Lock()
 TELEMETRY_LATEST: dict = {}
 TELEMETRY_SUBSCRIBERS: set[queue.Queue] = set()
@@ -157,6 +161,7 @@ HTML = """
     section { background:#fff; border:1px solid #d9dee8; border-radius:8px; padding:12px; margin-bottom:12px; }
     h2 { font-size:14px; margin:0 0 10px; }
     .row { display:grid; grid-template-columns:92px 1fr 70px; gap:8px; align-items:center; margin:8px 0; }
+    .check { display:flex; align-items:center; gap:8px; font-size:13px; color:#344054; }
     .two { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
     .buttons { display:flex; flex-wrap:wrap; gap:8px; }
     input[type=range] { width:100%; }
@@ -186,18 +191,16 @@ HTML = """
   <main>
     <div>
       <section>
-        <h2>实机运行入口 <span class="pill">single-state + final</span></h2>
+        <h2>实机运行入口 <span class="pill">unified tracker</span></h2>
         <div class="row"><label>SSH</label><input id="ssh_target" type="text" value="yahboom"><button onclick="deploy()">Deploy</button></div>
         <div class="row"><label>最长秒</label><input id="live_max_sec" type="range" min="2" max="120" step="1"><input id="live_max_secn" type="number" step="1"></div>
+        <div class="row"><label>Debug</label><label class="check"><input id="debug_capture" type="checkbox">录制帧+log</label><span class="hint">live_debug</span></div>
         <div class="buttons">
-          <button class="primary" onclick="startProfile('line')">巡线单测</button>
-          <button class="primary" onclick="startProfile('corner')">拐点单测</button>
-          <button class="primary" onclick="startProfile('gap')">虚线/丢线单测</button>
-          <button class="final" onclick="startProfile('final')">最终超级运行</button>
+          <button class="final" onclick="startProfile('final')">统一运行</button>
           <button class="danger" onclick="stopRace()">强制停车</button>
           <button onclick="reloadVideo()">Reload Video</button>
         </div>
-        <p class="hint">先 Deploy，再跑单项。单项跑稳后用“最终超级运行”；旧版 Safe Tuning 仍保留在 Legacy App。</p>
+        <p class="hint">先 Deploy，再统一运行。拐点、虚线、圆环都走同一套连续跟踪器；勾选 Debug 会把运行时帧、overlay、mask 和 telemetry 拉回 artifacts/live_debug。</p>
       </section>
       <div class="videoWrap">
         <img id="video" alt="live video" onload="updateCropBox()" onerror="log('VIDEO FAILED: 请确认 SSH、摄像头、或点击 Reload Video')" />
@@ -292,7 +295,7 @@ HTML = """
     async function saveConfig(){ const body={tracker:{},vision:{},camera:{},ui:{}}; body.camera.crop=[getVal("camera.crop.0"),getVal("camera.crop.1"),getVal("camera.crop.2"),getVal("camera.crop.3")]; for(const id of ids){ if(id.startsWith("camera.crop"))continue; if(id==="live_max_sec"){ body.ui.live_max_sec=getVal(id); continue; } writeCfgValue(body,id,getVal(id)); } await api("/api/config",body); log("CONFIG saved"); }
     async function analyze(){ await showError("ANALYZE", async()=>{ await saveConfig(); const d=await api("/api/analyze",{image_path:document.getElementById("image_path").value}); document.getElementById("image").src="data:image/jpeg;base64,"+d.image; log(JSON.stringify(d.summary,null,2)); }); }
     async function deploy(){ await showError("DEPLOY", async()=>{ await saveConfig(); const d=await api("/api/deploy",{ssh_target:document.getElementById("ssh_target").value}); log("DEPLOY OK: "+d.message); }); }
-    async function startProfile(profile){ await showError("START "+profile, async()=>{ await saveConfig(); const d=await api("/api/live/start",{profile,ssh_target:document.getElementById("ssh_target").value,max_sec:getVal("live_max_sec")}); log("RUNNING "+profile+": "+d.message); setTimeout(refreshLogs,800); }); }
+    async function startProfile(profile){ await showError("START "+profile, async()=>{ await saveConfig(); const d=await api("/api/live/start",{profile,ssh_target:document.getElementById("ssh_target").value,max_sec:getVal("live_max_sec"),debug:document.getElementById("debug_capture").checked}); log("RUNNING: "+d.message+(d.debug_path?"\\nDEBUG: "+d.debug_path:"")); setTimeout(refreshLogs,800); }); }
     async function stopRace(){ await showError("STOP", async()=>{ const d=await api("/api/live/stop",{ssh_target:document.getElementById("ssh_target").value}); log(d.message); }); }
     async function resetLegacyDefaults(){ await showError("DEFAULTS", async()=>{ const d=await api("/api/defaults/legacy",{}); log(d.message); await loadConfig(); }); }
     async function applyCamera(){ await showError("CAMERA", async()=>{ const d=await api("/api/camera",{ssh_target:document.getElementById("ssh_target").value,cam1:getVal("ui.cam1"),cam2:getVal("ui.cam2")}); log(d.message); }); }
@@ -381,10 +384,10 @@ LIVE_CONFIG_REL = "configs/race_config.live.json"
 
 
 def _write_live_config_file() -> None:
-    """Serialize the (profile-adjusted) CONFIG to a throwaway live config.
+    """Serialize the current CONFIG to a throwaway live-run config.
 
-    Profiles must never touch the canonical configs/race_config.json, otherwise
-    a single-corner test leaks turn directions into the saved baseline.
+    Live runs use a copied config so runtime launches never mutate the canonical
+    configs/race_config.json unless the user explicitly saves defaults.
     """
     path = ROOT / LIVE_CONFIG_REL
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -446,7 +449,88 @@ def _log_event(message: str) -> None:
         RUN_LOGS.appendleft(f"[{stamp}] {message}")
 
 
-def _read_process_stream(proc: subprocess.Popen, stream_name: str) -> None:
+def _debug_session_name(profile: str) -> str:
+    safe_profile = re.sub(r"[^A-Za-z0-9_-]+", "-", profile.strip() or "run").strip("-") or "run"
+    return f"{time.strftime('%Y%m%d-%H%M%S')}_{safe_profile}"
+
+
+def _append_debug_log(path: Path | None, message: str) -> None:
+    if path is None:
+        return
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with DEBUG_LOG_LOCK:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(f"[{stamp}] {message}\n")
+
+
+def _pull_remote_debug(ssh_target: str, remote_rel: str | None) -> None:
+    if not remote_rel:
+        return
+    remote_path = f"{REMOTE_ROOT}/{remote_rel}"
+    local_path = ROOT / remote_rel
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+
+    check = subprocess.run(
+        ["ssh", ssh_target, "sh", "-lc", f"test -d {shlex.quote(remote_path)}"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=8,
+    )
+    if check.returncode != 0:
+        _log_event(f"DEBUG PULL SKIPPED: remote dir missing {remote_path}")
+        return
+
+    pack = subprocess.run(
+        [
+            "ssh",
+            ssh_target,
+            "sh",
+            "-lc",
+            f"cd {shlex.quote(REMOTE_ROOT)} && tar -czf - {shlex.quote(remote_rel)}",
+        ],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=45,
+    )
+    if pack.returncode != 0:
+        _log_event(f"DEBUG PULL FAILED: {(pack.stderr or pack.stdout).decode('utf-8', errors='replace').strip()}")
+        return
+
+    extract = subprocess.run(
+        ["tar", "-xzf", "-", "-C", str(ROOT)],
+        input=pack.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=45,
+    )
+    if extract.returncode != 0:
+        _log_event(f"DEBUG EXTRACT FAILED: {extract.stderr.decode('utf-8', errors='replace').strip()}")
+        return
+    _log_event(f"DEBUG SAVED: {local_path}")
+
+
+def _watch_runner_exit(
+    proc: subprocess.Popen,
+    ssh_target: str,
+    debug_remote_rel: str | None,
+    debug_log_path: Path | None,
+) -> None:
+    code = proc.wait()
+    with RUN_LOCK:
+        RUN_PROCS.discard(proc)
+    _log_event(f"RUNNER EXITED: code={code}")
+    _append_debug_log(debug_log_path, f"runner exited: code={code}")
+    if debug_remote_rel:
+        # Give the runner's finally block a moment to flush manifest/telemetry.
+        time.sleep(0.5)
+        _pull_remote_debug(ssh_target, debug_remote_rel)
+
+
+def _read_process_stream(proc: subprocess.Popen, stream_name: str, debug_log_path: Path | None = None) -> None:
     stream = proc.stdout if stream_name == "stdout" else proc.stderr
     if stream is None:
         return
@@ -457,6 +541,7 @@ def _read_process_stream(proc: subprocess.Popen, stream_name: str) -> None:
             text = line.rstrip()
         if text:
             _log_event(f"{stream_name}: {text}")
+            _append_debug_log(debug_log_path, f"{stream_name}: {text}")
             if stream_name == "stdout" and text.startswith("{"):
                 try:
                     sample = json.loads(text)
@@ -466,9 +551,9 @@ def _read_process_stream(proc: subprocess.Popen, stream_name: str) -> None:
                     _publish_telemetry(sample)
 
 
-def _track_process_logs(proc: subprocess.Popen) -> None:
+def _track_process_logs(proc: subprocess.Popen, debug_log_path: Path | None = None) -> None:
     for stream_name in ("stdout", "stderr"):
-        thread = threading.Thread(target=_read_process_stream, args=(proc, stream_name), daemon=True)
+        thread = threading.Thread(target=_read_process_stream, args=(proc, stream_name, debug_log_path), daemon=True)
         thread.start()
 
 
@@ -523,26 +608,15 @@ def _sync_live_files(ssh_target: str) -> None:
     _log_event(f"CODE SYNCED: runner/state/config -> {ssh_target}:{REMOTE_ROOT}")
 
 
-def _apply_profile(profile: str) -> str:
+def _apply_profile(profile: str) -> tuple[str, str]:
     profile = (profile or "final").strip()
-    if profile == "line":
-        # Pure follow: disable pivot/bias so straight + gentle curve is isolated.
-        CONFIG.tracker.e_pivot = 2.0
-        CONFIG.tracker.theta_pivot = 2.0
-        CONFIG.tracker.e_bias = 0.0
-        return "巡线单测:关闭 pivot/bias,仅连续跟踪"
-    if profile == "corner":
-        # Exercise the pivot-assist branch for sharp bends of any angle.
-        CONFIG.tracker.e_pivot = 0.55
-        CONFIG.tracker.theta_pivot = 0.65
-        return "拐点单测:开启 pivot-assist(任意角度)"
-    if profile == "gap":
-        # Bias the confidence filter toward carrying through longer gaps.
-        CONFIG.tracker.conf_decay = 0.10
-        CONFIG.tracker.predict_speed_factor = 0.7
-        return "虚线/丢线单测:延长预测穿越"
-    if profile == "final":
-        return "最终全流程:统一跟踪器默认参数"
+    if profile in {"final", "unified"}:
+        return "final", "统一运行:连续跟踪器当前参数"
+    if profile in {"line", "corner", "gap"}:
+        # Compatibility for stale browser tabs or older scripts. These labels
+        # used to select tuning overlays, but there are no separate corner/gap
+        # state machines in the unified tracker.
+        return "final", f"统一运行:忽略旧 profile={profile},未改参数"
     raise ValueError(f"unknown run profile: {profile}")
 
 
@@ -785,25 +859,39 @@ class Handler(BaseHTTPRequestHandler):
         ssh_target = _ssh_target(data)
         max_sec = max(1.0, min(300.0, float(data.get("max_sec", 60))))
         profile = str(data.get("profile", "final"))
+        debug_enabled = bool(data.get("debug") or data.get("debug_capture"))
+        debug_remote_rel = None
+        debug_log_path = None
         with LOG_LOCK:
             RUN_LOGS.clear()
         _log_event(f"SSH CHECK: target={ssh_target}")
         _check_ssh_ready(ssh_target)
         _check_remote_runner(ssh_target)
-        # Apply the profile onto a temporary CONFIG, write it only to the live
-        # config, then restore CONFIG so the canonical race_config.json (already
-        # persisted by "save defaults") is never mutated by a test profile.
+        # Keep this snapshot/restore path so stale profile names remain harmless:
+        # live launch writes only the throwaway config, never canonical defaults.
         snapshot = _config_snapshot()
         try:
-            profile_note = _apply_profile(profile)
+            effective_profile, profile_note = _apply_profile(profile)
             _write_live_config_file()
         finally:
             _config_restore(snapshot)
         _sync_live_files(ssh_target)
         stop_live_processes(ssh_target)
+        debug_args = ""
+        if debug_enabled:
+            debug_remote_rel = f"{DEBUG_REMOTE_ROOT_REL}/{_debug_session_name(effective_profile)}"
+            debug_local_path = ROOT / debug_remote_rel
+            debug_local_path.mkdir(parents=True, exist_ok=True)
+            debug_log_path = debug_local_path / "backend.log"
+            _append_debug_log(debug_log_path, f"debug capture start: profile={profile}, max_sec={max_sec:.1f}, target={ssh_target}")
+            _log_event(f"DEBUG CAPTURE: {debug_local_path}")
+            debug_args = (
+                f" --debug-dir {shlex.quote(debug_remote_rel)}"
+                f" --debug-frame-period {DEBUG_FRAME_PERIOD:.2f}"
+            )
         command = (
             f"cd {REMOTE_ROOT} && "
-            f"python3 -u apps/race_runner.py --config {LIVE_CONFIG_REL} --max-sec {max_sec:.1f}"
+            f"python3 -u apps/race_runner.py --config {LIVE_CONFIG_REL} --max-sec {max_sec:.1f}{debug_args}"
         )
         proc = subprocess.Popen(
             ["ssh", ssh_target, command],
@@ -818,9 +906,19 @@ class Handler(BaseHTTPRequestHandler):
             raise RuntimeError((err or out or "race runner exited immediately").strip())
         with RUN_LOCK:
             RUN_PROCS.add(proc)
-        _track_process_logs(proc)
+        _track_process_logs(proc, debug_log_path)
+        threading.Thread(
+            target=_watch_runner_exit,
+            args=(proc, ssh_target, debug_remote_rel, debug_log_path),
+            daemon=True,
+        ).start()
         _log_event(f"RUNNING: {profile_note}, max_sec={max_sec:.1f}, target={ssh_target}")
-        return {"ok": True, "message": f"{profile_note}; runner on {ssh_target} for {max_sec:.1f}s"}
+        message = f"{profile_note}; runner on {ssh_target} for {max_sec:.1f}s"
+        payload = {"ok": True, "message": message}
+        if debug_remote_rel:
+            payload["debug_path"] = str(ROOT / debug_remote_rel)
+            payload["debug_remote"] = f"{ssh_target}:{REMOTE_ROOT}/{debug_remote_rel}"
+        return payload
 
     def _stop_live(self, data: dict) -> dict:
         ssh_target = _ssh_target(data)

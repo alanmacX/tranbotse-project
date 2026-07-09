@@ -32,6 +32,31 @@ button {
 button:hover { border-color: var(--accent); }
 main { display: grid; grid-template-columns: 1fr 480px; gap: 16px; padding: 16px; align-items: start; }
 .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+.controls { grid-column: 1 / -1; }
+.ctlRow { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.ctlRow label { color: var(--muted); font-size: 13px; width: 44px; }
+.ctlRow input[type=text] { flex: 0 0 160px; }
+.ctlRow input[type=range] { flex: 1; }
+.ctlRow input[type=number] { flex: 0 0 70px; }
+.checkRow { margin-top: -2px; }
+.check {
+  display: inline-flex; align-items: center; gap: 8px;
+  color: var(--text); font-size: 13px;
+}
+.check input { margin: 0; accent-color: var(--accent); }
+input[type=text], input[type=number] {
+  background: #0d1117; color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 8px;
+}
+.btnGrid { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+button.run { border-color: var(--accent); color: var(--accent); }
+button.run.final { background: var(--accent); color: #fff; }
+button.stop { border-color: var(--lost); color: var(--lost); }
+.msg {
+  margin-top: 10px; font-size: 13px; font-family: ui-monospace, Menlo, monospace;
+  color: var(--muted); min-height: 18px; white-space: pre-wrap;
+}
+.msg.err { color: var(--lost); }
 .hint { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 10px 0 0; }
 .videoWrap { position: relative; display: inline-block; max-width: 100%; }
 #video { display: block; max-width: 100%; border-radius: 8px; background: #000; min-height: 240px; }

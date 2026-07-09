@@ -5,7 +5,7 @@ import argparse
 import json
 import sys
 import time
-from dataclasses import fields, is_dataclass
+from dataclasses import asdict, fields, is_dataclass
 from pathlib import Path
 
 import cv2 as cv
@@ -111,6 +111,97 @@ def occluded_band_indices(height: int, width: int, cfg: RaceConfig) -> frozenset
     return frozenset(indices)
 
 
+class DebugRecorder:
+    """Optional runtime capture for field debugging."""
+
+    def __init__(self, debug_dir: str, cfg: RaceConfig, args: argparse.Namespace) -> None:
+        self.enabled = bool(debug_dir)
+        self.root = Path(debug_dir) if debug_dir else None
+        self.frame_period = max(0.1, float(args.debug_frame_period))
+        self.jpeg_quality = max(40, min(95, int(args.debug_jpeg_quality)))
+        self.last_frame_t = -1e9
+        self.frame_count = 0
+        self.started_at = time.time()
+        self.telemetry = None
+
+        if not self.enabled or self.root is None:
+            return
+
+        self.frames_dir = self.root / "frames"
+        self.crops_dir = self.root / "crops"
+        self.overlays_dir = self.root / "overlays"
+        self.masks_dir = self.root / "masks"
+        for path in (self.frames_dir, self.crops_dir, self.overlays_dir, self.masks_dir):
+            path.mkdir(parents=True, exist_ok=True)
+
+        with (self.root / "meta.json").open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "max_sec": args.max_sec,
+                    "period": args.period,
+                    "log_period": args.log_period,
+                    "frame_period": self.frame_period,
+                    "camera": args.camera,
+                    "config": asdict(cfg),
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+            f.write("\n")
+
+        self.telemetry = (self.root / "telemetry.jsonl").open("a", encoding="utf-8", buffering=1)
+        print(f"debug_capture_dir={self.root}", file=sys.stderr, flush=True)
+
+    def record(self, summary: dict, frame, crop, mask, features, cfg: RaceConfig, crop_center: float) -> None:
+        if not self.enabled or self.root is None:
+            return
+
+        if self.telemetry is not None:
+            self.telemetry.write(json.dumps(summary, ensure_ascii=False) + "\n")
+
+        elapsed = float(summary.get("t", 0.0))
+        if elapsed - self.last_frame_t < self.frame_period:
+            return
+
+        stem = f"{self.frame_count:05d}_{int(elapsed * 1000):07d}"
+        params = [int(cv.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
+        overlay = draw_debug_overlay(crop, features, cfg.vision.trigger_y_frac, crop_center=crop_center)
+
+        cv.imwrite(str(self.frames_dir / f"{stem}.jpg"), frame, params)
+        cv.imwrite(str(self.crops_dir / f"{stem}.jpg"), crop, params)
+        cv.imwrite(str(self.overlays_dir / f"{stem}.jpg"), overlay, params)
+        cv.imwrite(str(self.masks_dir / f"{stem}.png"), mask)
+
+        self.last_frame_t = elapsed
+        self.frame_count += 1
+
+    def close(self) -> None:
+        if not self.enabled or self.root is None:
+            return
+        if self.telemetry is not None:
+            self.telemetry.close()
+            self.telemetry = None
+        with (self.root / "manifest.json").open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "ended_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "duration_sec": round(time.time() - self.started_at, 3),
+                    "frames_saved": self.frame_count,
+                    "telemetry": "telemetry.jsonl",
+                    "frames": "frames/",
+                    "crops": "crops/",
+                    "overlays": "overlays/",
+                    "masks": "masks/",
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+            f.write("\n")
+
+
 def run(args: argparse.Namespace) -> int:
     cfg = load_config(Path(args.config))
     bot = make_bot(args.dry_run)
@@ -121,6 +212,7 @@ def run(args: argparse.Namespace) -> int:
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, cfg.camera.frame_height)
     if not cap.isOpened():
         raise RuntimeError(f"camera open failed: {args.camera}")
+    debug = DebugRecorder(args.debug_dir, cfg, args)
 
     if hasattr(bot, "set_floodlight"):
         bot.set_floodlight(args.light)
@@ -160,9 +252,10 @@ def run(args: argparse.Namespace) -> int:
             bot.set_car_motion(cmd_v, cmd_w)
 
             now = time.monotonic()
+            summary = command_summary(command, fit)
+            summary["t"] = round(now - start, 2)
+            debug.record(summary, frame, crop, mask, features, cfg, track_center)
             if now - last_log >= args.log_period:
-                summary = command_summary(command, fit)
-                summary["t"] = round(now - start, 2)
                 print(json.dumps(summary, ensure_ascii=False))
                 last_log = now
 
@@ -175,6 +268,7 @@ def run(args: argparse.Namespace) -> int:
             time.sleep(args.period)
     finally:
         stop_chassis(bot)
+        debug.close()
         cap.release()
         if args.display:
             cv.destroyAllWindows()
@@ -191,6 +285,9 @@ def main() -> int:
     parser.add_argument("--light", type=int, default=80)
     parser.add_argument("--display", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--debug-dir", default="", help="Save runtime frames and telemetry JSONL to this directory.")
+    parser.add_argument("--debug-frame-period", type=float, default=0.5)
+    parser.add_argument("--debug-jpeg-quality", type=int, default=82)
     return run(parser.parse_args())
 
 

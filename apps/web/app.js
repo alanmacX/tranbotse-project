@@ -132,3 +132,61 @@ el("mockBtn").addEventListener("click", toggleMock);
 el("video").src = "/video?ts=" + Date.now();
 loadCropBox();
 connect();
+
+// -- Run controls ---------------------------------------------------------
+const sshTarget = () => el("ssh").value.trim() || "yahboom";
+
+function setMsg(text, isErr) {
+  const m = el("msg");
+  m.textContent = text;
+  m.classList.toggle("err", !!isErr);
+}
+
+async function post(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  const data = await res.json();
+  if (!res.ok || !data.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+async function guard(label, fn) {
+  setMsg(label + " ...");
+  try {
+    const d = await fn();
+    setMsg(label + ": " + (d.message || "ok") + (d.debug_path ? "\nDebug: " + d.debug_path : ""));
+  } catch (e) {
+    setMsg(label + " FAILED: " + e.message, true);
+  }
+}
+
+// Keep the Max-s slider and its number box in sync.
+const maxSec = el("maxSec"), maxSecN = el("maxSecN");
+maxSec.addEventListener("input", () => (maxSecN.value = maxSec.value));
+maxSecN.addEventListener("input", () => (maxSec.value = maxSecN.value));
+
+el("deployBtn").addEventListener("click", () =>
+  guard("DEPLOY", () => post("/api/deploy", { ssh_target: sshTarget() }))
+);
+el("stopBtn").addEventListener("click", () =>
+  guard("STOP", () => post("/api/live/stop", { ssh_target: sshTarget() }))
+);
+el("reloadVideoBtn").addEventListener("click", () => {
+  el("video").src = "/video?ssh_target=" + encodeURIComponent(sshTarget()) + "&ts=" + Date.now();
+  setMsg("video reconnecting");
+});
+document.querySelectorAll("button.run").forEach((btn) =>
+  btn.addEventListener("click", () =>
+    guard(btn.textContent.trim(), () =>
+      post("/api/live/start", {
+        profile: btn.dataset.profile,
+        ssh_target: sshTarget(),
+        max_sec: Number(maxSec.value),
+        debug: el("debugCapture").checked,
+      })
+    )
+  )
+);
