@@ -16,6 +16,10 @@ class Run:
     cx: float
     width: int
     area: int
+    component_id: int = -1
+    component_area: int = 0
+    component_fill: float = 0.0
+    touches_border: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,11 +40,37 @@ class BranchFeature:
 
 
 @dataclass(frozen=True, slots=True)
+class PathPoint:
+    band_index: int
+    x: float
+    y: float
+    run: Run
+
+
+@dataclass(frozen=True, slots=True)
+class PreviewCandidate:
+    """A far segment worth remembering, but not fitting through a blind zone."""
+
+    direction: str
+    dir_sign: int          # +1 means target is to image/right side, -1 left.
+    anchor_band_index: int
+    target_band_index: int
+    anchor_x: float
+    anchor_y: float
+    target_x: float
+    target_y: float
+    score: float
+    gap_bands: int
+
+
+@dataclass(frozen=True, slots=True)
 class LineFeatures:
     found: bool
     err_norm: float = 0.0
     line_width_px: float = 0.0
     bands: tuple[ScanBand, ...] = ()
+    path: tuple[PathPoint, ...] = ()
+    preview: PreviewCandidate | None = None
     bottom: Run | None = None
     mid: Run | None = None
     branch_left: BranchFeature | None = None
@@ -53,13 +83,20 @@ class LineFeatures:
 
 def preprocess_blackline(frame_bgr: np.ndarray, cfg: VisionConfig) -> np.ndarray:
     """Return a binary mask where likely black track pixels are 255."""
-
     gray = cv.cvtColor(frame_bgr, cv.COLOR_BGR2GRAY)
-    clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-    equalized = clahe.apply(gray)
-    threshold = int(np.percentile(equalized, cfg.percentile))
-    threshold = max(cfg.threshold_min, min(cfg.threshold_max, threshold))
-    mask = (equalized <= threshold).astype(np.uint8) * 255
+    
+    # Adaptive threshold:
+    # 81x81 block size is large enough to cover the line width (10-30px) + surrounding floor
+    # C=5 is a small threshold offset to be sensitive to the tape even in low contrast
+    mask = cv.adaptiveThreshold(
+        gray, 
+        255, 
+        cv.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        cv.THRESH_BINARY_INV, 
+        81, 
+        5
+    )
+    
     mask = cv.morphologyEx(
         mask,
         cv.MORPH_OPEN,
@@ -69,7 +106,7 @@ def preprocess_blackline(frame_bgr: np.ndarray, cfg: VisionConfig) -> np.ndarray
     mask = cv.morphologyEx(
         mask,
         cv.MORPH_CLOSE,
-        cv.getStructuringElement(cv.MORPH_RECT, (5, 17)),
+        cv.getStructuringElement(cv.MORPH_RECT, (3, 9)),
         iterations=1,
     )
     return mask
@@ -82,7 +119,60 @@ def _band_bounds(index: int, height: int, band_count: int) -> tuple[int, int]:
     return y0, y1
 
 
-def _runs_from_band(mask: np.ndarray, y0: int, y1: int, cfg: VisionConfig) -> tuple[Run, ...]:
+@dataclass(frozen=True, slots=True)
+class Component:
+    x: int
+    y: int
+    width: int
+    height: int
+    area: int
+    fill: float
+    touches_border: bool
+
+
+def _component_labels(mask: np.ndarray, cfg: VisionConfig) -> tuple[np.ndarray, dict[int, Component]]:
+    """Label plausible black-line components before band scanning.
+
+    This is the contour/moments step used by robust camera line followers. It
+    removes sparse tile seams and glare fragments before they can become
+    synthetic scan boxes.
+    """
+
+    height, width = mask.shape[:2]
+    count, labels, stats, _centroids = cv.connectedComponentsWithStats(mask, connectivity=8)
+    components: dict[int, Component] = {}
+    min_area = max(cfg.component_min_area_px, cfg.min_run_area_px)
+    for component_id in range(1, count):
+        x = int(stats[component_id, cv.CC_STAT_LEFT])
+        y = int(stats[component_id, cv.CC_STAT_TOP])
+        w = int(stats[component_id, cv.CC_STAT_WIDTH])
+        h = int(stats[component_id, cv.CC_STAT_HEIGHT])
+        area = int(stats[component_id, cv.CC_STAT_AREA])
+        if w <= 0 or h <= 0 or area < min_area:
+            continue
+        fill = area / float(max(1, w * h))
+        if fill < cfg.component_min_fill_ratio and area < min_area * 4:
+            continue
+        # Very wide, shallow components are usually shadows/reflections, not a
+        # tape centerline. A true right-angle branch is wide, but not full-crop.
+        if w > width * cfg.component_max_width_ratio and h < height * 0.35:
+            continue
+        # The camera crop often includes a dark strip from the chassis at the
+        # bottom edge. It is wide, shallow, border-touching, and was previously
+        # chosen as the bottom anchor, which made straight-line tracking run on
+        # prediction after a few frames.
+        if (
+            y + h >= height - 2
+            and w > width * cfg.component_bottom_bar_width_ratio
+            and h < height * cfg.component_bottom_bar_height_ratio
+        ):
+            continue
+        touches_border = x <= 1 or x + w >= width - 1
+        components[component_id] = Component(x, y, w, h, area, fill, touches_border)
+    return labels, components
+
+
+def _runs_from_binary_band(mask: np.ndarray, y0: int, y1: int, cfg: VisionConfig) -> tuple[Run, ...]:
     band = mask[y0:y1, :]
     if band.size == 0:
         return ()
@@ -106,63 +196,313 @@ def _runs_from_band(mask: np.ndarray, y0: int, y1: int, cfg: VisionConfig) -> tu
     return tuple(runs)
 
 
-def _best_run(runs: Iterable[Run], crop_center: float) -> Run | None:
+def _runs_from_band(
+    mask: np.ndarray,
+    y0: int,
+    y1: int,
+    cfg: VisionConfig,
+    labels: np.ndarray | None = None,
+    components: dict[int, Component] | None = None,
+) -> tuple[Run, ...]:
+    if labels is None or components is None:
+        return _runs_from_binary_band(mask, y0, y1, cfg)
+
+    band_labels = labels[y0:y1, :]
+    if band_labels.size == 0:
+        return ()
+
+    height = max(1, y1 - y0)
+    runs: list[Run] = []
+    active_threshold = max(1, int(height * cfg.active_col_ratio))
+    for component_id in sorted(int(value) for value in np.unique(band_labels) if int(value) in components):
+        component = components[component_id]
+        component_band = band_labels == component_id
+        area_total = int(np.count_nonzero(component_band))
+        if area_total < cfg.min_run_area_px:
+            continue
+
+        col_sum = component_band.sum(axis=0)
+        active = col_sum >= active_threshold
+        start: int | None = None
+        for idx, on in enumerate([*active.tolist(), False]):
+            if on and start is None:
+                start = idx
+                continue
+            if not on and start is not None:
+                end = idx - 1
+                width = end - start + 1
+                if width >= cfg.min_run_width_px:
+                    local = component_band[:, start : end + 1]
+                    ys, xs = np.nonzero(local)
+                    area = int(xs.size)
+                    if area >= cfg.min_run_area_px:
+                        cx = float(xs.mean() + start)
+                        touches = component.touches_border or start <= 1 or end >= mask.shape[1] - 2
+                        runs.append(
+                            Run(
+                                start,
+                                end,
+                                cx,
+                                width,
+                                area,
+                                component_id=component_id,
+                                component_area=component.area,
+                                component_fill=component.fill,
+                                touches_border=touches,
+                            )
+                        )
+                start = None
+    return tuple(runs)
+
+
+def _run_cost(run: Run, target_x: float, crop_width: float, line_width: float | None = None) -> float:
+    half = max(1.0, crop_width / 2.0)
+    cost = abs(run.cx - target_x) / half
+    cost -= min(run.area, 1200) * 0.00015
+    cost -= min(run.component_area, 5000) * 0.000015
+    if run.touches_border:
+        cost += 0.18
+    if line_width and line_width > 0:
+        too_wide = max(0.0, run.width / line_width - 3.2)
+        cost += too_wide * 0.08
+    return cost
+
+
+def _best_run(runs: Iterable[Run], crop_center: float, crop_width: float | None = None) -> Run | None:
     runs = tuple(runs)
     if not runs:
         return None
-    return min(runs, key=lambda run: abs(run.cx - crop_center) - min(run.area, 800) * 0.001)
+    width = crop_width if crop_width is not None else max(crop_center * 2.0, 1.0)
+    return min(runs, key=lambda run: _run_cost(run, crop_center, width))
 
 
-def _path_best_runs(bands: list[ScanBand], crop_center: float, width: int) -> list[Run | None]:
-    """Choose one continuous near-field path through band candidates.
+def _predict_next_x(accepted: list[tuple[int, Run]], target_index: int) -> float:
+    last_index, last = accepted[-1]
+    if len(accepted) < 2:
+        return last.cx
+    prev_index, prev = accepted[-2]
+    di = max(1, last_index - prev_index)
+    return last.cx + (last.cx - prev.cx) * ((target_index - last_index) / di)
 
-    The binary mask may contain tile seams, glare edges, or crop-border blobs.
-    Picking each band independently lets those false runs become a fake curve.
-    Instead, anchor near the car and only accept upper-band runs that stay
-    geometrically close to the accepted path.
-    """
+
+def _corridor_score(mask: np.ndarray, x0: float, y0: float, x1: float, y1: float, radius: int) -> float:
+    """Fraction of black pixels inside a thick line corridor."""
+
+    steps = int(max(abs(x1 - x0), abs(y1 - y0), 1.0))
+    if steps <= 0:
+        return 0.0
+    height, width = mask.shape[:2]
+    support = 0
+    total = 0
+    for t in np.linspace(0.0, 1.0, num=max(8, min(96, steps)), dtype=np.float32):
+        x = int(round(x0 + (x1 - x0) * float(t)))
+        y = int(round(y0 + (y1 - y0) * float(t)))
+        xa = max(0, x - radius)
+        xb = min(width, x + radius + 1)
+        ya = max(0, y - 1)
+        yb = min(height, y + 2)
+        if xa >= xb or ya >= yb:
+            continue
+        roi = mask[ya:yb, xa:xb]
+        support += int(cv.countNonZero(roi))
+        total += int(roi.size)
+    return support / float(max(1, total))
+
+
+def _preview_candidate(
+    mask: np.ndarray,
+    bands: list[ScanBand],
+    path_bests: list[Run | None],
+    accepted: list[tuple[int, Run]],
+    crop_center: float,
+    width: int,
+    line_width: float,
+    cfg: VisionConfig,
+) -> PreviewCandidate | None:
+    if not accepted:
+        return None
+
+    anchor_index, anchor = accepted[-1]
+    if anchor.width > width * 0.42:
+        return None
+    anchor_band = bands[anchor_index]
+    anchor_y = (anchor_band.y0 + anchor_band.y1) / 2.0
+    min_dx = max(width * cfg.preview_min_dx_ratio, line_width * 1.7)
+    radius = max(4, int(round(line_width * cfg.preview_corridor_width_ratio / 2.0)))
+    best: PreviewCandidate | None = None
+    best_score = 0.0
+
+    for band in bands[anchor_index + 1 :]:
+        target_y = (band.y0 + band.y1) / 2.0
+        dy = max(1.0, anchor_y - target_y)
+        for run in band.runs:
+            if path_bests[band.index] == run:
+                continue
+            dx = run.cx - anchor.cx
+            branch_like = run.width >= line_width * cfg.branch_width_ratio
+            if run.width < max(cfg.min_run_width_px, line_width * 0.50):
+                continue
+            if run.component_area < cfg.min_run_area_px * 6:
+                continue
+            if abs(dx) < min_dx and not branch_like:
+                continue
+            if run.touches_border and run.component_id != anchor.component_id:
+                continue
+            angle = abs(dx) / dy
+            if angle < 0.15 and not branch_like:
+                continue
+
+            corridor = _corridor_score(mask, anchor.cx, anchor_y, run.cx, target_y, radius)
+            if corridor < 0.12 and run.component_id != anchor.component_id:
+                continue
+            run_conf = min(1.0, run.area / float(max(1, cfg.min_run_area_px * 8)))
+            turn_conf = min(1.0, abs(dx) / float(max(1.0, width * 0.42)))
+            branch_bonus = 0.14 if branch_like else 0.0
+            component_bonus = 0.08 if run.component_id == anchor.component_id and run.component_id >= 0 else 0.0
+            border_penalty = 0.18 if run.touches_border else 0.0
+            sparse_penalty = 0.12 if run.component_fill < cfg.component_min_fill_ratio * 1.35 else 0.0
+            score = (
+                0.48 * corridor
+                + 0.22 * run_conf
+                + 0.26 * turn_conf
+                + branch_bonus
+                + component_bonus
+                - border_penalty
+                - sparse_penalty
+            )
+
+            if score > best_score:
+                direction = "right" if dx > 0 else "left"
+                best_score = score
+                best = PreviewCandidate(
+                    direction=direction,
+                    dir_sign=1 if dx > 0 else -1,
+                    anchor_band_index=anchor_index,
+                    target_band_index=band.index,
+                    anchor_x=anchor.cx,
+                    anchor_y=anchor_y,
+                    target_x=run.cx,
+                    target_y=target_y,
+                    score=float(score),
+                    gap_bands=max(0, band.index - anchor_index - 1),
+                )
+
+    if best is not None and best_score >= cfg.preview_min_score:
+        return best
+    return None
+
+
+def _sliding_window_path(
+    mask: np.ndarray,
+    bands: list[ScanBand],
+    crop_center: float,
+    width: int,
+    cfg: VisionConfig,
+) -> tuple[list[Run | None], tuple[PathPoint, ...], PreviewCandidate | None]:
+    """Choose one bottom-anchored path and a separate far preview candidate."""
 
     bests: list[Run | None] = [None] * len(bands)
     anchor_index = next((band.index for band in bands[:2] if band.runs), None)
     if anchor_index is None:
         anchor_index = next((band.index for band in bands if band.runs), None)
     if anchor_index is None:
-        return bests
+        return bests, (), None
 
     anchor_band = bands[anchor_index]
-    anchor = _best_run(anchor_band.runs, crop_center)
+    anchor = _best_run(anchor_band.runs, crop_center, width)
     if anchor is None:
-        return bests
+        return bests, (), None
 
     bests[anchor_index] = anchor
     accepted: list[tuple[int, Run]] = [(anchor_index, anchor)]
-    max_jump = max(32.0, min(72.0, width * 0.24))
+    bottom_widths = [
+        run.width
+        for band in bands[:3]
+        for run in band.runs
+        if cfg.min_run_width_px <= run.width <= width * 0.25
+    ]
+    fallback_width = min(float(anchor.width), max(float(cfg.min_run_width_px), width * 0.12))
+    line_width = float(np.median(bottom_widths or [fallback_width]))
+    line_width = max(float(cfg.min_run_width_px), min(line_width, width * 0.16))
+    base_margin = max(float(cfg.sliding_window_margin_px), width * 0.16, line_width * 2.2)
+    missed_bands = 0
 
     for band in bands[anchor_index + 1 :]:
-        if not band.runs:
+        pred = _predict_next_x(accepted, band.index)
+        gap_scale = max(1.0, band.index - accepted[-1][0])
+        margin = base_margin * min(1.7, 1.0 + 0.35 * missed_bands + 0.15 * (gap_scale - 1.0))
+        candidates = [run for run in band.runs if abs(run.cx - pred) <= margin]
+        if candidates:
+            chosen = min(candidates, key=lambda run: _run_cost(run, pred, width, line_width))
+            bests[band.index] = chosen
+            accepted.append((band.index, chosen))
+            missed_bands = 0
             continue
 
-        prev_index, prev = accepted[-1]
-        if len(accepted) >= 2:
-            prev2_index, prev2 = accepted[-2]
-            di = max(1, prev_index - prev2_index)
-            pred = prev.cx + (prev.cx - prev2.cx) * ((band.index - prev_index) / di)
-        else:
-            pred = prev.cx
-
-        gap_scale = max(1, band.index - prev_index)
-        allowed_jump = max_jump * min(1.6, gap_scale)
-        candidates = [run for run in band.runs if abs(run.cx - pred) <= allowed_jump]
-        if not candidates:
-            # A visible but discontinuous upper segment is likely across a blind
-            # zone; stop before stitching it into the near-field path.
+        if band.runs:
             break
 
-        chosen = min(candidates, key=lambda run: abs(run.cx - pred) - min(run.area, 800) * 0.001)
+        missed_bands += 1
+        if missed_bands > cfg.sliding_window_max_gap_bands:
+            break
+
+    path = tuple(
+        PathPoint(
+            band_index=index,
+            x=run.cx,
+            y=(bands[index].y0 + bands[index].y1) / 2.0,
+            run=run,
+        )
+        for index, run in accepted
+    )
+    preview = None
+    # If the sliding window already reaches the far ROI, the near path is enough.
+    # Preview is reserved for an early break: a visible far segment after a blind
+    # zone, not a second opinion on every stray component in the expanded crop.
+    if accepted[-1][0] < cfg.band_count - 2:
+        preview = _preview_candidate(mask, bands, bests, accepted, crop_center, width, line_width, cfg)
+    return bests, path, preview
+
+
+def _classic_contour_path(
+    bands: list[ScanBand],
+    crop_center: float,
+    width: int,
+    cfg: VisionConfig,
+) -> tuple[list[Run | None], tuple[PathPoint, ...], PreviewCandidate | None]:
+    """OpenCV contour-centroid baseline used by common line followers.
+
+    It intentionally ignores far-field shape and follows only the near ROI. That
+    is less ambitious than the sliding-window planner, but much harder for tile
+    seams and reflections to derail on straight-line validation.
+    """
+
+    bests: list[Run | None] = [None] * len(bands)
+    accepted: list[tuple[int, Run]] = []
+    near_count = max(1, min(cfg.classic_near_band_count, len(bands)))
+    for band in bands[:near_count]:
+        candidates = [
+            run
+            for run in band.runs
+            if run.width <= width * cfg.classic_max_run_width_ratio
+            and 0.0 <= run.cx <= float(width)
+        ]
+        if not candidates:
+            continue
+        chosen = min(candidates, key=lambda run: _run_cost(run, crop_center, width))
         bests[band.index] = chosen
         accepted.append((band.index, chosen))
 
-    return bests
+    path = tuple(
+        PathPoint(
+            band_index=index,
+            x=run.cx,
+            y=(bands[index].y0 + bands[index].y1) / 2.0,
+            run=run,
+        )
+        for index, run in accepted
+    )
+    return bests, path, None
 
 
 def scan_line_features(mask: np.ndarray, cfg: VisionConfig, crop_center: float | None = None) -> LineFeatures:
@@ -172,13 +512,17 @@ def scan_line_features(mask: np.ndarray, cfg: VisionConfig, crop_center: float |
     if crop_center is None:
         crop_center = width / 2.0
 
+    labels, components = _component_labels(mask, cfg)
     raw_bands: list[ScanBand] = []
     for index in range(cfg.band_count):
         y0, y1 = _band_bounds(index, height, cfg.band_count)
-        runs = _runs_from_band(mask, y0, y1, cfg)
+        runs = _runs_from_band(mask, y0, y1, cfg, labels=labels, components=components)
         raw_bands.append(ScanBand(index=index, y0=y0, y1=y1, runs=runs, best=None))
 
-    path_bests = _path_best_runs(raw_bands, crop_center, width)
+    if cfg.fit_mode == "classic":
+        path_bests, path, preview = _classic_contour_path(raw_bands, crop_center, width, cfg)
+    else:
+        path_bests, path, preview = _sliding_window_path(mask, raw_bands, crop_center, width, cfg)
     bands = [
         ScanBand(index=band.index, y0=band.y0, y1=band.y1, runs=band.runs, best=path_bests[band.index])
         for band in raw_bands
@@ -197,9 +541,12 @@ def scan_line_features(mask: np.ndarray, cfg: VisionConfig, crop_center: float |
         err_cx = 0.65 * bottom.cx + 0.35 * mid.cx
     else:
         err_cx = valid[0].best.cx  # type: ignore[union-attr]
-    # Normalize by the crop half-width so left/right deviations are symmetric
-    # even when the crop is expanded asymmetrically (see CameraConfig expand_*).
-    half_width = max(width / 2.0, 1.0)
+    # Normalize by the actual asymmetric half-width relative to crop_center.
+    if err_cx >= crop_center:
+        half_width = max(float(width) - crop_center, 1.0)
+    else:
+        half_width = max(crop_center, 1.0)
+        
     err_norm = max(-1.0, min(1.0, (err_cx - crop_center) / half_width))
 
     branch_left: BranchFeature | None = None
@@ -228,6 +575,8 @@ def scan_line_features(mask: np.ndarray, cfg: VisionConfig, crop_center: float |
         err_norm=err_norm,
         line_width_px=line_width,
         bands=tuple(bands),
+        path=path,
+        preview=preview,
         bottom=bottom,
         mid=mid,
         branch_left=branch_left,
@@ -254,6 +603,10 @@ class TrajectoryFit:
     n_bands: int = 0         # number of bands that contributed
     quadratic: bool = False  # whether the quadratic term was used
     disconnected: bool = False  # visible bands were split by a large jump
+    preview_dir: int = 0     # +1 means a right-side far target, -1 left
+    preview_e: float = 0.0
+    preview_theta: float = 0.0
+    preview_conf: float = 0.0
 
 
 def _band_confidence(run: Run, band_height: float, line_width: float, cfg: VisionConfig) -> float:
@@ -266,6 +619,69 @@ def _band_confidence(run: Run, band_height: float, line_width: float, cfg: Visio
     # is much wider, so it is down-weighted rather than trusted as the center.
     width_conf = max(0.0, 1.0 - abs(width_ratio - 1.0))
     return max(0.0, min(1.0, 0.5 * area_conf + 0.5 * width_conf))
+
+
+def _preview_terms(features: LineFeatures, crop_center: float, half_width: float) -> tuple[int, float, float, float]:
+    preview = features.preview
+    if preview is None:
+        return 0, 0.0, 0.0, 0.0
+    e = max(-1.0, min(1.0, (preview.target_x - crop_center) / half_width))
+    dy = max(1.0, preview.anchor_y - preview.target_y)
+    theta = float(np.arctan2(preview.target_x - preview.anchor_x, dy))
+    conf = max(0.0, min(1.0, preview.score))
+    return preview.dir_sign, e, theta, conf
+
+
+def _fit_classic_contour_trajectory(
+    features: LineFeatures,
+    cfg: VisionConfig,
+    crop_center: float,
+    crop_width: float,
+    occluded_band_indices: frozenset[int],
+) -> TrajectoryFit:
+    half_width = max(crop_width / 2.0, 1.0)
+    samples: list[tuple[int, float, float, Run]] = []
+    for band in features.bands[: max(1, cfg.classic_near_band_count)]:
+        if band.index in occluded_band_indices or band.best is None:
+            continue
+        y_mid = (band.y0 + band.y1) / 2.0
+        samples.append((band.index, y_mid, band.best.cx, band.best))
+
+    if not samples:
+        return TrajectoryFit(found=False)
+
+    samples.sort(key=lambda item: item[0])
+    near = samples[0]
+    if len(samples) >= 2:
+        e_cx = 0.72 * samples[0][2] + 0.28 * samples[1][2]
+    else:
+        e_cx = near[2]
+    e0 = float(max(-1.0, min(1.0, (e_cx - crop_center) / half_width)))
+
+    theta = 0.0
+    if len(samples) >= 2:
+        far = samples[min(len(samples) - 1, 2)]
+        dy = max(1.0, near[1] - far[1])
+        dx = far[2] - near[2]
+        theta = float(np.arctan2(dx, dy))
+        theta = max(-cfg.classic_theta_limit, min(cfg.classic_theta_limit, theta))
+
+    n = len(samples)
+    area_score = min(1.0, sum(item[3].area for item in samples) / float(max(1, cfg.min_run_area_px * 12)))
+    count_score = min(1.0, n / float(max(1, cfg.classic_near_band_count)))
+    conf = float(max(0.0, min(1.0, 0.34 + 0.40 * count_score + 0.26 * area_score)))
+
+    return TrajectoryFit(
+        found=True,
+        e0=e0,
+        e_look=e0,
+        theta=theta,
+        kappa=0.0,
+        conf=conf,
+        n_bands=n,
+        quadratic=False,
+        disconnected=False,
+    )
 
 
 def fit_line_trajectory(
@@ -286,8 +702,18 @@ def fit_line_trajectory(
     they never contribute samples and are removed from the confidence
     denominator so a fixed obstruction is not read as line loss.
     """
+    if cfg.fit_mode == "classic":
+        return _fit_classic_contour_trajectory(
+            features,
+            cfg,
+            crop_center,
+            crop_width,
+            occluded_band_indices,
+        )
+
     half_width = max(crop_width / 2.0, 1.0)
     line_width = features.line_width_px if features.line_width_px > 0 else 8.0
+    preview_dir, preview_e, preview_theta, preview_conf = _preview_terms(features, crop_center, half_width)
 
     visible_bands = max(1, cfg.band_count - len(occluded_band_indices))
 
@@ -308,7 +734,13 @@ def fit_line_trajectory(
 
     n = len(samples)
     if n == 0:
-        return TrajectoryFit(found=False)
+        return TrajectoryFit(
+            found=False,
+            preview_dir=preview_dir,
+            preview_e=preview_e,
+            preview_theta=preview_theta,
+            preview_conf=preview_conf,
+        )
 
     samples.sort(key=lambda item: item[0])
     # The crop can lose the connecting arc during tight roundabout turns. In
@@ -325,6 +757,8 @@ def fit_line_trajectory(
         else:
             disconnected = True
             break
+    if preview_conf > 0.0 and features.preview is not None and features.preview.gap_bands > 0:
+        disconnected = True
 
     if disconnected and len(near_samples) >= 2:
         fit_samples = near_samples
@@ -341,20 +775,25 @@ def fit_line_trajectory(
     w_arr = np.asarray(ws, dtype=np.float64)
 
     if fit_n == 1:
-        e0 = max(-1.0, min(1.0, (float(x_arr[0]) - crop_center) / half_width))
+        e0 = float(max(-1.0, min(1.0, (float(x_arr[0]) - crop_center) / half_width)))
+        e_look = preview_e if preview_conf > 0.0 else e0
         conf = float(min(1.0, w_arr.sum() / (visible_bands * 0.9)))
         if disconnected:
             conf *= 0.45
         return TrajectoryFit(
             found=True,
             e0=e0,
-            e_look=e0,
+            e_look=e_look,
             theta=0.0,
             kappa=0.0,
             conf=conf,
             n_bands=fit_n,
             quadratic=False,
             disconnected=disconnected,
+            preview_dir=preview_dir,
+            preview_e=preview_e,
+            preview_theta=preview_theta,
+            preview_conf=preview_conf,
         )
 
     # RANSAC-lite: with enough bands, drop the single worst residual once so a
@@ -375,7 +814,7 @@ def fit_line_trajectory(
 
     y_bottom = float(y_arr.max())
     cx_bottom = float(np.polyval(coeffs, y_bottom))
-    e0 = max(-1.0, min(1.0, (cx_bottom - crop_center) / half_width))
+    e0 = float(max(-1.0, min(1.0, (cx_bottom - crop_center) / half_width)))
 
     if use_quadratic:
         a2, a1, _a0 = coeffs
@@ -389,15 +828,17 @@ def fit_line_trajectory(
     # Car forward is "up" the image (decreasing y). Positive theta => line bends
     # toward +x (right) as we look ahead. Sign chosen so theta and e0 agree.
     theta = float(np.arctan2(-slope, 1.0))
-    kappa = max(-1.0, min(1.0, curvature * half_width))
+    kappa = float(max(-1.0, min(1.0, curvature * half_width)))
 
     # Lookahead sample: the fitted curve some distance ahead (toward smaller y).
     if lookahead_frac > 0.0 and y_min < float("inf"):
         y_look = y_bottom - lookahead_frac * (y_bottom - y_min)
         cx_look = float(np.polyval(coeffs, y_look))
-        e_look = max(-1.0, min(1.0, (cx_look - crop_center) / half_width))
+        e_look = float(max(-1.0, min(1.0, (cx_look - crop_center) / half_width)))
     else:
         e_look = e0
+    if preview_conf > 0.0 and (lookahead_frac > 0.0 or disconnected):
+        e_look = preview_e
 
     conf = float(min(1.0, w_arr.sum() / (visible_bands * 0.9)))
     if disconnected:
@@ -418,6 +859,10 @@ def fit_line_trajectory(
         n_bands=fit_n,
         quadratic=use_quadratic,
         disconnected=disconnected,
+        preview_dir=preview_dir,
+        preview_e=preview_e,
+        preview_theta=preview_theta,
+        preview_conf=preview_conf,
     )
 
 
@@ -443,4 +888,16 @@ def draw_debug_overlay(frame_bgr: np.ndarray, features: LineFeatures, trigger_y_
             continue
         band = features.bands[branch.band_index]
         cv.rectangle(out, (branch.run.x0, band.y0), (branch.run.x1, band.y1 - 1), (0, 165, 255), 2)
+    if len(features.path) >= 2:
+        pts = [(int(round(point.x)), int(round(point.y))) for point in features.path]
+        for p0, p1 in zip(pts, pts[1:]):
+            cv.line(out, p0, p1, (0, 255, 0), 2)
+        for point in pts:
+            cv.circle(out, point, 3, (0, 255, 0), -1)
+    if features.preview is not None:
+        preview = features.preview
+        p0 = (int(round(preview.anchor_x)), int(round(preview.anchor_y)))
+        p1 = (int(round(preview.target_x)), int(round(preview.target_y)))
+        cv.line(out, p0, p1, (0, 140, 255), 2)
+        cv.circle(out, p1, 5, (0, 140, 255), -1)
     return out
