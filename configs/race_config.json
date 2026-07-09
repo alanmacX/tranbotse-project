@@ -34,9 +34,9 @@
   "corner": {
     "mode": "right",
     "confirm_frames": 2,
-    "forward_sec": 3.75,
+    "forward_sec": 5.0,
     "turn_w": 0.38,
-    "turn_sec": 2.6,
+    "turn_sec": 2.8,
     "right_turn_dir": -1.0,
     "left_turn_dir": 1.0,
     "reacquire_confirm_frames": 3,

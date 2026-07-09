@@ -76,7 +76,8 @@ HTML = """
     body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:#111827; background:#f4f6fb; }
     header { display:flex; align-items:center; justify-content:space-between; padding:14px 18px; background:#fff; border-bottom:1px solid #d9dee8; }
     h1 { font-size:20px; margin:0; }
-    main { display:grid; grid-template-columns:minmax(640px,1fr) 390px; gap:14px; padding:14px; }
+    main { display:grid; grid-template-columns:minmax(560px,1fr) minmax(420px,460px); gap:14px; padding:14px; align-items:start; }
+    aside { position:sticky; top:12px; max-height:calc(100vh - 24px); overflow:auto; padding-right:2px; }
     section { background:#fff; border:1px solid #d9dee8; border-radius:8px; padding:12px; margin-bottom:12px; }
     h2 { font-size:14px; margin:0 0 10px; }
     .row { display:grid; grid-template-columns:92px 1fr 70px; gap:8px; align-items:center; margin:8px 0; }
@@ -92,6 +93,10 @@ HTML = """
     #image { max-width:100%; border-radius:8px; border:1px solid #d9dee8; background:#111; }
     #log { height:330px; overflow:auto; background:#050816; color:#d6e2ff; border-radius:8px; padding:10px; font:13px ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap; border:2px solid #1463ff; }
     .hint { color:#667085; font-size:12px; line-height:1.4; }
+    .videoWrap { position:relative; display:inline-block; max-width:100%; margin-bottom:12px; }
+    #video { display:block; max-width:100%; border-radius:8px; border:1px solid #d9dee8; background:#111; }
+    #cropBox { position:absolute; border:2px solid #ffb020; box-shadow:0 0 0 9999px rgba(0,0,0,.14); pointer-events:none; box-sizing:border-box; }
+    @media (max-width: 960px) { main { grid-template-columns:1fr; } aside { position:static; max-height:none; overflow:visible; } }
   </style>
 </head>
 <body>
@@ -119,12 +124,15 @@ HTML = """
         </div>
         <p class="hint">先 Deploy，再跑单项。单项跑稳后用“最终超级运行”；旧版 Safe Tuning 仍保留在 Legacy App。</p>
       </section>
+      <div class="videoWrap">
+        <img id="video" alt="live video" onload="updateCropBox()" onerror="log('VIDEO FAILED: 请确认 SSH、摄像头、或点击 Reload Video')" />
+        <div id="cropBox"></div>
+      </div>
       <section>
         <h2>单帧诊断</h2>
         <div class="row"><label>Image path</label><input id="image_path" type="text" value="artifacts/baseline/line_follow_demo_result.jpg"><button class="primary" onclick="analyze()">Analyze</button></div>
         <p class="hint">只用于检查预处理/状态机判断，不作为主流程。</p>
       </section>
-      <img id="video" alt="live video" onerror="log('VIDEO FAILED: 请确认 SSH、摄像头、或点击 Reload Video')" style="max-width:100%; border-radius:8px; border:1px solid #d9dee8; background:#111; margin-bottom:12px;" />
       <img id="image" />
     </div>
     <aside>
@@ -194,9 +202,9 @@ HTML = """
   <script>
     const ids = ["line.speed","line.kp","line.max_w","vision.trigger_y_frac","corner.confirm_frames","corner.forward_sec","corner.turn_w","corner.turn_sec","vision.min_run_width_px","vision.min_run_area_px","gap.blind_sec","camera.crop.0","camera.crop.1","camera.crop.2","camera.crop.3","ui.cam1","ui.cam2","ui.j1","ui.j2","ui.j3","ui.arm_ms","live_max_sec"];
     function log(msg){ const el=document.getElementById("log"); el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}\\n` + el.textContent; }
-    function bind(id){ const r=document.getElementById(id), n=document.getElementById(id+"n"); if(!r||!n)return; const sync=(from)=>{ if(from===r)n.value=r.value; else r.value=n.value; }; r.addEventListener("input",()=>sync(r)); n.addEventListener("input",()=>sync(n)); }
+    function bind(id){ const r=document.getElementById(id), n=document.getElementById(id+"n"); if(!r||!n)return; const sync=(from)=>{ if(from===r)n.value=r.value; else r.value=n.value; if(id.startsWith("camera.crop")) updateCropBox(); }; r.addEventListener("input",()=>sync(r)); n.addEventListener("input",()=>sync(n)); }
     ids.forEach(bind);
-    function setVal(id,v){ document.getElementById(id).value=v; const n=document.getElementById(id+"n"); if(n)n.value=v; }
+    function setVal(id,v){ document.getElementById(id).value=v; const n=document.getElementById(id+"n"); if(n)n.value=v; if(id.startsWith("camera.crop")) updateCropBox(); }
     function getVal(id){ return Number(document.getElementById(id).value); }
     async function api(path, body){ const res=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})}); const data=await res.json(); if(!res.ok||!data.ok) throw new Error(data.error||res.statusText); return data; }
     async function showError(label, fn){ try { return await fn(); } catch(e) { log(label+" FAILED: "+e.message); setTimeout(refreshLogs,500); } }
@@ -214,8 +222,18 @@ HTML = """
     async function applyArm(){ await showError("ARM", async()=>{ const d=await api("/api/arm",{ssh_target:document.getElementById("ssh_target").value,j1:getVal("ui.j1"),j2:getVal("ui.j2"),j3:getVal("ui.j3"),arm_ms:getVal("ui.arm_ms")}); log(d.message); }); }
     async function saveDefaults(){ await showError("SAVE DEFAULTS", async()=>{ await saveConfig(); const d=await api("/api/defaults/save",{ui:{cam1:getVal("ui.cam1"),cam2:getVal("ui.cam2"),j1:getVal("ui.j1"),j2:getVal("ui.j2"),j3:getVal("ui.j3"),arm_ms:getVal("ui.arm_ms"),live_max_sec:getVal("live_max_sec")}}); log(d.message); }); }
     function presetCrop(x0,y0,x1,y1){ setVal("camera.crop.0",x0); setVal("camera.crop.1",y0); setVal("camera.crop.2",x1); setVal("camera.crop.3",y1); log(`box=[${x0},${y0},${x1},${y1}]`); }
+    function updateCropBox(){
+      const img=document.getElementById("video"), box=document.getElementById("cropBox");
+      if(!img||!box)return;
+      const nw=img.naturalWidth||640, nh=img.naturalHeight||480;
+      const sx=img.clientWidth/nw, sy=img.clientHeight/nh;
+      const x0=getVal("camera.crop.0"), y0=getVal("camera.crop.1"), x1=getVal("camera.crop.2"), y1=getVal("camera.crop.3");
+      box.style.left=(x0*sx)+"px"; box.style.top=(y0*sy)+"px";
+      box.style.width=Math.max(1,(x1-x0)*sx)+"px"; box.style.height=Math.max(1,(y1-y0)*sy)+"px";
+    }
     async function refreshLogs(){ try { const d=await (await fetch("/api/live/logs")).json(); if(d.logs&&d.logs.length){ document.getElementById("log").textContent=d.logs.join("\\n"); } } catch(e) { log("LOG REFRESH FAILED: "+e.message); } }
     function reloadVideo(){ document.getElementById("video").src="/video?ssh_target="+encodeURIComponent(document.getElementById("ssh_target").value)+"&ts="+Date.now(); log("video reconnect"); }
+    window.addEventListener("resize", updateCropBox);
     setInterval(refreshLogs,1200);
     loadConfig();
   </script>
@@ -767,8 +785,11 @@ while True:
                 chunk = proc.stdout.read(8192)
                 if not chunk:
                     break
-                self.wfile.write(chunk)
-                self.wfile.flush()
+                try:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    break
         finally:
             proc.terminate()
             with VIDEO_LOCK:
