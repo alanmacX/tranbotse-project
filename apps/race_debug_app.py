@@ -28,10 +28,39 @@ PORT = 8776
 CONFIG = RaceConfig()
 SSH_TARGET = "yahboom"
 REMOTE_ROOT = "/home/pi/tranbotse-project"
+UI_STATE_PATH = ROOT / "configs/race_ui_state.json"
+UI_STATE = {
+    "cam1": 90,
+    "cam2": 12,
+    "j1": 55,
+    "j2": 205,
+    "j3": 45,
+    "arm_ms": 1200,
+}
 RUN_PROCS: set[subprocess.Popen] = set()
 RUN_LOCK = threading.Lock()
 RUN_LOGS: deque[str] = deque(maxlen=240)
 LOG_LOCK = threading.Lock()
+
+
+def _load_ui_state() -> None:
+    try:
+        with UI_STATE_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            UI_STATE.update({key: data[key] for key in UI_STATE.keys() & data.keys()})
+    except FileNotFoundError:
+        pass
+
+
+def _write_ui_state() -> None:
+    UI_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with UI_STATE_PATH.open("w", encoding="utf-8") as f:
+        json.dump(UI_STATE, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+
+_load_ui_state()
 
 
 HTML = """
@@ -104,6 +133,26 @@ HTML = """
         <button onclick="resetLegacyDefaults()">恢复旧版实测默认</button>
       </section>
       <section>
+        <h2>相机云台</h2>
+        <div class="row"><label>水平</label><input id="ui.cam1" type="range" min="0" max="180" step="1"><input id="ui.cam1n" type="number" step="1"></div>
+        <div class="row"><label>俯仰</label><input id="ui.cam2" type="range" min="8" max="100" step="1"><input id="ui.cam2n" type="number" step="1"></div>
+        <div class="buttons">
+          <button class="primary" onclick="applyCamera()">应用相机</button>
+          <button onclick="saveDefaults()">保存默认</button>
+        </div>
+      </section>
+      <section>
+        <h2>机械臂停靠位</h2>
+        <div class="row"><label>j1</label><input id="ui.j1" type="range" min="0" max="225" step="1"><input id="ui.j1n" type="number" step="1"></div>
+        <div class="row"><label>j2</label><input id="ui.j2" type="range" min="30" max="270" step="1"><input id="ui.j2n" type="number" step="1"></div>
+        <div class="row"><label>夹爪</label><input id="ui.j3" type="range" min="30" max="180" step="1"><input id="ui.j3n" type="number" step="1"></div>
+        <div class="row"><label>时间</label><input id="ui.arm_ms" type="range" min="600" max="2200" step="50"><input id="ui.arm_msn" type="number" step="50"></div>
+        <div class="buttons">
+          <button class="primary" onclick="applyArm()">应用机械臂</button>
+          <button onclick="saveDefaults()">保存默认</button>
+        </div>
+      </section>
+      <section>
         <h2>直角状态机参数</h2>
         <div class="row"><label>mode</label><select id="corner.mode"><option>auto</option><option>right</option><option>left</option><option>off</option></select><button onclick="saveConfig()">Apply</button></div>
         <div class="row"><label>trigger</label><input id="vision.trigger_y_frac" type="range" min="0.1" max="0.8" step="0.05"><input id="vision.trigger_y_fracn" type="number" step="0.05"></div>
@@ -126,6 +175,11 @@ HTML = """
           <div class="row"><label>x1</label><input id="camera.crop.2" type="range" min="1" max="640" step="1"><input id="camera.crop.2n" type="number" step="1"></div>
           <div class="row"><label>y1</label><input id="camera.crop.3" type="range" min="1" max="480" step="1"><input id="camera.crop.3n" type="number" step="1"></div>
         </div>
+        <div class="buttons">
+          <button onclick="presetCrop(300,265,430,455)">旧版 box</button>
+          <button onclick="presetCrop(255,210,455,435)">宽 box</button>
+          <button onclick="saveDefaults()">保存默认</button>
+        </div>
       </section>
       <section>
         <h2>醒目运行日志</h2>
@@ -134,7 +188,7 @@ HTML = """
     </aside>
   </main>
   <script>
-    const ids = ["line.speed","line.kp","line.max_w","vision.trigger_y_frac","corner.confirm_frames","corner.forward_sec","corner.turn_w","corner.turn_sec","vision.min_run_width_px","vision.min_run_area_px","gap.blind_sec","camera.crop.0","camera.crop.1","camera.crop.2","camera.crop.3","live_max_sec"];
+    const ids = ["line.speed","line.kp","line.max_w","vision.trigger_y_frac","corner.confirm_frames","corner.forward_sec","corner.turn_w","corner.turn_sec","vision.min_run_width_px","vision.min_run_area_px","gap.blind_sec","camera.crop.0","camera.crop.1","camera.crop.2","camera.crop.3","ui.cam1","ui.cam2","ui.j1","ui.j2","ui.j3","ui.arm_ms","live_max_sec"];
     function log(msg){ const el=document.getElementById("log"); el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}\\n` + el.textContent; }
     function bind(id){ const r=document.getElementById(id), n=document.getElementById(id+"n"); if(!r||!n)return; const sync=(from)=>{ if(from===r)n.value=r.value; else r.value=n.value; }; r.addEventListener("input",()=>sync(r)); n.addEventListener("input",()=>sync(n)); }
     ids.forEach(bind);
@@ -152,6 +206,10 @@ HTML = """
     async function startProfile(profile){ await showError("START "+profile, async()=>{ await saveConfig(); const d=await api("/api/live/start",{profile,ssh_target:document.getElementById("ssh_target").value,max_sec:getVal("live_max_sec")}); log("RUNNING "+profile+": "+d.message); setTimeout(refreshLogs,800); }); }
     async function stopRace(){ await showError("STOP", async()=>{ const d=await api("/api/live/stop",{ssh_target:document.getElementById("ssh_target").value}); log(d.message); }); }
     async function resetLegacyDefaults(){ await showError("DEFAULTS", async()=>{ const d=await api("/api/defaults/legacy",{}); log(d.message); await loadConfig(); }); }
+    async function applyCamera(){ await showError("CAMERA", async()=>{ const d=await api("/api/camera",{ssh_target:document.getElementById("ssh_target").value,cam1:getVal("ui.cam1"),cam2:getVal("ui.cam2")}); log(d.message); }); }
+    async function applyArm(){ await showError("ARM", async()=>{ const d=await api("/api/arm",{ssh_target:document.getElementById("ssh_target").value,j1:getVal("ui.j1"),j2:getVal("ui.j2"),j3:getVal("ui.j3"),arm_ms:getVal("ui.arm_ms")}); log(d.message); }); }
+    async function saveDefaults(){ await showError("SAVE DEFAULTS", async()=>{ await saveConfig(); const d=await api("/api/defaults/save",{ui:{cam1:getVal("ui.cam1"),cam2:getVal("ui.cam2"),j1:getVal("ui.j1"),j2:getVal("ui.j2"),j3:getVal("ui.j3"),arm_ms:getVal("ui.arm_ms")}}); log(d.message); }); }
+    function presetCrop(x0,y0,x1,y1){ setVal("camera.crop.0",x0); setVal("camera.crop.1",y0); setVal("camera.crop.2",x1); setVal("camera.crop.3",y1); log(`box=[${x0},${y0},${x1},${y1}]`); }
     async function refreshLogs(){ try { const d=await (await fetch("/api/live/logs")).json(); if(d.logs&&d.logs.length){ document.getElementById("log").textContent=d.logs.join("\\n"); } } catch(e) { log("LOG REFRESH FAILED: "+e.message); } }
     function reloadVideo(){ document.getElementById("video").src="/video?ssh_target="+encodeURIComponent(document.getElementById("ssh_target").value)+"&ts="+Date.now(); log("video reconnect"); }
     setInterval(refreshLogs,1200);
@@ -183,6 +241,16 @@ def _deep_update_cfg(cfg: RaceConfig, data: dict) -> None:
                     setattr(section, key, str(value))
 
 
+def _clamp_int(value: object, lo: int, hi: int) -> int:
+    return max(lo, min(hi, int(value)))
+
+
+def _config_payload() -> dict:
+    payload = asdict(CONFIG)
+    payload["ui"] = dict(UI_STATE)
+    return payload
+
+
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
     raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
@@ -206,6 +274,37 @@ def _ssh_target(data: dict) -> str:
     if not re.fullmatch(r"[A-Za-z0-9_.@-]+", value):
         raise ValueError("ssh_target contains unsupported characters")
     return value
+
+
+def _transbot_code(body: str) -> str:
+    return f"""
+import sys, time
+sys.path.insert(0, '/home/pi/Transbot/py_install')
+from Transbot_Lib import Transbot
+bot = Transbot()
+try:
+    for _ in range(2):
+        bot.set_car_motion(0, 0)
+        time.sleep(0.03)
+{body}
+    for _ in range(2):
+        bot.set_car_motion(0, 0)
+        time.sleep(0.03)
+finally:
+    pass
+"""
+
+
+def _remote_python(ssh_target: str, code: str, timeout: float = 10) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["ssh", ssh_target, "python3", "-"],
+        input=code,
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+    )
 
 
 def _log_event(message: str) -> None:
@@ -322,6 +421,7 @@ def _apply_profile(profile: str) -> str:
 
 
 def _reset_legacy_single_state_defaults() -> None:
+    UI_STATE.update({"cam1": 90, "cam2": 12, "j1": 55, "j2": 205, "j3": 45, "arm_ms": 1200})
     CONFIG.camera.crop = (300, 265, 430, 455)
     CONFIG.camera.expand_left_px = 20
     CONFIG.camera.expand_right_px = 140
@@ -401,7 +501,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(raw)
             return
         if self.path == "/api/config":
-            _json_response(self, 200, asdict(CONFIG))
+            _json_response(self, 200, _config_payload())
             return
         if self.path == "/api/live/logs":
             with LOG_LOCK:
@@ -419,7 +519,15 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
             if self.path == "/api/config":
                 _deep_update_cfg(CONFIG, data)
-                _json_response(self, 200, {"ok": True, "config": asdict(CONFIG)})
+                if isinstance(data.get("ui"), dict):
+                    UI_STATE.update({key: data["ui"][key] for key in UI_STATE.keys() & data["ui"].keys()})
+                _json_response(self, 200, {"ok": True, "config": _config_payload()})
+                return
+            if self.path == "/api/camera":
+                _json_response(self, 200, self._camera(data))
+                return
+            if self.path == "/api/arm":
+                _json_response(self, 200, self._arm(data))
                 return
             if self.path == "/api/analyze":
                 _json_response(self, 200, self._analyze(data))
@@ -436,8 +544,18 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/defaults/legacy":
                 _reset_legacy_single_state_defaults()
                 _write_config_file()
+                _write_ui_state()
                 _log_event("CONFIG: reset to legacy single-state defaults")
-                _json_response(self, 200, {"ok": True, "message": "已恢复旧版单项实测默认参数"})
+                _json_response(self, 200, {"ok": True, "message": "已恢复旧版单项、box、相机、机械臂默认参数"})
+                return
+            if self.path == "/api/defaults/save":
+                _deep_update_cfg(CONFIG, data)
+                if isinstance(data.get("ui"), dict):
+                    UI_STATE.update({key: data["ui"][key] for key in UI_STATE.keys() & data["ui"].keys()})
+                _write_config_file()
+                _write_ui_state()
+                _log_event("DEFAULTS SAVED: config + camera/arm/ui")
+                _json_response(self, 200, {"ok": True, "message": "已保存当前 config、box、相机、机械臂为默认值"})
                 return
             self.send_error(404)
         except Exception as exc:
@@ -471,6 +589,44 @@ class Handler(BaseHTTPRequestHandler):
             "branch_right": None if features.branch_right is None else features.branch_right.y,
         }
         return {"ok": True, "summary": summary, "image": base64.b64encode(buf).decode("ascii")}
+
+    def _camera(self, data: dict) -> dict:
+        ssh_target = _ssh_target(data)
+        cam1 = _clamp_int(data.get("cam1", UI_STATE["cam1"]), 0, 180)
+        cam2 = _clamp_int(data.get("cam2", UI_STATE["cam2"]), 8, 100)
+        _check_ssh_ready(ssh_target)
+        code = _transbot_code(f"""
+    bot.set_pwm_servo(1, {cam1})
+    time.sleep(0.08)
+    bot.set_pwm_servo(2, {cam2})
+    time.sleep(0.18)
+""")
+        res = _remote_python(ssh_target, code, timeout=8)
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr.strip() or res.stdout.strip() or "camera servo failed")
+        UI_STATE["cam1"], UI_STATE["cam2"] = cam1, cam2
+        _write_ui_state()
+        _log_event(f"CAMERA: servo1={cam1}, servo2={cam2}")
+        return {"ok": True, "message": f"camera servo1={cam1}, servo2={cam2}"}
+
+    def _arm(self, data: dict) -> dict:
+        ssh_target = _ssh_target(data)
+        j1 = _clamp_int(data.get("j1", UI_STATE["j1"]), 0, 225)
+        j2 = _clamp_int(data.get("j2", UI_STATE["j2"]), 30, 270)
+        j3 = _clamp_int(data.get("j3", UI_STATE["j3"]), 30, 180)
+        arm_ms = _clamp_int(data.get("arm_ms", UI_STATE["arm_ms"]), 600, 2200)
+        _check_ssh_ready(ssh_target)
+        code = _transbot_code(f"""
+    bot.set_uart_servo_angle_array({j1}, {j2}, {j3}, {arm_ms})
+    time.sleep({arm_ms / 1000.0 + 0.25:.2f})
+""")
+        res = _remote_python(ssh_target, code, timeout=max(6, arm_ms / 1000 + 4))
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr.strip() or res.stdout.strip() or "arm servo failed")
+        UI_STATE["j1"], UI_STATE["j2"], UI_STATE["j3"], UI_STATE["arm_ms"] = j1, j2, j3, arm_ms
+        _write_ui_state()
+        _log_event(f"ARM: j1={j1}, j2={j2}, j3={j3}, {arm_ms}ms")
+        return {"ok": True, "message": f"arm j1={j1}, j2={j2}, j3={j3}, {arm_ms}ms"}
 
     def _deploy(self, data: dict) -> dict:
         _write_config_file()
