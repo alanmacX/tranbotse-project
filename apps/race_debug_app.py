@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import json
+import queue
 import re
 import subprocess
 import sys
@@ -49,6 +50,74 @@ RUN_LOCK = threading.Lock()
 VIDEO_LOCK = threading.Lock()
 RUN_LOGS: deque[str] = deque(maxlen=240)
 LOG_LOCK = threading.Lock()
+
+# Live telemetry parsed from the runner's JSON stdout (command_summary lines),
+# fanned out to browser dashboards over Server-Sent Events.
+WEB_ROOT = ROOT / "apps/web"
+TELEMETRY_LOCK = threading.Lock()
+TELEMETRY_LATEST: dict = {}
+TELEMETRY_SUBSCRIBERS: set[queue.Queue] = set()
+MOCK_LOCK = threading.Lock()
+MOCK_THREAD: threading.Thread | None = None
+MOCK_STOP = threading.Event()
+
+
+def _publish_telemetry(sample: dict) -> None:
+    """Store the latest telemetry sample and push it to every SSE subscriber."""
+    with TELEMETRY_LOCK:
+        TELEMETRY_LATEST.clear()
+        TELEMETRY_LATEST.update(sample)
+        subscribers = list(TELEMETRY_SUBSCRIBERS)
+    for sub in subscribers:
+        try:
+            sub.put_nowait(sample)
+        except queue.Full:
+            pass
+
+
+def _mock_telemetry_loop() -> None:
+    """Emit synthetic telemetry so the dashboard can be developed offline."""
+    import math
+
+    t = 0.0
+    while not MOCK_STOP.is_set():
+        e0 = 0.4 * math.sin(t * 0.9)
+        theta = 0.3 * math.sin(t * 0.9 + 0.4)
+        kappa = 0.2 * math.cos(t * 0.6)
+        pivot = abs(e0) > CONFIG.tracker.e_pivot
+        sample = {
+            "state": "track",
+            "mode": "pivot" if pivot else "follow",
+            "reason": "mock",
+            "v": round(CONFIG.tracker.v_max * (0.0 if pivot else 0.8), 4),
+            "w": round(-(CONFIG.tracker.k_e * e0 + CONFIG.tracker.k_theta * theta), 4),
+            "found": True,
+            "e0": round(e0, 4),
+            "theta": round(theta, 4),
+            "kappa": round(kappa, 4),
+            "conf": round(0.7 + 0.2 * math.sin(t), 4),
+            "n_bands": 6,
+            "t": round(t, 2),
+        }
+        _publish_telemetry(sample)
+        t += 0.1
+        MOCK_STOP.wait(0.1)
+
+
+def _set_mock(enabled: bool) -> str:
+    global MOCK_THREAD
+    with MOCK_LOCK:
+        if enabled:
+            if MOCK_THREAD and MOCK_THREAD.is_alive():
+                return "mock already running"
+            MOCK_STOP.clear()
+            MOCK_THREAD = threading.Thread(target=_mock_telemetry_loop, daemon=True)
+            MOCK_THREAD.start()
+            return "mock telemetry started"
+        MOCK_STOP.set()
+        MOCK_THREAD = None
+        return "mock telemetry stopped"
+
 
 
 def _load_ui_state() -> None:
@@ -386,6 +455,13 @@ def _read_process_stream(proc: subprocess.Popen, stream_name: str) -> None:
             text = line.rstrip()
         if text:
             _log_event(f"{stream_name}: {text}")
+            if stream_name == "stdout" and text.startswith("{"):
+                try:
+                    sample = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(sample, dict) and "state" in sample:
+                    _publish_telemetry(sample)
 
 
 def _track_process_logs(proc: subprocess.Popen) -> None:
@@ -565,6 +641,17 @@ class Handler(BaseHTTPRequestHandler):
                 logs = list(RUN_LOGS)
             _json_response(self, 200, {"ok": True, "logs": logs})
             return
+        if self.path == "/api/telemetry/latest":
+            with TELEMETRY_LOCK:
+                latest = dict(TELEMETRY_LATEST)
+            _json_response(self, 200, {"ok": True, "sample": latest})
+            return
+        if self.path == "/api/telemetry":
+            self.stream_telemetry()
+            return
+        if self.path == "/ui" or self.path.startswith("/ui/"):
+            self.serve_static()
+            return
         if self.path.startswith("/video"):
             self.stream_video()
             return
@@ -597,6 +684,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/live/stop":
                 _json_response(self, 200, self._stop_live(data))
+                return
+            if self.path == "/api/mock":
+                message = _set_mock(bool(data.get("enabled", True)))
+                _json_response(self, 200, {"ok": True, "message": message})
                 return
             if self.path == "/api/defaults/legacy":
                 _reset_legacy_single_state_defaults()
@@ -734,6 +825,56 @@ class Handler(BaseHTTPRequestHandler):
         stop_live_processes(ssh_target)
         return {"ok": True, "message": "stop sent"}
 
+    def stream_telemetry(self) -> None:
+        sub: queue.Queue = queue.Queue(maxsize=64)
+        with TELEMETRY_LOCK:
+            TELEMETRY_SUBSCRIBERS.add(sub)
+            latest = dict(TELEMETRY_LATEST)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        try:
+            if latest:
+                self._sse_send(latest)
+            while True:
+                try:
+                    sample = sub.get(timeout=15.0)
+                    self._sse_send(sample)
+                except queue.Empty:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            with TELEMETRY_LOCK:
+                TELEMETRY_SUBSCRIBERS.discard(sub)
+
+    def _sse_send(self, sample: dict) -> None:
+        payload = json.dumps(sample, ensure_ascii=False)
+        self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+        self.wfile.flush()
+
+    def serve_static(self) -> None:
+        rel = self.path[len("/ui"):].lstrip("/") or "index.html"
+        target = (WEB_ROOT / rel).resolve()
+        root = WEB_ROOT.resolve()
+        if target != root and root not in target.parents:
+            self.send_error(403)
+            return
+        if not target.is_file():
+            self.send_error(404)
+            return
+        ctypes = {".html": "text/html", ".js": "text/javascript", ".css": "text/css"}
+        ctype = ctypes.get(target.suffix, "application/octet-stream")
+        raw = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", f"{ctype}; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
     def stream_video(self) -> None:
         ssh_target = SSH_TARGET
         if "?" in self.path:
@@ -800,6 +941,7 @@ def main() -> None:
     _load_config_file()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Race debug app: http://{HOST}:{PORT}")
+    print(f"New dashboard:   http://{HOST}:{PORT}/ui")
     server.serve_forever()
 
 

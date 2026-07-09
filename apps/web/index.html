@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Transbot Race Dashboard</title>
+  <link rel="stylesheet" href="/ui/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Transbot Race Dashboard</h1>
+    <div class="conn">
+      <span id="dot" class="dot"></span>
+      <span id="connText">disconnected</span>
+      <button id="mockBtn">Mock on</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel video">
+      <h2>Live view</h2>
+      <div class="videoWrap">
+        <img id="video" alt="live video" />
+        <div id="cropBox"></div>
+      </div>
+      <p class="hint">Video streams from the robot over SSH via the debug backend. The
+        amber box shows the configured crop.</p>
+    </section>
+
+    <section class="panel state">
+      <h2>Controller</h2>
+      <div class="stateRow">
+        <span id="stateLight" class="light"></span>
+        <span id="stateName" class="stateName">--</span>
+        <span id="modeName" class="pill">--</span>
+      </div>
+      <div class="bars">
+        <div class="bar"><label>e0</label><div class="track"><div id="bar_e0" class="fill signed"></div></div><span id="val_e0">0</span></div>
+        <div class="bar"><label>theta</label><div class="track"><div id="bar_theta" class="fill signed"></div></div><span id="val_theta">0</span></div>
+        <div class="bar"><label>kappa</label><div class="track"><div id="bar_kappa" class="fill signed"></div></div><span id="val_kappa">0</span></div>
+        <div class="bar"><label>conf</label><div class="track"><div id="bar_conf" class="fill"></div></div><span id="val_conf">0</span></div>
+        <div class="bar"><label>v</label><div class="track"><div id="bar_v" class="fill"></div></div><span id="val_v">0</span></div>
+        <div class="bar"><label>w</label><div class="track"><div id="bar_w" class="fill signed"></div></div><span id="val_w">0</span></div>
+      </div>
+      <canvas id="chart" width="440" height="150"></canvas>
+      <p class="hint">Series: <b class="c-e0">e0</b> · <b class="c-theta">theta</b> · <b class="c-conf">conf</b></p>
+    </section>
+  </main>
+
+  <script src="/ui/app.js"></script>
+</body>
+</html>
