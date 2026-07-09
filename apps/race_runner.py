@@ -39,7 +39,21 @@ def load_config(path: Path) -> RaceConfig:
     if path.exists():
         with path.open("r", encoding="utf-8") as f:
             update_dataclass(cfg, json.load(f))
+    _validate_config(cfg)
     return cfg
+
+
+def _validate_config(cfg: RaceConfig) -> None:
+    x0, y0, x1, y1 = cfg.camera.crop
+    crop_h = y1 - y0
+    min_h = cfg.vision.band_count * 12
+    if crop_h < min_h:
+        raise ValueError(
+            f"crop height {crop_h}px too small for band_count={cfg.vision.band_count} "
+            f"(need >= {min_h}px). Check camera.crop={cfg.camera.crop}."
+        )
+    if x1 <= x0:
+        raise ValueError(f"crop x1 must be > x0, got {cfg.camera.crop}")
 
 
 class DryBot:

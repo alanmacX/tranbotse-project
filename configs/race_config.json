@@ -3,10 +3,10 @@
     "frame_width": 640,
     "frame_height": 480,
     "crop": [
-      336,
-      391,
-      429,
-      415
+      300,
+      265,
+      430,
+      455
     ],
     "expand_left_px": 20,
     "expand_right_px": 140
@@ -37,7 +37,7 @@
     "forward_sec": 5.0,
     "turn_w": 0.38,
     "turn_sec": 2.35,
-    "right_turn_dir": 1.0,
+    "right_turn_dir": -1.0,
     "left_turn_dir": 1.0,
     "reacquire_confirm_frames": 3,
     "reacquire_err_norm": 0.5

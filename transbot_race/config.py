@@ -55,6 +55,7 @@ class CornerConfig:
     left_turn_dir: float = 1.0
     reacquire_confirm_frames: int = 3
     reacquire_err_norm: float = 0.50
+    reacquire_timeout_sec: float = 3.0
 
 
 @dataclass(slots=True)
@@ -67,6 +68,10 @@ class GapConfig:
     blind_speed_factor: float = 0.70
     blind_turn_factor: float = 0.35
     search_w: float = 0.16
+    # Minimum |w| while searching, so a line lost near the crop center
+    # (last_err_norm ~= 0) still sweeps instead of stalling at w=0.
+    search_w_min: float = 0.10
+    search_timeout_sec: float = 3.0
 
 
 @dataclass(slots=True)

@@ -111,6 +111,43 @@ class RaceStateMachineTests(unittest.TestCase):
         self.assertEqual(sm.state, RaceState.LINE_FOLLOW)
         self.assertEqual(cmd.reason, "line_follow")
 
+    def test_search_never_stalls_when_centered(self):
+        # Line lost with err_norm ~= 0 must still sweep, not freeze at w=0.
+        cfg = RaceConfig()
+        cfg.gap.missing_frames = 1
+        cfg.gap.blind_sec = 0.0
+        sm = RaceStateMachine(cfg)
+        missing = scan_line_features(np.zeros((120, 180), dtype=np.uint8), cfg.vision, crop_center=90)
+        sm.step(missing, now=0.1)
+        cmd = sm.step(missing, now=0.2)
+        self.assertEqual(cmd.reason, "line_missing")
+        self.assertGreaterEqual(abs(cmd.w), cfg.gap.search_w_min)
+
+    def test_search_times_out_to_stopped(self):
+        cfg = RaceConfig()
+        cfg.gap.missing_frames = 1
+        cfg.gap.blind_sec = 0.0
+        cfg.gap.search_timeout_sec = 1.0
+        sm = RaceStateMachine(cfg)
+        missing = scan_line_features(np.zeros((120, 180), dtype=np.uint8), cfg.vision, crop_center=90)
+        sm.step(missing, now=0.1)
+        sm.step(missing, now=0.2)  # sweep begins here
+        cmd = sm.step(missing, now=2.0)
+        self.assertEqual(sm.state, RaceState.STOPPED)
+        self.assertEqual(cmd.reason, "search_timeout")
+
+    def test_reacquire_times_out_to_stopped(self):
+        cfg = RaceConfig()
+        cfg.corner.reacquire_timeout_sec = 1.0
+        sm = RaceStateMachine(cfg)
+        sm.state = RaceState.REACQUIRE
+        sm.state_started_at = 0.0
+        sm.active_turn_dir = 1.0
+        missing = scan_line_features(np.zeros((120, 180), dtype=np.uint8), cfg.vision, crop_center=90)
+        cmd = sm.step(missing, now=2.0)
+        self.assertEqual(sm.state, RaceState.STOPPED)
+        self.assertEqual(cmd.reason, "reacquire_timeout")
+
 
 if __name__ == "__main__":
     unittest.main()

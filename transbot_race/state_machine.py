@@ -37,6 +37,8 @@ class RaceStateMachine:
         self.corner_direction: str | None = None
         self.active_turn_dir = 0.0
         self.reacquire_count = 0
+        self.search_started_at: float | None = None
+        self.last_search_sign = 1.0
         self.last_event = "init"
 
     def reset(self) -> None:
@@ -70,6 +72,9 @@ class RaceStateMachine:
                     return self._line_follow(features)
             else:
                 self.reacquire_count = 0
+            if now - self.state_started_at >= self.cfg.corner.reacquire_timeout_sec:
+                self._enter(RaceState.STOPPED, now, "reacquire_timeout")
+                return MotionCommand(0.0, 0.0, "reacquire_timeout", self.state)
             return MotionCommand(0.0, self.active_turn_dir * self.cfg.corner.turn_w, "reacquire_turn", self.state)
 
         if not features.found:
@@ -80,10 +85,24 @@ class RaceStateMachine:
                 if now - self.state_started_at <= self.cfg.gap.blind_sec:
                     w = -self.last_err_norm * self.cfg.line.max_w * self.cfg.gap.blind_turn_factor
                     return MotionCommand(self.cfg.line.speed * self.cfg.gap.blind_speed_factor, w, "gap_blind", self.state)
-            w = -self.last_err_norm * self.cfg.gap.search_w
+            # Search sweep. Guarantee a non-zero angular velocity so a line lost
+            # near the crop center does not stall the chassis at w=0. Track a
+            # start time so the sweep terminates in STOPPED instead of forever.
+            if self.search_started_at is None:
+                self.search_started_at = now
+            if now - self.search_started_at >= self.cfg.gap.search_timeout_sec:
+                self._enter(RaceState.STOPPED, now, "search_timeout")
+                return MotionCommand(0.0, 0.0, "search_timeout", self.state)
+            sign = self.last_err_norm
+            if abs(sign) < 1e-3:
+                sign = self.last_search_sign
+            sign = -1.0 if sign > 0 else 1.0
+            self.last_search_sign = sign
+            w = sign * max(abs(self.last_err_norm) * self.cfg.gap.search_w, self.cfg.gap.search_w_min)
             return MotionCommand(0.0, w, "line_missing", self.state)
 
         self.missing_count = 0
+        self.search_started_at = None
         self.last_err_norm = features.err_norm
         if self.state == RaceState.GAP_BLIND:
             self._enter(RaceState.LINE_FOLLOW, now, "gap_recovered")

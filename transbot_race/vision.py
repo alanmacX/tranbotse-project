@@ -133,7 +133,10 @@ def scan_line_features(mask: np.ndarray, cfg: VisionConfig, crop_center: float |
         err_cx = 0.65 * bottom.cx + 0.35 * mid.cx
     else:
         err_cx = valid[0].best.cx  # type: ignore[union-attr]
-    err_norm = max(-1.0, min(1.0, (err_cx - crop_center) / max(crop_center, 1.0)))
+    # Normalize by the crop half-width so left/right deviations are symmetric
+    # even when the crop is expanded asymmetrically (see CameraConfig expand_*).
+    half_width = max(width / 2.0, 1.0)
+    err_norm = max(-1.0, min(1.0, (err_cx - crop_center) / half_width))
 
     branch_left: BranchFeature | None = None
     branch_right: BranchFeature | None = None

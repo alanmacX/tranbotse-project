@@ -300,6 +300,30 @@ def _write_config_file() -> None:
         f.write("\n")
 
 
+LIVE_CONFIG_REL = "configs/race_config.live.json"
+
+
+def _write_live_config_file() -> None:
+    """Serialize the (profile-adjusted) CONFIG to a throwaway live config.
+
+    Profiles must never touch the canonical configs/race_config.json, otherwise
+    a single-corner test leaks turn directions into the saved baseline.
+    """
+    path = ROOT / LIVE_CONFIG_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(asdict(CONFIG), f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+
+def _config_snapshot() -> dict:
+    return asdict(CONFIG)
+
+
+def _config_restore(snapshot: dict) -> None:
+    _deep_update_cfg(CONFIG, snapshot)
+
+
 def _ssh_target(data: dict) -> str:
     value = str(data.get("ssh_target") or SSH_TARGET).strip()
     value = value or SSH_TARGET
@@ -407,7 +431,7 @@ def _check_remote_runner(ssh_target: str) -> None:
 
 
 def _sync_live_files(ssh_target: str) -> None:
-    package = "transbot_race apps/race_runner.py configs/race_config.json"
+    package = "transbot_race apps/race_runner.py configs/race_config.json " + LIVE_CONFIG_REL
     cmd = f"tar -czf - {package} | ssh {ssh_target} 'mkdir -p {REMOTE_ROOT} && tar -xzf - -C {REMOTE_ROOT}'"
     res = subprocess.run(cmd, cwd=ROOT, shell=True, text=True, capture_output=True, timeout=45)
     if res.returncode != 0:
@@ -705,8 +729,15 @@ class Handler(BaseHTTPRequestHandler):
         _log_event(f"SSH CHECK: target={ssh_target}")
         _check_ssh_ready(ssh_target)
         _check_remote_runner(ssh_target)
-        profile_note = _apply_profile(profile)
-        _write_config_file()
+        # Apply the profile onto a temporary CONFIG, write it only to the live
+        # config, then restore CONFIG so the canonical race_config.json (already
+        # persisted by "save defaults") is never mutated by a test profile.
+        snapshot = _config_snapshot()
+        try:
+            profile_note = _apply_profile(profile)
+            _write_live_config_file()
+        finally:
+            _config_restore(snapshot)
         _sync_live_files(ssh_target)
         stop_live_processes(ssh_target)
         corner_stop_flag = " --stop-after-corner" if profile in {"corner_right", "corner_left"} else ""
@@ -717,7 +748,7 @@ class Handler(BaseHTTPRequestHandler):
         force_turn_flag = f" --force-turn-dir {force_turn_dir:.1f}" if force_turn_dir else ""
         command = (
             f"cd {REMOTE_ROOT} && "
-            f"python3 -u apps/race_runner.py --config configs/race_config.json --max-sec {max_sec:.1f}{corner_stop_flag}{force_turn_flag}"
+            f"python3 -u apps/race_runner.py --config {LIVE_CONFIG_REL} --max-sec {max_sec:.1f}{corner_stop_flag}{force_turn_flag}"
         )
         proc = subprocess.Popen(
             ["ssh", ssh_target, command],
