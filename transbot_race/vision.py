@@ -183,6 +183,7 @@ class TrajectoryFit:
 
     found: bool
     e0: float = 0.0          # bottom lateral error, normalized to [-1, 1]
+    e_look: float = 0.0      # lateral error at the lookahead point, [-1, 1]
     theta: float = 0.0       # line heading vs car forward, radians (approx)
     kappa: float = 0.0       # normalized curvature (0 straight, >0 bends right)
     conf: float = 0.0        # overall fit confidence [0, 1]
@@ -207,27 +208,37 @@ def fit_line_trajectory(
     cfg: VisionConfig,
     crop_center: float,
     crop_width: float,
+    lookahead_frac: float = 0.0,
+    occluded_band_indices: frozenset[int] = frozenset(),
 ) -> TrajectoryFit:
     """Weighted polynomial fit of the line centerline across scan bands.
 
     Uses each band's best run as a sample (y_mid, cx) weighted by a per-band
     confidence. Falls back from quadratic to linear when fewer than 4 bands are
     available, so dashed lines (sparse bands) still yield a stable estimate.
+
+    Bands listed in occluded_band_indices are known dead zones (arm/gripper):
+    they never contribute samples and are removed from the confidence
+    denominator so a fixed obstruction is not read as line loss.
     """
     half_width = max(crop_width / 2.0, 1.0)
     line_width = features.line_width_px if features.line_width_px > 0 else 8.0
 
+    visible_bands = max(1, cfg.band_count - len(occluded_band_indices))
+
     ys: list[float] = []
     xs: list[float] = []
     ws: list[float] = []
+    y_min = float("inf")
     for band in features.bands:
-        if band.best is None:
+        if band.index in occluded_band_indices or band.best is None:
             continue
         band_h = float(max(1, band.y1 - band.y0))
         conf = _band_confidence(band.best, band_h, line_width, cfg)
         if conf <= 0.0:
             continue
         y_mid = (band.y0 + band.y1) / 2.0
+        y_min = min(y_min, float(band.y0))
         # Weight the bottom of the crop (nearest the car) more heavily.
         near_bias = 1.0 + 0.5 * (band.index == 0)
         ys.append(y_mid)
@@ -276,10 +287,19 @@ def fit_line_trajectory(
     theta = float(np.arctan2(-slope, 1.0))
     kappa = max(-1.0, min(1.0, curvature * half_width))
 
-    conf = float(min(1.0, w_arr.sum() / (cfg.band_count * 0.9)))
+    # Lookahead sample: the fitted curve some distance ahead (toward smaller y).
+    if lookahead_frac > 0.0 and y_min < float("inf"):
+        y_look = y_bottom - lookahead_frac * (y_bottom - y_min)
+        cx_look = float(np.polyval(coeffs, y_look))
+        e_look = max(-1.0, min(1.0, (cx_look - crop_center) / half_width))
+    else:
+        e_look = e0
+
+    conf = float(min(1.0, w_arr.sum() / (visible_bands * 0.9)))
     return TrajectoryFit(
         found=True,
         e0=e0,
+        e_look=e_look,
         theta=theta,
         kappa=kappa,
         conf=conf,

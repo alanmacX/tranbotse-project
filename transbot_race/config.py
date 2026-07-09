@@ -15,6 +15,42 @@ class CameraConfig:
 
 
 @dataclass(slots=True)
+class PerspectiveConfig:
+    """Lens undistort + inverse-perspective (bird's-eye) mapping.
+
+    All fields default to a no-op: with enabled=False the pipeline runs in raw
+    crop pixel space exactly as before. Populate camera_matrix/dist_coeffs from
+    an intrinsic calibration and homography from a ground-plane calibration to
+    turn e0/theta/kappa into physically meaningful (and left/right symmetric)
+    ground-space quantities.
+    """
+
+    enabled: bool = False
+    undistort: bool = False
+    camera_matrix: tuple[float, ...] | None = None   # 9 floats, row-major 3x3
+    dist_coeffs: tuple[float, ...] | None = None      # 5 floats k1,k2,p1,p2,k3
+    homography: tuple[float, ...] | None = None        # 9 floats, crop->bird 3x3
+    output_width: int = 160
+    output_height: int = 240
+    px_per_cm: float = 4.0
+
+
+@dataclass(slots=True)
+class OcclusionConfig:
+    """Static dead zones (arm, gripper, chassis) in the scan coordinate space.
+
+    Rectangles are (x0, y0, x1, y1) in the crop (or bird's-eye, if perspective
+    is enabled) frame. Occluded pixels are forced to background before scanning
+    and, crucially, occluded bands are excluded from the confidence denominator
+    so a known obstruction is not mistaken for line loss.
+    """
+
+    enabled: bool = False
+    rects: tuple[tuple[int, int, int, int], ...] = ()
+
+
+
+@dataclass(slots=True)
 class VisionConfig:
     """Image preprocessing and scan-line feature extraction knobs."""
 
@@ -76,6 +112,12 @@ class TrackerConfig:
     # Optional branch bias for roundabout / fork exit selection.
     e_bias: float = 0.0              # + biases toward right side, - toward left
 
+    # Pure-pursuit lookahead: when > 0, steer toward the fitted curve sampled at
+    # this fraction of the ROI height ahead, instead of the reactive e0 law.
+    # 0 disables (pure reactive control, unchanged behavior).
+    lookahead_frac: float = 0.0
+    k_pursuit: float = 0.9
+
 
 @dataclass(slots=True)
 class RaceConfig:
@@ -83,4 +125,6 @@ class RaceConfig:
 
     camera: CameraConfig = field(default_factory=CameraConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
+    perspective: PerspectiveConfig = field(default_factory=PerspectiveConfig)
+    occlusion: OcclusionConfig = field(default_factory=OcclusionConfig)
     tracker: TrackerConfig = field(default_factory=TrackerConfig)

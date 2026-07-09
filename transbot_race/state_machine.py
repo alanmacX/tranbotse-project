@@ -61,6 +61,7 @@ class RaceStateMachine:
         self.state_started_at = 0.0
         # Filtered trajectory estimate.
         self.f_e0 = 0.0
+        self.f_e_look = 0.0
         self.f_theta = 0.0
         self.f_kappa = 0.0
         self.f_conf = 0.0
@@ -102,6 +103,7 @@ class RaceStateMachine:
             self.d_e0 = (1 - b) * self.d_e0 + b * (self.f_e0 - prev_e0)
             self.f_theta = (1 - a) * self.f_theta + a * fit.theta
             self.f_kappa = (1 - a) * self.f_kappa + a * fit.kappa
+            self.f_e_look = (1 - a) * self.f_e_look + a * fit.e_look
             # Fast-attack, slow-release: snap up to a stronger fit, ease down.
             if self.f_conf < fit.conf:
                 self.f_conf = fit.conf
@@ -110,6 +112,7 @@ class RaceStateMachine:
         else:
             # Predict: extrapolate position by its rate, decay confidence.
             self.f_e0 = max(-1.0, min(1.0, self.f_e0 + self.d_e0))
+            self.f_e_look = max(-1.0, min(1.0, self.f_e_look + self.d_e0))
             self.f_conf = max(0.0, self.f_conf - t.conf_decay)
 
     # -- TRACK ------------------------------------------------------------
@@ -121,8 +124,15 @@ class RaceStateMachine:
         theta = self.f_theta
         kappa = self.f_kappa
 
+        # Lateral term: pure-pursuit toward the lookahead point when enabled,
+        # else reactive error at the bottom of the crop. Same feedback shape.
+        if t.lookahead_frac > 0.0:
+            lateral = t.k_pursuit * (self.f_e_look + t.e_bias)
+        else:
+            lateral = t.k_e * e0
+
         sign = 1.0 if t.invert_turn else -1.0
-        w = sign * (t.k_e * e0 + t.k_theta * theta + t.k_ff * kappa)
+        w = sign * (lateral + t.k_theta * theta + t.k_ff * kappa)
 
         # Pivot assist: saturation branch for sharp bends / corners of any angle.
         enter = abs(e0) > t.e_pivot or abs(theta) > t.theta_pivot

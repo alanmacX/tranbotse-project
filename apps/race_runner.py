@@ -14,6 +14,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from transbot_race.config import RaceConfig  # noqa: E402
+from transbot_race.geometry import (  # noqa: E402
+    PerspectiveTransformer,
+    apply_occlusion,
+    band_is_occluded,
+)
 from transbot_race.state_machine import RaceStateMachine, command_summary  # noqa: E402
 from transbot_race.vision import (  # noqa: E402
     draw_debug_overlay,
@@ -92,10 +97,25 @@ def crop_frame(frame, cfg: RaceConfig):
     return frame[y0:y1, ex0:ex1], (ex0, y0, ex1, y1), track_center
 
 
+def occluded_band_indices(height: int, width: int, cfg: RaceConfig) -> frozenset[int]:
+    """Bands (in scan_line_features geometry) that fall in a static dead zone."""
+    if not cfg.occlusion.enabled or not cfg.occlusion.rects:
+        return frozenset()
+    n = cfg.vision.band_count
+    indices = []
+    for index in range(n):
+        y1 = height - int(index * height / n)
+        y0 = height - int((index + 1) * height / n)
+        if band_is_occluded(y0, y1, width, cfg.occlusion):
+            indices.append(index)
+    return frozenset(indices)
+
+
 def run(args: argparse.Namespace) -> int:
     cfg = load_config(Path(args.config))
     bot = make_bot(args.dry_run)
     sm = RaceStateMachine(cfg)
+    perspective = PerspectiveTransformer(cfg.perspective)
     cap = cv.VideoCapture(args.camera)
     cap.set(cv.CAP_PROP_FRAME_WIDTH, cfg.camera.frame_width)
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, cfg.camera.frame_height)
@@ -115,11 +135,24 @@ def run(args: argparse.Namespace) -> int:
                 bot.set_car_motion(0.0, 0.0)
                 time.sleep(0.05)
                 continue
+            frame = perspective.undistort(frame)
             crop, (x0, y0, x1, y1), track_center = crop_frame(frame, cfg)
-            crop_w = x1 - x0
+            if perspective.active:
+                crop = perspective.to_birdseye(crop)
+                track_center = crop.shape[1] / 2.0
+            crop_w = crop.shape[1]
             mask = preprocess_blackline(crop, cfg.vision)
+            mask = apply_occlusion(mask, cfg.occlusion)
+            occluded = occluded_band_indices(crop.shape[0], crop.shape[1], cfg)
             features = scan_line_features(mask, cfg.vision, crop_center=track_center)
-            fit = fit_line_trajectory(features, cfg.vision, crop_center=track_center, crop_width=crop_w)
+            fit = fit_line_trajectory(
+                features,
+                cfg.vision,
+                crop_center=track_center,
+                crop_width=crop_w,
+                lookahead_frac=cfg.tracker.lookahead_frac,
+                occluded_band_indices=occluded,
+            )
             command = sm.step(fit, now=time.monotonic())
             cmd_v, cmd_w = command.v, command.w
             bot.set_car_motion(cmd_v, cmd_w)

@@ -23,6 +23,20 @@
     "branch_min_crop_ratio": 0.22,
     "trigger_y_frac": 0.3
   },
+  "perspective": {
+    "enabled": false,
+    "undistort": false,
+    "camera_matrix": null,
+    "dist_coeffs": null,
+    "homography": null,
+    "output_width": 160,
+    "output_height": 240,
+    "px_per_cm": 4.0
+  },
+  "occlusion": {
+    "enabled": false,
+    "rects": []
+  },
   "tracker": {
     "v_max": 0.06,
     "v_min_ratio": 0.35,
@@ -46,6 +60,8 @@
     "w_search": 0.16,
     "w_search_min": 0.1,
     "search_timeout_sec": 3.0,
-    "e_bias": 0.0
+    "e_bias": 0.0,
+    "lookahead_frac": 0.0,
+    "k_pursuit": 0.9
   }
 }

@@ -101,6 +101,25 @@ class UnifiedTrackerTests(unittest.TestCase):
         self.assertEqual(cmd.v, 0.0)
         self.assertEqual(cmd.w, 0.0)
 
+    def test_lookahead_steers_toward_ahead_error(self):
+        # With pure-pursuit enabled, an approaching bend (line offset ahead but
+        # centered at the bottom) still turns toward the lookahead point.
+        cfg = RaceConfig()
+        cfg.tracker.lookahead_frac = 0.6
+        cfg.tracker.k_theta = 0.0
+        cfg.tracker.k_ff = 0.0
+        sm = RaceStateMachine(cfg)
+        features = scan_line_features(right_angle(corner_y=120), cfg.vision, crop_center=CENTER)
+        fit = fit_line_trajectory(
+            features, cfg.vision, crop_center=CENTER, crop_width=W, lookahead_frac=0.6
+        )
+        cmd = None
+        for i in range(8):
+            cmd = sm.step(fit, now=i * 0.1)
+        self.assertEqual(sm.state, RaceState.TRACK)
+        self.assertGreater(abs(cmd.w), 0.0)
+
+
 
 if __name__ == "__main__":
     unittest.main()
