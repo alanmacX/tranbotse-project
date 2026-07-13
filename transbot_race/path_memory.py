@@ -113,10 +113,7 @@ class CornerCommandDelay:
         self.hold_v = 0.0
         self.hold_w = 0.0
         self.stable_w = 0.0
-        self.history: list[float] = []
-        self.profile: list[float] = []
-        self.replay_sign = 0
-        self.replay_index = 0
+        self.turned_rad = 0.0
         self.clear_frames = 0
         self.last_now: float | None = None
 
@@ -128,11 +125,11 @@ class CornerCommandDelay:
         command_w: float,
         now: float,
         linear: float,
+        angular: float = 0.0,
     ) -> CornerCommandResult:
-        travelled = self._travel(now, linear)
+        travelled, turned = self._motion_delta(now, linear, angular)
         direction = _intent_direction(features, fit, self.cfg)
         if self.state == "armed":
-            self._remember(command_w)
             if direction == 0 and fit.found and fit.conf >= 0.65:
                 limit = self.cfg.corner_hold_max_w
                 self.stable_w = max(-limit, min(limit, command_w))
@@ -145,15 +142,23 @@ class CornerCommandDelay:
                 self.remaining_m = self.cfg.camera_to_axle_m
                 self.hold_v = max(0.0, command_v)
                 self.hold_w = self.stable_w
-                self.profile = list(self.history)
-                self.replay_index = 0
-                self.replay_sign = 1 if command_w > 0.0 else -1 if command_w < 0.0 else 0
+                self.turned_rad = 0.0
         elif self.state == "waiting":
             self.remaining_m = max(0.0, self.remaining_m - travelled)
             if self.remaining_m <= 1e-6:
-                self.state = "replay"
-        elif self.state == "replay":
-            if self.replay_index >= len(self.profile):
+                self.state = "turning"
+                self.turned_rad = 0.0
+        elif self.state == "turning":
+            self.turned_rad += turned
+            ready = self.turned_rad >= self.cfg.corner_reacquire_angle_rad
+            aligned = bool(
+                fit.found
+                and fit.conf >= 0.65
+                and fit.n_bands >= 3
+                and abs(fit.e0) <= self.cfg.corner_e_threshold
+                and abs(fit.theta) <= self.cfg.corner_theta_threshold
+            )
+            if (ready and aligned) or self.turned_rad >= self.cfg.corner_turn_angle_rad:
                 self.state = "cooldown"
                 self.clear_frames = 0
         elif self.state == "cooldown":
@@ -164,37 +169,31 @@ class CornerCommandDelay:
         if self.state == "waiting":
             status = PathStrategyStatus(
                 True, "corner_event", "waiting_margin", self.remaining_m,
-                self.candidate_dir, len(self.profile),
+                self.candidate_dir, 0,
             )
             return CornerCommandResult(self.hold_v, self.hold_w, status)
-        if self.state == "replay" and self.profile:
-            w = self.profile[min(self.replay_index, len(self.profile) - 1)]
-            self.replay_index += 1
+        if self.state == "turning":
+            turn_v = self.hold_v * max(0.0, min(1.0, self.cfg.corner_turn_speed_ratio))
+            turn_w = -self.candidate_dir * abs(self.cfg.corner_replay_max_w)
             status = PathStrategyStatus(
-                True, "corner_event", "replay_step", 0.0,
-                self.candidate_dir, len(self.profile),
+                True, "corner_event", "committed_turn", 0.0,
+                self.candidate_dir, 0,
+                (self.turned_rad, self.cfg.corner_turn_angle_rad),
             )
-            return CornerCommandResult(self.hold_v, w, status)
+            return CornerCommandResult(turn_v, turn_w, status)
         status = PathStrategyStatus(
             True, "corner_event", self.state, 0.0,
-            self.candidate_dir, len(self.profile),
+            self.candidate_dir, 0,
         )
         return CornerCommandResult(command_v, command_w, status)
 
-    def _remember(self, command_w: float) -> None:
-        limit = self.cfg.corner_replay_max_w
-        self.history.append(max(-limit, min(limit, float(command_w))))
-        keep = max(1, self.cfg.corner_record_steps)
-        if len(self.history) > keep:
-            del self.history[:-keep]
-
-    def _travel(self, now: float, linear: float) -> float:
+    def _motion_delta(self, now: float, linear: float, angular: float) -> tuple[float, float]:
         if self.last_now is None:
             self.last_now = now
-            return 0.0
+            return 0.0, 0.0
         dt = max(0.0, min(self.cfg.max_motion_dt_sec, now - self.last_now))
         self.last_now = now
-        return max(0.0, linear) * dt
+        return max(0.0, linear) * dt, abs(angular) * dt
 
 
 class RollingPathPursuit:

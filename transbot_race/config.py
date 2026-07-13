@@ -40,7 +40,10 @@ class PathMemoryConfig:
     corner_e_threshold: float = 0.48
     corner_record_steps: int = 5
     corner_hold_max_w: float = 0.0
-    corner_replay_max_w: float = 0.16
+    corner_replay_max_w: float = 0.20
+    corner_turn_angle_rad: float = 1.35
+    corner_reacquire_angle_rad: float = 0.70
+    corner_turn_speed_ratio: float = 0.45
     lookahead_m: float = 0.07
     lateral_half_width_m: float = 0.20
     path_max_points: int = 160

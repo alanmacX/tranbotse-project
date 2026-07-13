@@ -158,7 +158,10 @@ async function loadStrategy() {
   el("strategyMargin").value = cfg.path_memory.camera_to_axle_m;
   el("cornerConfirm").value = cfg.path_memory.corner_confirm_frames;
   el("cornerTheta").value = cfg.path_memory.corner_theta_threshold;
-  el("cornerRecordSteps").value = cfg.path_memory.corner_record_steps;
+  el("cornerTurnAngle").value = cfg.path_memory.corner_turn_angle_rad;
+  el("cornerReacquireAngle").value = cfg.path_memory.corner_reacquire_angle_rad;
+  el("cornerTurnW").value = cfg.path_memory.corner_replay_max_w;
+  el("cornerTurnSpeed").value = cfg.path_memory.corner_turn_speed_ratio;
   el("strategyLookahead").value = cfg.path_memory.lookahead_m;
   el("paperNearM").value = cfg.ground_projection.paper_near_m;
   showStrategyFields();
@@ -173,7 +176,10 @@ el("strategySaveBtn").addEventListener("click", () => guard("STRATEGY", async ()
       camera_to_axle_m: Number(el("strategyMargin").value),
       corner_confirm_frames: Number(el("cornerConfirm").value),
       corner_theta_threshold: Number(el("cornerTheta").value),
-      corner_record_steps: Number(el("cornerRecordSteps").value),
+      corner_turn_angle_rad: Number(el("cornerTurnAngle").value),
+      corner_reacquire_angle_rad: Number(el("cornerReacquireAngle").value),
+      corner_replay_max_w: Number(el("cornerTurnW").value),
+      corner_turn_speed_ratio: Number(el("cornerTurnSpeed").value),
       lookahead_m: Number(el("strategyLookahead").value),
     },
     obstacle: { enabled: el("obstacleEnabled").checked },

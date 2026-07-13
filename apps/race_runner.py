@@ -96,8 +96,12 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError(f"unsupported path-memory mode: {cfg.path_memory.mode}")
     if cfg.path_memory.corner_confirm_frames <= 0 or cfg.path_memory.path_max_points <= 0:
         raise ValueError("path-memory frame and point limits must be positive")
-    if cfg.path_memory.corner_record_steps <= 0 or cfg.path_memory.corner_replay_max_w <= 0.0:
-        raise ValueError("corner record steps and replay limit must be positive")
+    if cfg.path_memory.corner_replay_max_w <= 0.0 or cfg.path_memory.corner_turn_angle_rad <= 0.0:
+        raise ValueError("corner turn angle and angular speed must be positive")
+    if not 0.0 <= cfg.path_memory.corner_turn_speed_ratio <= 1.0:
+        raise ValueError("corner turn speed ratio must be within [0, 1]")
+    if not 0.0 <= cfg.path_memory.corner_reacquire_angle_rad <= cfg.path_memory.corner_turn_angle_rad:
+        raise ValueError("corner reacquire angle must be within [0, turn angle]")
     if cfg.path_memory.max_age_sec <= 0.0 or cfg.path_memory.max_motion_dt_sec <= 0.0:
         raise ValueError("path-memory time limits must be positive")
 
@@ -375,7 +379,8 @@ def run(args: argparse.Namespace) -> int:
             command = sm.step(fit, now=now, obstacle=obstacle_decision.stop_required)
             if strategy_mode == "corner_event" and not obstacle_decision.stop_required:
                 delayed = corner_margin.step(
-                    visual_fit, features, command.v, command.w, now, motion.linear,
+                    visual_fit, features, command.v, command.w, now,
+                    motion.linear, motion.angular,
                 )
                 memory_status = delayed.status
                 if delayed.v != command.v or delayed.w != command.w:
