@@ -113,6 +113,7 @@ class CornerCommandDelay:
         self.hold_v = 0.0
         self.hold_w = 0.0
         self.stable_w = 0.0
+        self.history: list[float] = []
         self.profile: list[float] = []
         self.replay_sign = 0
         self.replay_index = 0
@@ -131,6 +132,7 @@ class CornerCommandDelay:
         travelled = self._travel(now, linear)
         direction = _intent_direction(features, fit, self.cfg)
         if self.state == "armed":
+            self._remember(command_w)
             if direction == 0 and fit.found and fit.conf >= 0.65:
                 limit = self.cfg.corner_hold_max_w
                 self.stable_w = max(-limit, min(limit, command_w))
@@ -143,12 +145,10 @@ class CornerCommandDelay:
                 self.remaining_m = self.cfg.camera_to_axle_m
                 self.hold_v = max(0.0, command_v)
                 self.hold_w = self.stable_w
-                self.profile = []
+                self.profile = list(self.history)
                 self.replay_index = 0
                 self.replay_sign = 1 if command_w > 0.0 else -1 if command_w < 0.0 else 0
-                self._record(command_w)
         elif self.state == "waiting":
-            self._record(command_w)
             self.remaining_m = max(0.0, self.remaining_m - travelled)
             if self.remaining_m <= 1e-6:
                 self.state = "replay"
@@ -181,17 +181,12 @@ class CornerCommandDelay:
         )
         return CornerCommandResult(command_v, command_w, status)
 
-    def _record(self, command_w: float) -> None:
-        # Capture the complete camera-ahead command stream while straight motion
-        # is active. Replaying only the first few frames truncates the corner.
-        max_steps = max(1, self.cfg.corner_record_steps, self.cfg.path_max_points)
-        if len(self.profile) >= max_steps:
-            return
-        sign = 1 if command_w > 0.0 else -1 if command_w < 0.0 else 0
-        if self.replay_sign and sign and sign != self.replay_sign:
-            return
+    def _remember(self, command_w: float) -> None:
         limit = self.cfg.corner_replay_max_w
-        self.profile.append(max(-limit, min(limit, float(command_w))))
+        self.history.append(max(-limit, min(limit, float(command_w))))
+        keep = max(1, self.cfg.corner_record_steps)
+        if len(self.history) > keep:
+            del self.history[:-keep]
 
     def _travel(self, now: float, linear: float) -> float:
         if self.last_now is None:
