@@ -96,6 +96,18 @@ class UnifiedTrackerTests(unittest.TestCase):
         expected_w = -(cfg.tracker.k_e * fit.e0 + cfg.tracker.k_theta * fit.theta)
         self.assertAlmostEqual(command.w, expected_w)
 
+    def test_default_tracker_pivots_when_lateral_error_overrides_heading(self):
+        cfg = RaceConfig()
+        sm = RaceStateMachine(cfg)
+        fit = TrajectoryFit(
+            found=True, e0=-0.56, e_look=-0.56, theta=0.42,
+            conf=0.9, n_bands=4,
+        )
+        command = sm.reacquire_from(fit, now=1.0)
+        self.assertEqual(command.mode, TrackMode.PIVOT)
+        self.assertAlmostEqual(command.v, 0.0)
+        self.assertGreater(command.w, 0.0)
+
     def test_right_angle_enters_pivot_not_a_state(self):
         cfg = poly_config()
         cfg.tracker.e_pivot = 0.55

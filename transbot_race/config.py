@@ -106,7 +106,7 @@ class VisionConfig:
     branch_width_ratio: float = 2.2
     branch_min_crop_ratio: float = 0.22
     trigger_y_frac: float = 0.30
-    fit_mode: str = "classic"        # "classic" contour ROI baseline, or "poly"
+    fit_mode: str = "poly"           # "classic" contour ROI baseline, or "poly"
 
     # Contour/sliding-window extraction. These mirror the reliable shape of
     # common OpenCV line followers and lane detectors: clean connected
@@ -149,8 +149,8 @@ class TrackerConfig:
     # Control law: w = k_e*e0 + k_theta*theta + k_ff*kappa.
     k_e: float = 0.24
     k_theta: float = 0.30
-    k_ff: float = 0.0
-    max_w: float = 0.24
+    k_ff: float = 0.20
+    max_w: float = 0.30
     slow_gain: float = 0.55          # how much |w| cuts speed (0..1)
 
     # Confidence filter: below conf_predict the controller runs on prediction
@@ -164,11 +164,11 @@ class TrackerConfig:
 
     # Pivot assist: a saturation branch of the same controller, entered when the
     # line is far off / sharply angled (covers corners of any angle).
-    e_pivot: float = 1.05            # lateral error alone should not stop straight tracking
-    theta_pivot: float = 1.30        # radians
+    e_pivot: float = 0.55
+    theta_pivot: float = 0.65        # radians
     pivot_hysteresis: float = 0.12   # fractional widening to exit pivot
-    v_pivot_ratio: float = 0.30      # v during pivot, fraction of v_max
-    w_pivot: float = 0.26
+    v_pivot_ratio: float = 0.0       # v during pivot, fraction of v_max
+    w_pivot: float = 0.34
 
     # LOST search sweep.
     w_search: float = 0.16
