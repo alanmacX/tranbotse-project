@@ -190,3 +190,73 @@ document.querySelectorAll("button.run").forEach((btn) =>
     )
   )
 );
+
+// -- Ground-plane calibration ----------------------------------------------
+const calibImage = el("calibImage");
+const calibCanvas = el("calibCanvas");
+const calibCtx = calibCanvas.getContext("2d");
+let calibPoints = [];
+
+function drawCalibrationPoints() {
+  calibCtx.clearRect(0, 0, calibCanvas.width, calibCanvas.height);
+  calibCtx.strokeStyle = "#f0b429";
+  calibCtx.fillStyle = "#f85149";
+  calibCtx.lineWidth = 2;
+  calibPoints.forEach((point, index) => {
+    calibCtx.beginPath();
+    calibCtx.arc(point.canvasX, point.canvasY, 5, 0, Math.PI * 2);
+    calibCtx.fill();
+    calibCtx.fillText(String(index + 1), point.canvasX + 7, point.canvasY - 7);
+    if (index) {
+      const previous = calibPoints[index - 1];
+      calibCtx.beginPath();
+      calibCtx.moveTo(previous.canvasX, previous.canvasY);
+      calibCtx.lineTo(point.canvasX, point.canvasY);
+      calibCtx.stroke();
+    }
+  });
+}
+
+function sizeCalibrationCanvas() {
+  calibCanvas.width = calibImage.clientWidth;
+  calibCanvas.height = calibImage.clientHeight;
+  drawCalibrationPoints();
+}
+
+calibCanvas.addEventListener("click", (event) => {
+  if (!calibImage.naturalWidth || calibPoints.length >= 4) return;
+  const rect = calibCanvas.getBoundingClientRect();
+  const canvasX = event.clientX - rect.left;
+  const canvasY = event.clientY - rect.top;
+  calibPoints.push({
+    canvasX,
+    canvasY,
+    imageX: canvasX * calibImage.naturalWidth / calibCanvas.width,
+    imageY: canvasY * calibImage.naturalHeight / calibCanvas.height,
+  });
+  drawCalibrationPoints();
+});
+
+el("calibCaptureBtn").addEventListener("click", () => guard("CAPTURE", async () => {
+  const data = await post("/api/calibration/capture", { ssh_target: sshTarget() });
+  calibPoints = [];
+  calibImage.src = "data:image/jpeg;base64," + data.image;
+  calibImage.onload = sizeCalibrationCanvas;
+  return { message: "标定画面已获取" };
+}));
+
+el("calibResetBtn").addEventListener("click", () => {
+  calibPoints = [];
+  drawCalibrationPoints();
+  setMsg("calibration points reset");
+});
+
+el("calibSaveBtn").addEventListener("click", () => guard("CALIBRATE", async () => {
+  if (calibPoints.length !== 4) throw new Error("需要依次点击 4 个角点");
+  return post("/api/calibration/compute", {
+    points: calibPoints.map((point) => [point.imageX, point.imageY]),
+    paper_near_cm: Number(el("paperNearCm").value),
+  });
+}));
+
+window.addEventListener("resize", sizeCalibrationCanvas);

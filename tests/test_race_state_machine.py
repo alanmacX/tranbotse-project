@@ -15,6 +15,12 @@ def fit_of(mask, cfg):
     return fit_line_trajectory(features, cfg.vision, crop_center=CENTER, crop_width=W)
 
 
+def poly_config():
+    cfg = RaceConfig()
+    cfg.vision.fit_mode = "poly"
+    return cfg
+
+
 def straight(x=CENTER, line_w=18):
     mask = np.zeros((H, W), dtype=np.uint8)
     cv.rectangle(mask, (x - line_w // 2, 0), (x + line_w // 2, H - 1), 255, -1)
@@ -30,6 +36,13 @@ def right_angle(line_w=18, corner_y=150):
 
 def empty():
     return np.zeros((H, W), dtype=np.uint8)
+
+
+def blind_right(line_w=18):
+    mask = np.zeros((H, W), dtype=np.uint8)
+    cv.rectangle(mask, (CENTER - line_w // 2, 150), (CENTER + line_w // 2, H - 1), 255, -1)
+    cv.rectangle(mask, (145, 0), (170, 90), 255, -1)
+    return mask
 
 
 def replay(sm, mask, cfg, start=0.0, n=6, dt=0.1):
@@ -58,7 +71,9 @@ class UnifiedTrackerTests(unittest.TestCase):
         self.assertLess(cmd.w, 0.0)
 
     def test_right_angle_enters_pivot_not_a_state(self):
-        cfg = RaceConfig()
+        cfg = poly_config()
+        cfg.tracker.e_pivot = 0.55
+        cfg.tracker.theta_pivot = 0.65
         sm = RaceStateMachine(cfg)
         cmd = replay(sm, right_angle(), cfg, n=8)
         # Still the single TRACK state, but pivot sub-mode with near-zero speed.
@@ -104,7 +119,7 @@ class UnifiedTrackerTests(unittest.TestCase):
     def test_lookahead_steers_toward_ahead_error(self):
         # With pure-pursuit enabled, an approaching bend (line offset ahead but
         # centered at the bottom) still turns toward the lookahead point.
-        cfg = RaceConfig()
+        cfg = poly_config()
         cfg.tracker.lookahead_frac = 0.6
         cfg.tracker.k_theta = 0.0
         cfg.tracker.k_ff = 0.0
@@ -118,6 +133,22 @@ class UnifiedTrackerTests(unittest.TestCase):
             cmd = sm.step(fit, now=i * 0.1)
         self.assertEqual(sm.state, RaceState.TRACK)
         self.assertGreater(abs(cmd.w), 0.0)
+
+    def test_blind_preview_executes_plan_inside_track(self):
+        cfg = poly_config()
+        cfg.tracker.preview_plan_enabled = True
+        cfg.tracker.preview_forward_sec = 0.2
+        cfg.tracker.preview_turn_sec = 0.4
+        sm = RaceStateMachine(cfg)
+        fit = fit_of(blind_right(), cfg)
+        cmd1 = sm.step(fit, now=0.0)
+        cmd2 = sm.step(fit, now=0.25)
+        self.assertEqual(sm.state, RaceState.TRACK)
+        self.assertEqual(cmd1.mode, TrackMode.PLAN)
+        self.assertEqual(cmd1.reason, "preview_forward")
+        self.assertEqual(cmd2.mode, TrackMode.PLAN)
+        self.assertEqual(cmd2.reason, "preview_turn")
+        self.assertLess(cmd2.w, 0.0)
 
 
 

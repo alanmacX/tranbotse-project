@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import sys
 import time
-from dataclasses import asdict, fields, is_dataclass
+from dataclasses import asdict, fields, is_dataclass, replace
 from pathlib import Path
 
 import cv2 as cv
@@ -19,6 +20,17 @@ from transbot_race.geometry import (  # noqa: E402
     apply_occlusion,
     band_is_occluded,
 )
+from transbot_race.path_memory import (  # noqa: E402
+    PathMemoryStatus,
+    ShortHorizonPathMemory,
+    image_path_to_axle,
+    read_motion_sample,
+)
+from transbot_race.obstacle import (  # noqa: E402
+    ObstacleMonitor,
+    ObstacleState,
+    draw_obstacle_overlay,
+)
 from transbot_race.state_machine import RaceStateMachine, command_summary  # noqa: E402
 from transbot_race.vision import (  # noqa: E402
     _band_bounds,
@@ -27,6 +39,14 @@ from transbot_race.vision import (  # noqa: E402
     preprocess_blackline,
     scan_line_features,
 )
+
+
+def coerce_tuple(value: object) -> tuple:
+    if isinstance(value, str):
+        value = ast.literal_eval(value)
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"expected tuple/list value, got {value!r}")
+    return tuple(tuple(item) if isinstance(item, list) else item for item in value)
 
 
 def update_dataclass(obj: object, values: dict) -> None:
@@ -39,8 +59,8 @@ def update_dataclass(obj: object, values: dict) -> None:
         current = getattr(obj, key)
         if is_dataclass(current) and isinstance(value, dict):
             update_dataclass(current, value)
-        elif isinstance(current, tuple) and isinstance(value, list):
-            setattr(obj, key, tuple(value))
+        elif isinstance(current, tuple):
+            setattr(obj, key, coerce_tuple(value))
         else:
             setattr(obj, key, value)
 
@@ -55,6 +75,9 @@ def load_config(path: Path) -> RaceConfig:
 
 
 def _validate_config(cfg: RaceConfig) -> None:
+    cfg.camera.crop = tuple(int(item) for item in coerce_tuple(cfg.camera.crop))
+    if len(cfg.camera.crop) != 4:
+        raise ValueError(f"camera.crop must have 4 values, got {cfg.camera.crop!r}")
     x0, y0, x1, y1 = cfg.camera.crop
     crop_h = y1 - y0
     min_h = cfg.vision.band_count * 12
@@ -65,11 +88,25 @@ def _validate_config(cfg: RaceConfig) -> None:
         )
     if x1 <= x0:
         raise ValueError(f"crop x1 must be > x0, got {cfg.camera.crop}")
+    if cfg.path_memory.effective_camera_to_axle_m < 0.0:
+        raise ValueError("effective camera-to-axle distance cannot be negative")
+    if cfg.path_memory.lookahead_m <= 0.0 or cfg.path_memory.heading_lookahead_m <= 0.0:
+        raise ValueError("path-memory lookahead distances must be positive")
+    if cfg.perspective.enabled and cfg.path_memory.enabled and cfg.perspective.px_per_cm <= 0.0:
+        raise ValueError("path memory requires a positive perspective.px_per_cm")
 
 
 class DryBot:
+    def __init__(self) -> None:
+        self.v = 0.0
+        self.w = 0.0
+
     def set_car_motion(self, v: float, w: float) -> None:
+        self.v, self.w = float(v), float(w)
         print(f"DRY command v={v:.4f} w={w:.4f}")
+
+    def get_motion_data(self) -> tuple[float, float]:
+        return self.v, self.w
 
     def set_floodlight(self, value: int) -> None:
         print(f"DRY floodlight {value}")
@@ -131,7 +168,8 @@ class DebugRecorder:
         self.crops_dir = self.root / "crops"
         self.overlays_dir = self.root / "overlays"
         self.masks_dir = self.root / "masks"
-        for path in (self.frames_dir, self.crops_dir, self.overlays_dir, self.masks_dir):
+        self.obstacles_dir = self.root / "obstacles"
+        for path in (self.frames_dir, self.crops_dir, self.overlays_dir, self.masks_dir, self.obstacles_dir):
             path.mkdir(parents=True, exist_ok=True)
 
         with (self.root / "meta.json").open("w", encoding="utf-8") as f:
@@ -154,7 +192,10 @@ class DebugRecorder:
         self.telemetry = (self.root / "telemetry.jsonl").open("a", encoding="utf-8", buffering=1)
         print(f"debug_capture_dir={self.root}", file=sys.stderr, flush=True)
 
-    def record(self, summary: dict, frame, crop, mask, features, cfg: RaceConfig, crop_center: float) -> None:
+    def record(
+        self, summary: dict, frame, crop, mask, features, cfg: RaceConfig, crop_center: float,
+        raw_crop=None, obstacle_decision=None, raw_track_center: float | None = None,
+    ) -> None:
         if not self.enabled or self.root is None:
             return
 
@@ -173,6 +214,9 @@ class DebugRecorder:
         cv.imwrite(str(self.crops_dir / f"{stem}.jpg"), crop, params)
         cv.imwrite(str(self.overlays_dir / f"{stem}.jpg"), overlay, params)
         cv.imwrite(str(self.masks_dir / f"{stem}.png"), mask)
+        if raw_crop is not None and obstacle_decision is not None and raw_track_center is not None:
+            obstacle_overlay = draw_obstacle_overlay(raw_crop, obstacle_decision, raw_track_center, cfg.obstacle)
+            cv.imwrite(str(self.obstacles_dir / f"{stem}.jpg"), obstacle_overlay, params)
 
         self.last_frame_t = elapsed
         self.frame_count += 1
@@ -194,6 +238,7 @@ class DebugRecorder:
                     "crops": "crops/",
                     "overlays": "overlays/",
                     "masks": "masks/",
+                    "obstacles": "obstacles/",
                 },
                 f,
                 ensure_ascii=False,
@@ -207,6 +252,8 @@ def run(args: argparse.Namespace) -> int:
     bot = make_bot(args.dry_run)
     sm = RaceStateMachine(cfg)
     perspective = PerspectiveTransformer(cfg.perspective)
+    path_memory = ShortHorizonPathMemory(cfg.path_memory)
+    obstacle_monitor = ObstacleMonitor(cfg.obstacle)
     cap = cv.VideoCapture(args.camera)
     cap.set(cv.CAP_PROP_FRAME_WIDTH, cfg.camera.frame_width)
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, cfg.camera.frame_height)
@@ -220,6 +267,10 @@ def run(args: argparse.Namespace) -> int:
     start = time.monotonic()
     last_log = 0.0
     occluded = frozenset()  # computed once from the first crop; static per run
+    last_cmd_v = 0.0
+    last_cmd_w = 0.0
+    straight_streak = 0
+    obstacle_armed_until = -1e9
     try:
         stop_chassis(bot, count=3, delay=0.03)
         while time.monotonic() - start < args.max_sec:
@@ -230,6 +281,8 @@ def run(args: argparse.Namespace) -> int:
                 continue
             frame = perspective.undistort(frame)
             crop, (x0, y0, x1, y1), track_center = crop_frame(frame, cfg)
+            raw_crop = crop.copy()
+            raw_track_center = track_center
             if perspective.active:
                 crop = perspective.to_birdseye(crop)
                 track_center = crop.shape[1] / 2.0
@@ -239,7 +292,7 @@ def run(args: argparse.Namespace) -> int:
             if not occluded and cfg.occlusion.enabled:
                 occluded = occluded_band_indices(crop.shape[0], crop.shape[1], cfg)
             features = scan_line_features(mask, cfg.vision, crop_center=track_center)
-            fit = fit_line_trajectory(
+            visual_fit = fit_line_trajectory(
                 features,
                 cfg.vision,
                 crop_center=track_center,
@@ -247,14 +300,83 @@ def run(args: argparse.Namespace) -> int:
                 lookahead_frac=cfg.tracker.lookahead_frac,
                 occluded_band_indices=occluded,
             )
-            command = sm.step(fit, now=time.monotonic())
+            now = time.monotonic()
+            motion = read_motion_sample(bot, last_cmd_v, last_cmd_w)
+            stable_straight = bool(
+                visual_fit.found
+                and visual_fit.conf >= 0.65
+                and visual_fit.n_bands >= 3
+                and abs(visual_fit.theta) <= 0.16
+                and abs(visual_fit.e0) <= 0.28
+                and not visual_fit.disconnected
+                and features.branch_left is None
+                and features.branch_right is None
+            )
+            straight_streak = straight_streak + 1 if stable_straight else 0
+            if straight_streak >= cfg.obstacle.stable_frames:
+                obstacle_armed_until = now + cfg.obstacle.arm_hold_sec
+            obstacle_armed = now <= obstacle_armed_until
+            obstacle_decision = obstacle_monitor.update(raw_crop, raw_track_center, obstacle_armed)
+
+            fit = visual_fit
+            memory_status = PathMemoryStatus(False, "perspective_inactive")
+            if cfg.path_memory.enabled and perspective.active:
+                pixels_per_meter = cfg.perspective.px_per_cm * 100.0
+                accepted_path = features.path
+                if obstacle_decision.state not in (ObstacleState.CLEAR, ObstacleState.DISARMED):
+                    accepted_path = ()
+                metric_points = image_path_to_axle(
+                    accepted_path,
+                    image_width=crop.shape[1],
+                    image_height=crop.shape[0],
+                    center_x=track_center,
+                    pixels_per_meter=pixels_per_meter,
+                    camera_to_axle_m=cfg.path_memory.effective_camera_to_axle_m,
+                )
+                buffered_fit, memory_status = path_memory.step(
+                    metric_points,
+                    visual_fit,
+                    now=now,
+                    linear_velocity=motion.linear,
+                    angular_velocity=motion.angular,
+                    lateral_half_width_m=(crop_w / 2.0) / max(pixels_per_meter, 1e-6),
+                )
+                if buffered_fit is not None:
+                    fit = buffered_fit
+            command = sm.step(fit, now=now, obstacle=obstacle_decision.stop_required)
+            if obstacle_decision.slow_required and command.v > 0.0:
+                command = replace(
+                    command,
+                    v=min(command.v, cfg.tracker.v_max * cfg.obstacle.slow_speed_ratio),
+                    reason="obstacle_approach_slow",
+                )
             cmd_v, cmd_w = command.v, command.w
             bot.set_car_motion(cmd_v, cmd_w)
+            last_cmd_v, last_cmd_w = cmd_v, cmd_w
 
-            now = time.monotonic()
             summary = command_summary(command, fit)
             summary["t"] = round(now - start, 2)
-            debug.record(summary, frame, crop, mask, features, cfg, track_center)
+            summary["motion_v"] = round(motion.linear, 4)
+            summary["motion_w"] = round(motion.angular, 4)
+            summary["motion_source"] = motion.source
+            summary["path_memory_active"] = memory_status.active
+            summary["path_memory_reason"] = memory_status.reason
+            summary["path_memory_age"] = round(memory_status.snapshot_age_sec, 3)
+            summary["path_memory_snapshots"] = memory_status.snapshot_count
+            summary["path_memory_points"] = memory_status.point_count
+            summary["camera_to_axle_effective_m"] = round(cfg.path_memory.effective_camera_to_axle_m, 4)
+            summary["obstacle_state"] = obstacle_decision.state.value
+            summary["obstacle_conf"] = round(obstacle_decision.confidence, 3)
+            summary["obstacle_armed"] = obstacle_armed
+            candidate = obstacle_decision.evidence.candidate
+            summary["obstacle_cue"] = None if candidate is None else candidate.cue
+            summary["obstacle_bbox"] = None if candidate is None else candidate.bbox
+            debug.record(
+                summary, frame, crop, mask, features, cfg, track_center,
+                raw_crop=raw_crop,
+                obstacle_decision=obstacle_decision,
+                raw_track_center=raw_track_center,
+            )
             if now - last_log >= args.log_period:
                 print(json.dumps(summary, ensure_ascii=False))
                 last_log = now

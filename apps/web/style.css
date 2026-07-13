@@ -56,7 +56,13 @@ button.stop { border-color: var(--lost); color: var(--lost); }
   margin-top: 10px; font-size: 13px; font-family: ui-monospace, Menlo, monospace;
   color: var(--muted); min-height: 18px; white-space: pre-wrap;
 }
-.msg.err { color: var(--lost); }
+.msg.err { color: #f85149; }
+
+/* Calibration panel */
+.calibration .calib-controls { display: flex; gap: 8px; flex-wrap: wrap; }
+.calibration button { flex: 1; min-width: 120px; }
+.calibWrap { border: 1px solid #30363d; border-radius: 4px; overflow: hidden; background: #0d1117; }
+
 .hint { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 10px 0 0; }
 .videoWrap { position: relative; display: inline-block; max-width: 100%; }
 #video { display: block; max-width: 100%; border-radius: 8px; background: #000; min-height: 240px; }

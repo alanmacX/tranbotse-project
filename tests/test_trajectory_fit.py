@@ -15,6 +15,12 @@ def _fit(mask, cfg):
     return fit_line_trajectory(features, cfg.vision, crop_center=CENTER, crop_width=W)
 
 
+def poly_config():
+    cfg = RaceConfig()
+    cfg.vision.fit_mode = "poly"
+    return cfg
+
+
 def straight(x=CENTER, line_w=18):
     mask = np.zeros((H, W), dtype=np.uint8)
     cv.rectangle(mask, (x - line_w // 2, 0), (x + line_w // 2, H - 1), 255, -1)
@@ -69,6 +75,20 @@ def blind_zone_split(line_w=18):
     return mask
 
 
+def blind_zone_with_border_seam(line_w=18):
+    mask = np.zeros((H, W), dtype=np.uint8)
+    cv.rectangle(mask, (CENTER - line_w // 2, 150), (CENTER + line_w // 2, H - 1), 255, -1)
+    cv.line(mask, (W - 2, 0), (W - 10, 105), 255, 8)
+    return mask
+
+
+def straight_with_chassis_bar(line_w=18):
+    mask = np.zeros((H, W), dtype=np.uint8)
+    cv.rectangle(mask, (CENTER - line_w // 2, 0), (CENTER + line_w // 2, H - 34), 255, -1)
+    cv.rectangle(mask, (0, H - 18), (150, H - 1), 255, -1)
+    return mask
+
+
 class TrajectoryFitTests(unittest.TestCase):
     def test_straight_is_centered_low_curvature(self):
         fit = _fit(straight(), RaceConfig())
@@ -89,7 +109,7 @@ class TrajectoryFitTests(unittest.TestCase):
         self.assertGreater(abs(fit.theta), 0.1)
 
     def test_arc_reports_curvature(self):
-        fit = _fit(arc(), RaceConfig())
+        fit = _fit(arc(), poly_config())
         self.assertTrue(fit.found)
         self.assertGreater(abs(fit.kappa), 0.05)
 
@@ -102,7 +122,7 @@ class TrajectoryFitTests(unittest.TestCase):
     def test_right_angle_produces_strong_signal(self):
         # A right-angle corner should surface as large heading/curvature so the
         # continuous controller slows and pivots - no dedicated corner state.
-        fit = _fit(right_angle(), RaceConfig())
+        fit = _fit(right_angle(), poly_config())
         self.assertTrue(fit.found)
         self.assertGreater(abs(fit.theta) + abs(fit.kappa), 0.2)
 
@@ -114,12 +134,33 @@ class TrajectoryFitTests(unittest.TestCase):
         self.assertLess(abs(fit.kappa), 0.25)
 
     def test_blind_zone_split_lowers_confidence(self):
-        fit = _fit(blind_zone_split(), RaceConfig())
+        fit = _fit(blind_zone_split(), poly_config())
         self.assertTrue(fit.found)
         self.assertTrue(fit.disconnected)
         self.assertLess(fit.conf, 0.4)
         self.assertLess(abs(fit.theta), 0.25)
         self.assertLess(abs(fit.kappa), 0.25)
+
+    def test_blind_zone_split_latches_preview_direction(self):
+        fit = _fit(blind_zone_split(), poly_config())
+        self.assertEqual(fit.preview_dir, 1)
+        self.assertGreater(fit.preview_conf, 0.3)
+        self.assertGreater(fit.preview_e, 0.2)
+
+    def test_border_seam_does_not_become_preview(self):
+        fit = _fit(blind_zone_with_border_seam(), RaceConfig())
+        self.assertTrue(fit.found)
+        self.assertEqual(fit.preview_dir, 0)
+        self.assertEqual(fit.preview_conf, 0.0)
+
+    def test_bottom_chassis_bar_is_not_path_anchor(self):
+        cfg = RaceConfig()
+        features = scan_line_features(straight_with_chassis_bar(), cfg.vision, crop_center=CENTER)
+        fit = fit_line_trajectory(features, cfg.vision, crop_center=CENTER, crop_width=W)
+        self.assertTrue(fit.found)
+        self.assertGreaterEqual(fit.n_bands, 3)
+        self.assertLess(abs(fit.e0), 0.15)
+        self.assertTrue(features.bottom is None or features.bottom.width < W * 0.34)
 
 
 if __name__ == "__main__":
