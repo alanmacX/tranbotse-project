@@ -46,7 +46,7 @@
   "path_memory": {
     "enabled": true,
     "mode": "corner_event",
-    "camera_to_axle_m": 0.18,
+    "camera_to_axle_m": 0.215,
     "corner_confirm_frames": 3,
     "corner_theta_threshold": 0.18,
     "corner_e_threshold": 0.48,
