@@ -16,13 +16,11 @@ class DebugConfigTests(unittest.TestCase):
         _deep_update_cfg(cfg, {
             "path_memory": {
                 "camera_to_axle_m": 0.12,
-                "mode": "local_pursuit",
-                "path_max_points": 64,
+                "mode": "corner_event",
             }
         })
         self.assertAlmostEqual(cfg.path_memory.camera_to_axle_m, 0.12)
-        self.assertEqual(cfg.path_memory.mode, "local_pursuit")
-        self.assertEqual(cfg.path_memory.path_max_points, 64)
+        self.assertEqual(cfg.path_memory.mode, "corner_event")
 
     def test_ground_homography_loads_as_tuple(self):
         cfg = RaceConfig()

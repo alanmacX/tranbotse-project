@@ -59,8 +59,6 @@
         <select id="strategyMode">
           <option value="none">No margin</option>
           <option value="corner_event">Corner event</option>
-          <option value="ipm_axle">IPM axle path</option>
-          <option value="local_pursuit">Local path pursuit</option>
         </select>
         <button id="strategySaveBtn">Apply</button>
       </div>
@@ -76,16 +74,6 @@
         <div class="ctlRow"><label>Reacquire rad</label><input id="cornerReacquireAngle" type="number" min="0.1" max="2" step="0.05" /></div>
         <div class="ctlRow"><label>Turn w</label><input id="cornerTurnW" type="number" min="0.05" max="0.5" step="0.01" /></div>
         <div class="ctlRow"><label>Turn speed ratio</label><input id="cornerTurnSpeed" type="number" min="0" max="1" step="0.05" /></div>
-      </div>
-      <div class="strategyFields" data-modes="ipm_axle,local_pursuit">
-        <div class="ctlRow"><label>Lookahead m</label><input id="strategyLookahead" type="number" min="0.02" max="0.3" step="0.005" /></div>
-        <div class="calib-controls">
-          <input id="paperNearM" type="number" min="0" max="0.5" step="0.005" aria-label="Paper near edge metres" />
-          <button id="calibCaptureBtn">Capture rectangle</button>
-          <button id="calibResetBtn">Reset points</button>
-          <button id="calibSaveBtn">Save calibration</button>
-        </div>
-        <div class="calibWrap"><img id="calibImage" alt="Ground calibration" /><canvas id="calibCanvas"></canvas></div>
       </div>
       <div id="strategyStatus" class="msg"></div>
     </section>

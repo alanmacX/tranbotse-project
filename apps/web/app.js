@@ -143,7 +143,6 @@ connect();
 
 // -- Margin strategy -----------------------------------------------------
 const strategyMode = el("strategyMode");
-let calibrationPoints = [];
 
 function showStrategyFields() {
   document.querySelectorAll(".strategyFields").forEach((node) => {
@@ -162,8 +161,6 @@ async function loadStrategy() {
   el("cornerReacquireAngle").value = cfg.path_memory.corner_reacquire_angle_rad;
   el("cornerTurnW").value = cfg.path_memory.corner_replay_max_w;
   el("cornerTurnSpeed").value = cfg.path_memory.corner_turn_speed_ratio;
-  el("strategyLookahead").value = cfg.path_memory.lookahead_m;
-  el("paperNearM").value = cfg.ground_projection.paper_near_m;
   showStrategyFields();
 }
 
@@ -180,57 +177,12 @@ el("strategySaveBtn").addEventListener("click", () => guard("STRATEGY", async ()
       corner_reacquire_angle_rad: Number(el("cornerReacquireAngle").value),
       corner_replay_max_w: Number(el("cornerTurnW").value),
       corner_turn_speed_ratio: Number(el("cornerTurnSpeed").value),
-      lookahead_m: Number(el("strategyLookahead").value),
     },
     obstacle: { enabled: el("obstacleEnabled").checked },
   });
   return { message: "selected " + strategyMode.value };
 }));
 
-const calibImage = el("calibImage"), calibCanvas = el("calibCanvas");
-const calibCtx = calibCanvas.getContext("2d");
-function drawCalibration() {
-  calibCtx.clearRect(0, 0, calibCanvas.width, calibCanvas.height);
-  calibCtx.fillStyle = "#f85149";
-  calibCtx.strokeStyle = "#f0b429";
-  calibCtx.lineWidth = 2;
-  calibrationPoints.forEach((point, index) => {
-    calibCtx.beginPath(); calibCtx.arc(point.cx, point.cy, 5, 0, Math.PI * 2); calibCtx.fill();
-    calibCtx.fillText(String(index + 1), point.cx + 7, point.cy - 7);
-    if (index) {
-      const previous = calibrationPoints[index - 1];
-      calibCtx.beginPath(); calibCtx.moveTo(previous.cx, previous.cy); calibCtx.lineTo(point.cx, point.cy); calibCtx.stroke();
-    }
-  });
-}
-function sizeCalibration() {
-  calibCanvas.width = calibImage.clientWidth;
-  calibCanvas.height = calibImage.clientHeight;
-  drawCalibration();
-}
-calibCanvas.addEventListener("click", (event) => {
-  if (!calibImage.naturalWidth || calibrationPoints.length >= 4) return;
-  const rect = calibCanvas.getBoundingClientRect();
-  const cx = event.clientX - rect.left, cy = event.clientY - rect.top;
-  calibrationPoints.push({cx, cy, x: cx * calibImage.naturalWidth / rect.width, y: cy * calibImage.naturalHeight / rect.height});
-  drawCalibration();
-});
-el("calibCaptureBtn").addEventListener("click", () => guard("CAPTURE", async () => {
-  const data = await post("/api/calibration/capture", {ssh_target: sshTarget()});
-  calibrationPoints = [];
-  calibImage.src = "data:image/jpeg;base64," + data.image;
-  calibImage.onload = sizeCalibration;
-  return {message: "click BL, TL, TR, BR"};
-}));
-el("calibResetBtn").addEventListener("click", () => { calibrationPoints = []; drawCalibration(); });
-el("calibSaveBtn").addEventListener("click", () => guard("CALIBRATION", async () => {
-  if (calibrationPoints.length !== 4) throw new Error("click exactly four rectangle corners");
-  return post("/api/calibration/compute", {
-    points: calibrationPoints.map((point) => [point.x, point.y]),
-    paper_near_m: Number(el("paperNearM").value),
-  });
-}));
-window.addEventListener("resize", sizeCalibration);
 loadStrategy();
 
 // -- Run controls ---------------------------------------------------------

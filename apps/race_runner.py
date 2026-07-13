@@ -10,7 +10,6 @@ from dataclasses import asdict, fields, is_dataclass, replace
 from pathlib import Path
 
 import cv2 as cv
-import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -19,16 +18,11 @@ from transbot_race.config import RaceConfig  # noqa: E402
 from transbot_race.geometry import apply_occlusion, band_is_occluded  # noqa: E402
 from transbot_race.path_memory import (  # noqa: E402
     CornerCommandDelay,
-    GroundProjector,
     PathStrategyStatus,
-    RollingPathPursuit,
-    bird_path_to_ground,
-    path_pixels,
     read_motion_sample,
 )
 from transbot_race.obstacle import (  # noqa: E402
     ObstacleMonitor,
-    ObstacleState,
     draw_obstacle_overlay,
 )
 from transbot_race.state_machine import RaceStateMachine, command_summary  # noqa: E402
@@ -92,10 +86,10 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError(f"crop x1 must be > x0, got {cfg.camera.crop}")
     if cfg.path_memory.camera_to_axle_m < 0.0:
         raise ValueError("camera-to-axle distance cannot be negative")
-    if cfg.path_memory.mode not in ("none", "corner_event", "ipm_axle", "local_pursuit"):
+    if cfg.path_memory.mode not in ("none", "corner_event"):
         raise ValueError(f"unsupported path-memory mode: {cfg.path_memory.mode}")
-    if cfg.path_memory.corner_confirm_frames <= 0 or cfg.path_memory.path_max_points <= 0:
-        raise ValueError("path-memory frame and point limits must be positive")
+    if cfg.path_memory.corner_confirm_frames <= 0:
+        raise ValueError("corner confirmation frame count must be positive")
     if cfg.path_memory.corner_replay_max_w <= 0.0 or cfg.path_memory.corner_turn_angle_rad <= 0.0:
         raise ValueError("corner turn angle and angular speed must be positive")
     if not 0.0 <= cfg.path_memory.corner_turn_speed_ratio <= 1.0:
@@ -104,8 +98,8 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError("corner reacquire angle must be within [0, turn angle]")
     if cfg.path_memory.corner_image_angle_gain <= 0.0 or cfg.path_memory.corner_search_extra_rad < 0.0:
         raise ValueError("corner angle gain must be positive and extra search angle non-negative")
-    if cfg.path_memory.max_age_sec <= 0.0 or cfg.path_memory.max_motion_dt_sec <= 0.0:
-        raise ValueError("path-memory time limits must be positive")
+    if cfg.path_memory.max_motion_dt_sec <= 0.0:
+        raise ValueError("path-memory motion interval must be positive")
 
 
 class DryBot:
@@ -228,17 +222,6 @@ class DebugRecorder:
                 label += f" {strategy_status.remaining_m:.3f}m"
             cv.rectangle(overlay, (0, 0), (min(overlay.shape[1], 300), 24), (0, 0, 0), -1)
             cv.putText(overlay, label, (6, 17), cv.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1, cv.LINE_AA)
-            if strategy_status.target is not None and strategy_status.mode == "ipm_axle":
-                tx, ty = strategy_status.target
-                px = int(round(overlay.shape[1] / 2.0 - ty * cfg.ground_projection.pixels_per_meter))
-                py = int(round(overlay.shape[0] - 1.0 - (tx - cfg.path_memory.camera_to_axle_m) * cfg.ground_projection.pixels_per_meter))
-                cv.circle(overlay, (px, py), 6, (0, 0, 255), 2)
-            elif strategy_status.target is not None and strategy_status.mode == "local_pursuit" and cfg.ground_projection.homography:
-                tx, ty = strategy_status.target
-                ground = np.asarray([[[tx - cfg.path_memory.camera_to_axle_m, ty]]], dtype=np.float64)
-                inverse = np.linalg.inv(np.asarray(cfg.ground_projection.homography, dtype=np.float64).reshape(3, 3))
-                px, py = cv.perspectiveTransform(ground, inverse).reshape(2)
-                cv.circle(overlay, (int(round(px)), int(round(py))), 6, (0, 0, 255), 2)
 
         cv.imwrite(str(self.frames_dir / f"{stem}.jpg"), frame, params)
         cv.imwrite(str(self.crops_dir / f"{stem}.jpg"), crop, params)
@@ -281,10 +264,7 @@ def run(args: argparse.Namespace) -> int:
     cfg = load_config(Path(args.config))
     bot = make_bot(args.dry_run)
     sm = RaceStateMachine(cfg)
-    projector = GroundProjector(cfg.ground_projection)
     corner_margin = CornerCommandDelay(cfg.path_memory)
-    ipm_pursuit = RollingPathPursuit(cfg.path_memory, "ipm_axle")
-    local_pursuit = RollingPathPursuit(cfg.path_memory, "local_pursuit")
     obstacle_monitor = ObstacleMonitor(cfg.obstacle)
     cap = cv.VideoCapture(args.camera)
     cap.set(cv.CAP_PROP_FRAME_WIDTH, cfg.camera.frame_width)
@@ -315,9 +295,6 @@ def run(args: argparse.Namespace) -> int:
             raw_crop = crop.copy()
             raw_track_center = track_center
             strategy_mode = cfg.path_memory.mode if cfg.path_memory.enabled else "disabled"
-            if strategy_mode == "ipm_axle" and projector.active:
-                crop = projector.warp(raw_crop)
-                track_center = crop.shape[1] / 2.0
             crop_w = crop.shape[1]
             mask = preprocess_blackline(crop, cfg.vision)
             mask = apply_occlusion(mask, cfg.occlusion)
@@ -353,31 +330,10 @@ def run(args: argparse.Namespace) -> int:
             fit = visual_fit
             memory_status = PathStrategyStatus(False, strategy_mode, "disabled")
             if cfg.path_memory.enabled:
-                accepted_fit = visual_fit
-                if obstacle_decision.state not in (ObstacleState.CLEAR, ObstacleState.DISARMED):
-                    accepted_fit = replace(visual_fit, found=False, conf=0.0)
                 if strategy_mode == "none":
                     memory_status = PathStrategyStatus(False, "none", "passthrough")
                 elif strategy_mode == "corner_event":
                     memory_status = PathStrategyStatus(True, "corner_event", corner_margin.state)
-                elif strategy_mode == "ipm_axle":
-                    if projector.active:
-                        points = bird_path_to_ground(
-                            features, crop.shape[1], crop.shape[0],
-                            cfg.ground_projection.pixels_per_meter,
-                            cfg.path_memory.camera_to_axle_m,
-                        )
-                        fit, memory_status = ipm_pursuit.step(points, accepted_fit, now, motion.linear, motion.angular)
-                    else:
-                        memory_status = PathStrategyStatus(False, strategy_mode, "calibration_required")
-                elif strategy_mode == "local_pursuit":
-                    if projector.active:
-                        points = projector.project(path_pixels(features))
-                        if len(points):
-                            points[:, 0] += cfg.path_memory.camera_to_axle_m
-                        fit, memory_status = local_pursuit.step(points, accepted_fit, now, motion.linear, motion.angular)
-                    else:
-                        memory_status = PathStrategyStatus(False, strategy_mode, "calibration_required")
             command = sm.step(fit, now=now, obstacle=obstacle_decision.stop_required)
             if strategy_mode == "corner_event" and not obstacle_decision.stop_required:
                 delayed = corner_margin.step(

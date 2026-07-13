@@ -33,7 +33,7 @@ class PathMemoryConfig:
     """Selectable camera-to-axle experiment strategy."""
 
     enabled: bool = True
-    mode: str = "none"  # none, corner_event, ipm_axle, local_pursuit
+    mode: str = "none"  # none, corner_event
     camera_to_axle_m: float = 0.10
     corner_confirm_frames: int = 3
     corner_theta_threshold: float = 0.18
@@ -46,16 +46,12 @@ class PathMemoryConfig:
     corner_turn_speed_ratio: float = 0.45
     corner_image_angle_gain: float = 6.8
     corner_search_extra_rad: float = 0.40
-    lookahead_m: float = 0.07
-    lateral_half_width_m: float = 0.20
-    path_max_points: int = 160
-    max_age_sec: float = 2.0
     max_motion_dt_sec: float = 0.25
 
 
 @dataclass(slots=True)
 class GroundProjectionConfig:
-    """Pixel-to-ground calibration shared by IPM and point projection."""
+    """Pixel-to-ground calibration retained for capture geometry analysis."""
 
     homography: tuple[float, ...] | None = None  # crop pixel -> (forward, left) metres
     paper_width_m: float = 0.210

@@ -3,10 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
-import cv2 as cv
 import numpy as np
 
-from .config import GroundProjectionConfig, PathMemoryConfig
+from .config import PathMemoryConfig
 from .vision import LineFeatures, TrajectoryFit
 
 
@@ -49,42 +48,6 @@ def read_motion_sample(bot: object, fallback_v: float, fallback_w: float) -> Mot
         except Exception:
             pass
     return MotionSample(float(fallback_v), float(fallback_w), "command_fallback")
-
-
-class GroundProjector:
-    def __init__(self, cfg: GroundProjectionConfig) -> None:
-        self.cfg = cfg
-
-    @property
-    def active(self) -> bool:
-        return self.cfg.homography is not None and len(self.cfg.homography) == 9
-
-    @property
-    def matrix(self) -> np.ndarray | None:
-        if not self.active:
-            return None
-        return np.asarray(self.cfg.homography, dtype=np.float64).reshape(3, 3)
-
-    def project(self, points_px: np.ndarray) -> np.ndarray:
-        if self.matrix is None or len(points_px) == 0:
-            return np.empty((0, 2), dtype=np.float64)
-        src = np.asarray(points_px, dtype=np.float64).reshape(-1, 1, 2)
-        return cv.perspectiveTransform(src, self.matrix).reshape(-1, 2)
-
-    def bird_matrix(self) -> np.ndarray | None:
-        h = self.matrix
-        if h is None:
-            return None
-        ppm = self.cfg.pixels_per_meter
-        cx = self.cfg.bird_width_px / 2.0
-        ground_to_bird = np.asarray([[0.0, -ppm, cx], [-ppm, 0.0, self.cfg.bird_height_px - 1.0], [0.0, 0.0, 1.0]])
-        return ground_to_bird @ h
-
-    def warp(self, crop: np.ndarray) -> np.ndarray:
-        matrix = self.bird_matrix()
-        if matrix is None:
-            return crop.copy()
-        return cv.warpPerspective(crop, matrix, (self.cfg.bird_width_px, self.cfg.bird_height_px))
 
 
 def _corner_observation(
@@ -231,65 +194,3 @@ class CornerCommandDelay:
         dt = max(0.0, min(self.cfg.max_motion_dt_sec, now - self.last_now))
         self.last_now = now
         return max(0.0, linear) * dt, abs(angular) * dt
-
-
-class RollingPathPursuit:
-    def __init__(self, cfg: PathMemoryConfig, mode: str) -> None:
-        self.cfg = cfg
-        self.mode = mode
-        self.points = np.empty((0, 2), dtype=np.float64)
-        self.last_now: float | None = None
-
-    def step(self, observed: np.ndarray, source_fit: TrajectoryFit, now: float, linear: float, angular: float) -> tuple[TrajectoryFit, PathStrategyStatus]:
-        self._advance(now, linear, angular)
-        if len(observed):
-            observed = observed[np.isfinite(observed).all(axis=1)]
-            if len(observed):
-                near_x = float(np.min(observed[:, 0]))
-                blind = self.points[(self.points[:, 0] >= -0.03) & (self.points[:, 0] < near_x)] if len(self.points) else self.points
-                self.points = np.vstack((blind, observed))[-self.cfg.path_max_points:]
-        self.points = self.points[(self.points[:, 0] >= -0.03) & (self.points[:, 0] <= 0.8)] if len(self.points) else self.points
-        candidates = self.points[self.points[:, 0] > 0.0]
-        if len(candidates) == 0:
-            return source_fit, PathStrategyStatus(False, self.mode, "no_ground_path")
-        distances = np.linalg.norm(candidates, axis=1)
-        target = candidates[int(np.argmin(np.abs(distances - self.cfg.lookahead_m)))]
-        tx, ty = float(target[0]), float(target[1])
-        e_look = max(-1.0, min(1.0, -ty / max(self.cfg.lateral_half_width_m, 1e-3)))
-        theta = math.atan2(-ty, max(tx, 1e-4))
-        curvature = -2.0 * ty / max(tx * tx + ty * ty, 1e-4)
-        fit = TrajectoryFit(
-            found=True, e0=source_fit.e0, e_look=e_look, theta=theta,
-            kappa=max(-1.0, min(1.0, curvature * self.cfg.lookahead_m)),
-            conf=max(source_fit.conf, 0.5), n_bands=source_fit.n_bands,
-            path_memory=True,
-        )
-        return fit, PathStrategyStatus(True, self.mode, "tracking", point_count=len(self.points), target=(tx, ty))
-
-    def _advance(self, now: float, linear: float, angular: float) -> None:
-        if self.last_now is None:
-            self.last_now = now
-            return
-        dt = now - self.last_now
-        self.last_now = now
-        if dt <= 0.0 or dt > self.cfg.max_motion_dt_sec:
-            if dt > self.cfg.max_motion_dt_sec:
-                self.points = np.empty((0, 2), dtype=np.float64)
-            return
-        if not len(self.points):
-            return
-        shifted = self.points - np.asarray([max(0.0, linear) * dt, 0.0])
-        yaw = angular * dt
-        c, s = math.cos(yaw), math.sin(yaw)
-        self.points = shifted @ np.asarray([[c, -s], [s, c]], dtype=np.float64)
-
-
-def path_pixels(features: LineFeatures) -> np.ndarray:
-    return np.asarray([(point.x, point.y) for point in features.path], dtype=np.float64)
-
-
-def bird_path_to_ground(features: LineFeatures, width: int, height: int, ppm: float, axle_offset: float) -> np.ndarray:
-    return np.asarray([
-        ((height - 1.0 - point.y) / ppm + axle_offset, -(point.x - width / 2.0) / ppm)
-        for point in features.path
-    ], dtype=np.float64).reshape(-1, 2)
