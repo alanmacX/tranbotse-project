@@ -77,6 +77,25 @@ class UnifiedTrackerTests(unittest.TestCase):
         # Line to the right of center -> steer right (w < 0 with invert_turn off).
         self.assertLess(cmd.w, 0.0)
 
+    def test_corner_reacquire_reseeds_filter_from_current_line(self):
+        cfg = RaceConfig()
+        sm = RaceStateMachine(cfg)
+        sm.f_e0 = 1.0
+        sm.f_theta = 1.0
+        sm.d_e0 = 0.5
+        sm.state = RaceState.LOST
+        fit = TrajectoryFit(
+            found=True, e0=0.10, e_look=0.10, theta=0.20,
+            conf=0.9, n_bands=4,
+        )
+        command = sm.reacquire_from(fit, now=1.0)
+        self.assertEqual(sm.state, RaceState.TRACK)
+        self.assertAlmostEqual(sm.f_e0, fit.e0)
+        self.assertAlmostEqual(sm.f_theta, fit.theta)
+        self.assertAlmostEqual(sm.d_e0, 0.0)
+        expected_w = -(cfg.tracker.k_e * fit.e0 + cfg.tracker.k_theta * fit.theta)
+        self.assertAlmostEqual(command.w, expected_w)
+
     def test_right_angle_enters_pivot_not_a_state(self):
         cfg = poly_config()
         cfg.tracker.e_pivot = 0.55

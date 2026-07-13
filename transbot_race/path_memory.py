@@ -125,7 +125,8 @@ class CornerCommandDelay:
         angular_scale: float = 1.0,
     ) -> CornerCommandResult:
         travelled, turned = self._motion_delta(now, linear, angular, angular_scale)
-        visual_align = False
+        center_confirm = False
+        visual_takeover = False
         direction, observed_angle = (0, 0.0)
         if not self.cfg.capture_geometry_enabled:
             direction, observed_angle = _corner_observation(features, fit, self.cfg)
@@ -198,12 +199,18 @@ class CornerCommandDelay:
         elif self.state == "turning":
             self.turned_rad += turned
             ready = self.turned_rad >= self.cfg.corner_reacquire_angle_rad
-            visible = self._reacquire_valid(fit)
-            visual_align = ready and visible
-            self.reacquire_frames = self.reacquire_frames + 1 if ready and visible else 0
+            centered = ready and self._centered_track(fit)
+            self.reacquire_frames = self.reacquire_frames + 1 if centered else 0
             if self.reacquire_frames >= self.cfg.corner_reacquire_confirm_frames:
-                self.state = "handoff"
-                self.handoff_index = 0
+                if self.cfg.capture_geometry_enabled:
+                    self.state = "cooldown"
+                    self.clear_frames = 0
+                    visual_takeover = True
+                else:
+                    self.state = "handoff"
+                    self.handoff_index = 0
+            elif centered:
+                center_confirm = True
             elif self.turned_rad >= self.target_angle_rad:
                 if self.cfg.capture_geometry_enabled:
                     self.state = "failed"
@@ -253,21 +260,23 @@ class CornerCommandDelay:
                 (0.0, self.target_angle_rad),
             )
             return CornerCommandResult(self.hold_v, self.hold_w, status)
+        if visual_takeover:
+            status = PathStrategyStatus(
+                True, "corner_event", "corner_visual_takeover", 0.0,
+                self.candidate_dir, self.reacquire_frames,
+                (self.turned_rad, self.target_angle_rad),
+            )
+            return CornerCommandResult(command_v, command_w, status)
         if self.state == "turning":
             turn_v = self.hold_v * max(0.0, min(1.0, self.cfg.corner_turn_speed_ratio))
             turn_w = -self.candidate_dir * abs(self.cfg.corner_replay_max_w)
-            if visual_align:
-                alpha = self.cfg.corner_visual_align_blend
+            if center_confirm:
                 status = PathStrategyStatus(
-                    True, "corner_event", "corner_visual_align", 0.0,
+                    True, "corner_event", "corner_center_confirm", 0.0,
                     self.candidate_dir, self.reacquire_frames,
                     (self.turned_rad, self.target_angle_rad),
                 )
-                return CornerCommandResult(
-                    (1.0 - alpha) * turn_v + alpha * command_v,
-                    (1.0 - alpha) * turn_w + alpha * command_w,
-                    status,
-                )
+                return CornerCommandResult(0.0, 0.0, status)
             status = PathStrategyStatus(
                 True, "corner_event", "committed_turn", 0.0,
                 self.candidate_dir, 0,
@@ -349,6 +358,15 @@ class CornerCommandDelay:
             and not fit.disconnected
             and abs(fit.e0) <= self.cfg.corner_reacquire_max_e
             and abs(fit.theta) <= self.cfg.corner_reacquire_max_theta
+        )
+
+    def _centered_track(self, fit: TrajectoryFit) -> bool:
+        return bool(
+            fit.found
+            and fit.conf >= 0.65
+            and fit.n_bands >= 3
+            and not fit.disconnected
+            and abs(fit.e0) <= self.cfg.corner_reacquire_max_e
         )
 
     def _stable_straight(self, fit: TrajectoryFit, features: LineFeatures) -> bool:

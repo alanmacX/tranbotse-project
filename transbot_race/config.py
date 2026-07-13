@@ -51,7 +51,7 @@ class PathMemoryConfig:
     corner_capture_angle_scale: float = 0.70
     corner_command_yaw_scale: float = 0.50
     corner_reacquire_angle_rad: float = 0.35
-    corner_reacquire_max_e: float = 0.65
+    corner_reacquire_max_e: float = 0.25
     corner_reacquire_max_theta: float = 0.45
     corner_visual_align_blend: float = 0.70
     corner_turn_speed_ratio: float = 0.45

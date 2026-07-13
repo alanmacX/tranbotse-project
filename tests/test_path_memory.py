@@ -86,7 +86,8 @@ class PathStrategyTests(unittest.TestCase):
 
         unaligned = turn_fit(theta=0.4)
         turning = gate.step(unaligned, features, 0.0, 0.0, 0.8, 0.0, -1.0)
-        self.assertEqual(turning.status.reason, "corner_visual_align")
+        self.assertEqual(turning.status.reason, "corner_center_confirm")
+        self.assertAlmostEqual(turning.w, 0.0)
         self.assertAlmostEqual(turning.status.target[0], 0.5)
 
         aligned = TrajectoryFit(found=True, e0=0.1, theta=0.05, conf=0.9, n_bands=5)
@@ -258,7 +259,7 @@ class PathStrategyTests(unittest.TestCase):
         self.assertEqual(stopped.status.reason, "corner_reacquire_failed")
         self.assertAlmostEqual(stopped.w, 0.0)
 
-    def test_visual_alignment_reduces_fixed_turn_before_handoff(self):
+    def test_centered_line_stops_turn_then_takes_over_without_blend(self):
         cfg = PathMemoryConfig(
             corner_reacquire_angle_rad=0.20,
             corner_reacquire_confirm_frames=2,
@@ -277,8 +278,15 @@ class PathStrategyTests(unittest.TestCase):
             trackable, LineFeatures(found=True), 0.04, 0.03,
             0.0, 0.0, 0.0,
         )
-        self.assertEqual(output.status.reason, "corner_visual_align")
-        self.assertGreater(output.w, -cfg.corner_replay_max_w)
+        self.assertEqual(output.status.reason, "corner_center_confirm")
+        self.assertAlmostEqual(output.w, 0.0)
+        takeover = gate.step(
+            trackable, LineFeatures(found=True), 0.04, 0.03,
+            0.1, 0.0, 0.0,
+        )
+        self.assertEqual(takeover.status.reason, "corner_visual_takeover")
+        self.assertAlmostEqual(takeover.w, 0.03)
+        self.assertEqual(gate.state, "cooldown")
 
 
 if __name__ == "__main__": unittest.main()

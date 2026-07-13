@@ -63,7 +63,7 @@
     "corner_capture_angle_scale": 0.7,
     "corner_command_yaw_scale": 0.5,
     "corner_reacquire_angle_rad": 0.35,
-    "corner_reacquire_max_e": 0.65,
+    "corner_reacquire_max_e": 0.25,
     "corner_reacquire_max_theta": 0.45,
     "corner_visual_align_blend": 0.7,
     "corner_turn_speed_ratio": 0.45,

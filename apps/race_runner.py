@@ -399,7 +399,9 @@ def run(args: argparse.Namespace) -> int:
                     ),
                 )
                 memory_status = delayed.status
-                if delayed.v != command.v or delayed.w != command.w:
+                if memory_status.reason == "corner_visual_takeover":
+                    command = sm.reacquire_from(visual_fit, now)
+                elif delayed.v != command.v or delayed.w != command.w:
                     command = replace(
                         command,
                         v=delayed.v,

@@ -88,6 +88,23 @@ class RaceStateMachine:
     def reset(self) -> None:
         self.__init__(self.cfg)
 
+    def reacquire_from(self, fit: TrajectoryFit, now: float) -> MotionCommand:
+        """Restart normal tracking from the current line without stale turn history."""
+        self.state = RaceState.TRACK
+        self.state_started_at = now
+        self.f_e0 = fit.e0
+        self.f_e_look = fit.e_look
+        self.f_theta = fit.theta
+        self.f_kappa = fit.kappa
+        self.f_conf = fit.conf
+        self.d_e0 = 0.0
+        self.in_pivot = False
+        self.use_path_lookahead = fit.path_memory
+        self.ever_acquired = True
+        self._clear_plan()
+        self.last_event = "corner_visual_takeover"
+        return self._track_step(now)
+
     # -- public API -------------------------------------------------------
     def step(self, fit: TrajectoryFit, now: float, obstacle: bool = False) -> MotionCommand:
         if obstacle:
