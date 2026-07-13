@@ -18,6 +18,11 @@ then replayed with a safety limit before returning to live control. It never
 queues an old `TrajectoryFit`. Simultaneous left and right branches are treated
 as an undecided junction and do not latch a direction.
 
+Before the first valid line acquisition the chassis remains stationary. LOST
+search rotation is enabled only after the tracker has acquired a line once, so
+camera warm-up or a temporarily blank mask cannot rotate the chassis before
+margin detection runs.
+
 ## IPM axle path
 
 `ipm_axle` uses the rectangle calibration to warp the crop into a metric bird

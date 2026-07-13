@@ -160,9 +160,16 @@ def _filter_preprocess_components(mask: np.ndarray, hard_guard: np.ndarray, near
         component = labels == component_id
         hard_overlap = float(np.count_nonzero(component & hard_bool)) / float(max(1, area))
         near_overlap = float(np.count_nonzero(component & near_bool)) / float(max(1, area))
+        effective_thickness = area / float(max(w, h, 1))
+        track_structure = (
+            area >= 900
+            and h >= height * 0.45
+            and effective_thickness >= 10.0
+            and (w >= width * 0.18 or fill >= 0.50)
+        )
         if hard_overlap > 0.18 and fill < 0.65:
             continue
-        if near_overlap > 0.16 and fill < 0.50:
+        if near_overlap > 0.16 and fill < 0.50 and not track_structure:
             continue
 
         clean[component] = 255

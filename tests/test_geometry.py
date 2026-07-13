@@ -5,6 +5,7 @@ import numpy as np
 
 from transbot_race.config import OcclusionConfig, RaceConfig
 from transbot_race.geometry import apply_occlusion, band_is_occluded
+from transbot_race.vision import _filter_preprocess_components
 from transbot_race.vision import fit_line_trajectory, scan_line_features
 
 
@@ -18,6 +19,16 @@ def straight(x=CENTER, line_w=18):
 
 
 class OcclusionTests(unittest.TestCase):
+    def test_large_corner_survives_near_reflection_guard(self):
+        mask = np.zeros((H, W), dtype=np.uint8)
+        cv.rectangle(mask, (50, 55), (68, H - 1), 255, -1)
+        cv.rectangle(mask, (50, 55), (145, 73), 255, -1)
+        hard = np.zeros_like(mask)
+        near = np.zeros_like(mask)
+        cv.rectangle(near, (45, 45), (95, 95), 255, -1)
+        clean = _filter_preprocess_components(mask, hard, near)
+        self.assertGreater(cv.countNonZero(clean), 2000)
+
     def test_disabled_is_passthrough(self):
         mask = straight()
         out = apply_occlusion(mask, OcclusionConfig(enabled=False, rects=((0, 0, W, H),)))

@@ -5,7 +5,7 @@ import numpy as np
 
 from transbot_race.config import RaceConfig
 from transbot_race.state_machine import RaceState, RaceStateMachine, TrackMode
-from transbot_race.vision import fit_line_trajectory, scan_line_features
+from transbot_race.vision import TrajectoryFit, fit_line_trajectory, scan_line_features
 
 W, H, CENTER = 180, 200, 90
 
@@ -54,6 +54,13 @@ def replay(sm, mask, cfg, start=0.0, n=6, dt=0.1):
 
 
 class UnifiedTrackerTests(unittest.TestCase):
+    def test_blank_start_waits_without_search_rotation(self):
+        sm = RaceStateMachine(RaceConfig())
+        cmd = sm.step(TrajectoryFit(found=False), now=0.0)
+        self.assertEqual(cmd.reason, "await_first_line")
+        self.assertEqual(cmd.v, 0.0)
+        self.assertEqual(cmd.w, 0.0)
+
     def test_straight_tracks_forward(self):
         cfg = RaceConfig()
         sm = RaceStateMachine(cfg)

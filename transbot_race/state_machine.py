@@ -76,6 +76,7 @@ class RaceStateMachine:
         self.d_e0 = 0.0
         self.in_pivot = False
         self.use_path_lookahead = False
+        self.ever_acquired = False
         self.plan_dir = 0
         self.plan_score = 0.0
         self.plan_expires_at = 0.0
@@ -98,6 +99,14 @@ class RaceStateMachine:
 
         self._update_plan_latch(fit, now)
         self._update_filter(fit)
+        if fit.found and fit.conf > 0.0:
+            self.ever_acquired = True
+
+        # Camera exposure and the first preprocessing frames may be blank. Do
+        # not rotate before the tracker has established which side the line is
+        # on; LOST search is only meaningful after a real acquisition.
+        if not self.ever_acquired:
+            return MotionCommand(0.0, 0.0, "await_first_line", self.state, None)
 
         if self.state == RaceState.LOST:
             return self._lost_step(now)
