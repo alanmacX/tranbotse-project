@@ -1,5 +1,6 @@
 import unittest
 from dataclasses import replace
+import math
 
 import numpy as np
 
@@ -23,30 +24,34 @@ class FakeBot:
 
 class PathStrategyTests(unittest.TestCase):
     def test_corner_event_holds_then_commits_to_detected_turn(self):
-        cfg = PathMemoryConfig(camera_to_axle_m=0.02, corner_confirm_frames=2)
+        cfg = PathMemoryConfig(camera_to_axle_m=0.02, corner_confirm_frames=3)
         gate = CornerCommandDelay(cfg)
         features = LineFeatures(found=True)
         gate.step(turn_fit(), features, 0.05, -0.08, 0.0, 0.0)
-        held = gate.step(turn_fit(), features, 0.05, -0.10, 0.1, 0.1)
+        gate.step(turn_fit(), features, 0.05, -0.09, 0.1, 0.1)
+        held = gate.step(turn_fit(), features, 0.05, -0.10, 0.2, 0.1)
         self.assertEqual(held.status.reason, "waiting_margin")
         self.assertLessEqual(abs(held.w), cfg.corner_hold_max_w)
-        gate.step(turn_fit(), features, 0.05, -0.12, 0.2, 0.1)
-        turning = gate.step(turn_fit(), features, 0.05, -0.15, 0.3, 0.1)
+        self.assertAlmostEqual(gate.target_angle_rad, math.pi / 2.0, places=2)
+        gate.step(turn_fit(), features, 0.05, -0.12, 0.3, 0.1)
+        turning = gate.step(turn_fit(), features, 0.05, -0.15, 0.4, 0.1)
         self.assertEqual(turning.status.reason, "committed_turn")
         self.assertAlmostEqual(turning.w, -cfg.corner_replay_max_w)
         self.assertAlmostEqual(turning.v, 0.05 * cfg.corner_turn_speed_ratio)
 
     def test_corner_event_keeps_trigger_speed_when_live_tracker_loses_line(self):
-        cfg = PathMemoryConfig(camera_to_axle_m=0.10, corner_confirm_frames=1)
+        cfg = PathMemoryConfig(camera_to_axle_m=0.10, corner_confirm_frames=3)
         gate = CornerCommandDelay(cfg)
         features = LineFeatures(found=True)
 
-        triggered = gate.step(turn_fit(), features, 0.06, -0.12, 0.0, 0.0)
+        gate.step(turn_fit(), features, 0.06, -0.10, 0.0, 0.0)
+        gate.step(turn_fit(), features, 0.06, -0.11, 0.1, 0.0)
+        triggered = gate.step(turn_fit(), features, 0.06, -0.12, 0.2, 0.0)
         self.assertEqual(triggered.status.reason, "waiting_margin")
         self.assertAlmostEqual(triggered.v, 0.06)
 
         lost_fit = replace(turn_fit(), found=False, conf=0.0)
-        waiting = gate.step(lost_fit, LineFeatures(found=False), 0.0, 0.0, 0.1, 0.04)
+        waiting = gate.step(lost_fit, LineFeatures(found=False), 0.0, 0.0, 0.3, 0.04)
         self.assertEqual(waiting.status.reason, "waiting_margin")
         self.assertAlmostEqual(waiting.v, 0.06)
         self.assertAlmostEqual(waiting.w, 0.0)
@@ -54,25 +59,34 @@ class PathStrategyTests(unittest.TestCase):
     def test_corner_event_uses_measured_yaw_then_reacquires_line(self):
         cfg = PathMemoryConfig(
             camera_to_axle_m=0.01,
-            corner_confirm_frames=1,
+            corner_confirm_frames=3,
             corner_turn_angle_rad=1.2,
             corner_reacquire_angle_rad=0.5,
         )
         gate = CornerCommandDelay(cfg)
         features = LineFeatures(found=True)
         gate.step(turn_fit(), features, 0.05, -0.04, 0.0, 0.0)
-        turning = gate.step(turn_fit(), features, 0.05, -0.04, 0.1, 0.1, 0.0)
+        gate.step(turn_fit(), features, 0.05, -0.04, 0.1, 0.0, 0.0)
+        gate.step(turn_fit(), features, 0.05, -0.04, 0.2, 0.0, 0.0)
+        turning = gate.step(turn_fit(), features, 0.05, -0.04, 0.3, 0.1, 0.0)
         self.assertEqual(turning.status.reason, "committed_turn")
 
         unaligned = turn_fit(theta=0.4)
-        turning = gate.step(unaligned, features, 0.0, 0.0, 0.6, 0.0, -1.0)
+        turning = gate.step(unaligned, features, 0.0, 0.0, 0.8, 0.0, -1.0)
         self.assertEqual(turning.status.reason, "committed_turn")
         self.assertAlmostEqual(turning.status.target[0], 0.25)
 
         aligned = TrajectoryFit(found=True, e0=0.1, theta=0.05, conf=0.9, n_bands=5)
-        reacquired = gate.step(aligned, features, 0.03, -0.02, 1.1, 0.0, -1.0)
+        reacquired = gate.step(aligned, features, 0.03, -0.02, 1.3, 0.0, -1.0)
         self.assertEqual(reacquired.status.reason, "cooldown")
         self.assertAlmostEqual(reacquired.v, 0.03)
+
+    def test_corner_event_rejects_heading_lateral_sign_conflict(self):
+        gate = CornerCommandDelay(PathMemoryConfig(corner_confirm_frames=3))
+        conflict = TrajectoryFit(found=True, e0=-0.08, theta=0.42, conf=0.9, n_bands=3)
+        for i in range(6):
+            output = gate.step(conflict, LineFeatures(found=True), 0.05, 0.0, i * 0.1, 0.05)
+        self.assertEqual(output.status.reason, "armed")
 
     def test_corner_event_does_not_delay_every_fit(self):
         gate = CornerCommandDelay(PathMemoryConfig(corner_confirm_frames=2))

@@ -87,20 +87,39 @@ class GroundProjector:
         return cv.warpPerspective(crop, matrix, (self.cfg.bird_width_px, self.cfg.bird_height_px))
 
 
-def _intent_direction(features: LineFeatures, fit: TrajectoryFit, cfg: PathMemoryConfig) -> int:
+def _corner_observation(
+    features: LineFeatures, fit: TrajectoryFit, cfg: PathMemoryConfig,
+) -> tuple[int, float]:
     left = features.branch_left is not None
     right = features.branch_right is not None
     if left and right:
-        return 0
+        return 0, 0.0
     if right:
-        return 1
+        return 1, math.pi / 2.0
     if left:
-        return -1
+        return -1, math.pi / 2.0
     if fit.preview_dir:
-        return 1 if fit.preview_dir > 0 else -1
-    if abs(fit.theta) < cfg.corner_theta_threshold:
-        return 0
-    return 1 if fit.theta > 0 else -1
+        angle = min(math.pi / 2.0, max(0.60, abs(fit.preview_theta) * cfg.corner_image_angle_gain))
+        return (1 if fit.preview_dir > 0 else -1), angle
+    if (
+        not fit.found
+        or fit.conf < 0.80
+        or fit.n_bands < 3
+        or fit.disconnected
+        or abs(fit.theta) < cfg.corner_theta_threshold
+    ):
+        return 0, 0.0
+    direction = 1 if fit.theta > 0 else -1
+    # A one-frame fit that points across the current lateral displacement is
+    # the failure signature seen in 113957; do not latch it as a corner.
+    if abs(fit.e0) >= 0.02 and direction != (1 if fit.e0 > 0 else -1):
+        return 0, 0.0
+    angle = min(math.pi / 2.0, max(0.60, abs(fit.theta) * cfg.corner_image_angle_gain))
+    return direction, angle
+
+
+def _intent_direction(features: LineFeatures, fit: TrajectoryFit, cfg: PathMemoryConfig) -> int:
+    return _corner_observation(features, fit, cfg)[0]
 
 
 class CornerCommandDelay:
@@ -109,6 +128,8 @@ class CornerCommandDelay:
         self.state = "armed"
         self.candidate_dir = 0
         self.confirm = 0
+        self.candidate_angles: list[float] = []
+        self.target_angle_rad = cfg.corner_turn_angle_rad
         self.remaining_m = 0.0
         self.hold_v = 0.0
         self.hold_w = 0.0
@@ -128,21 +149,26 @@ class CornerCommandDelay:
         angular: float = 0.0,
     ) -> CornerCommandResult:
         travelled, turned = self._motion_delta(now, linear, angular)
-        direction = _intent_direction(features, fit, self.cfg)
+        direction, observed_angle = _corner_observation(features, fit, self.cfg)
         if self.state == "armed":
             if direction == 0 and fit.found and fit.conf >= 0.65:
                 limit = self.cfg.corner_hold_max_w
                 self.stable_w = max(-limit, min(limit, command_w))
             if direction and direction == self.candidate_dir:
                 self.confirm += 1
+                self.candidate_angles.append(observed_angle)
             else:
                 self.candidate_dir, self.confirm = direction, int(direction != 0)
-            if self.confirm >= max(1, self.cfg.corner_confirm_frames):
+                self.candidate_angles = [observed_angle] if direction else []
+            if self.confirm >= max(3, self.cfg.corner_confirm_frames):
                 self.state = "waiting"
                 self.remaining_m = self.cfg.camera_to_axle_m
                 self.hold_v = max(0.0, command_v)
                 self.hold_w = self.stable_w
                 self.turned_rad = 0.0
+                angles = [angle for angle in self.candidate_angles if angle > 0.0]
+                fitted_angle = float(np.median(angles)) if angles else self.cfg.corner_turn_angle_rad
+                self.target_angle_rad = max(self.cfg.corner_reacquire_angle_rad, fitted_angle)
         elif self.state == "waiting":
             self.remaining_m = max(0.0, self.remaining_m - travelled)
             if self.remaining_m <= 1e-6:
@@ -151,14 +177,16 @@ class CornerCommandDelay:
         elif self.state == "turning":
             self.turned_rad += turned
             ready = self.turned_rad >= self.cfg.corner_reacquire_angle_rad
-            aligned = bool(
-                fit.found
-                and fit.conf >= 0.65
-                and fit.n_bands >= 3
-                and abs(fit.e0) <= self.cfg.corner_e_threshold
-                and abs(fit.theta) <= self.cfg.corner_theta_threshold
-            )
-            if (ready and aligned) or self.turned_rad >= self.cfg.corner_turn_angle_rad:
+            visible = bool(fit.found and fit.conf >= 0.48 and fit.n_bands >= 2)
+            if ready and visible:
+                self.state = "cooldown"
+                self.clear_frames = 0
+            elif self.turned_rad >= self.target_angle_rad:
+                self.state = "seeking"
+        elif self.state == "seeking":
+            self.turned_rad += turned
+            visible = bool(fit.found and fit.conf >= 0.48 and fit.n_bands >= 2)
+            if visible or self.turned_rad >= self.target_angle_rad + self.cfg.corner_search_extra_rad:
                 self.state = "cooldown"
                 self.clear_frames = 0
         elif self.state == "cooldown":
@@ -170,6 +198,7 @@ class CornerCommandDelay:
             status = PathStrategyStatus(
                 True, "corner_event", "waiting_margin", self.remaining_m,
                 self.candidate_dir, 0,
+                (0.0, self.target_angle_rad),
             )
             return CornerCommandResult(self.hold_v, self.hold_w, status)
         if self.state == "turning":
@@ -178,9 +207,17 @@ class CornerCommandDelay:
             status = PathStrategyStatus(
                 True, "corner_event", "committed_turn", 0.0,
                 self.candidate_dir, 0,
-                (self.turned_rad, self.cfg.corner_turn_angle_rad),
+                (self.turned_rad, self.target_angle_rad),
             )
             return CornerCommandResult(turn_v, turn_w, status)
+        if self.state == "seeking":
+            turn_w = -self.candidate_dir * abs(self.cfg.corner_replay_max_w)
+            status = PathStrategyStatus(
+                True, "corner_event", "corner_reacquire_search", 0.0,
+                self.candidate_dir, 0,
+                (self.turned_rad, self.target_angle_rad),
+            )
+            return CornerCommandResult(0.0, turn_w, status)
         status = PathStrategyStatus(
             True, "corner_event", self.state, 0.0,
             self.candidate_dir, 0,

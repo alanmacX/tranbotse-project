@@ -102,6 +102,8 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError("corner turn speed ratio must be within [0, 1]")
     if not 0.0 <= cfg.path_memory.corner_reacquire_angle_rad <= cfg.path_memory.corner_turn_angle_rad:
         raise ValueError("corner reacquire angle must be within [0, turn angle]")
+    if cfg.path_memory.corner_image_angle_gain <= 0.0 or cfg.path_memory.corner_search_extra_rad < 0.0:
+        raise ValueError("corner angle gain must be positive and extra search angle non-negative")
     if cfg.path_memory.max_age_sec <= 0.0 or cfg.path_memory.max_motion_dt_sec <= 0.0:
         raise ValueError("path-memory time limits must be positive")
 
