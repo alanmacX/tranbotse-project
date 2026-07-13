@@ -92,7 +92,7 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError(f"crop x1 must be > x0, got {cfg.camera.crop}")
     if cfg.path_memory.camera_to_axle_m < 0.0:
         raise ValueError("camera-to-axle distance cannot be negative")
-    if cfg.path_memory.mode not in ("corner_event", "ipm_axle", "local_pursuit"):
+    if cfg.path_memory.mode not in ("none", "corner_event", "ipm_axle", "local_pursuit"):
         raise ValueError(f"unsupported path-memory mode: {cfg.path_memory.mode}")
     if cfg.path_memory.corner_confirm_frames <= 0 or cfg.path_memory.path_max_points <= 0:
         raise ValueError("path-memory frame and point limits must be positive")
@@ -348,7 +348,9 @@ def run(args: argparse.Namespace) -> int:
                 accepted_fit = visual_fit
                 if obstacle_decision.state not in (ObstacleState.CLEAR, ObstacleState.DISARMED):
                     accepted_fit = replace(visual_fit, found=False, conf=0.0)
-                if strategy_mode == "corner_event":
+                if strategy_mode == "none":
+                    memory_status = PathStrategyStatus(False, "none", "passthrough")
+                elif strategy_mode == "corner_event":
                     fit, memory_status = corner_margin.step(accepted_fit, features, now, motion.linear)
                 elif strategy_mode == "ipm_axle":
                     if projector.active:

@@ -154,6 +154,7 @@ function showStrategyFields() {
 async function loadStrategy() {
   const cfg = await (await fetch("/api/config")).json();
   strategyMode.value = cfg.path_memory.mode;
+  el("obstacleEnabled").checked = !!cfg.obstacle.enabled;
   el("strategyMargin").value = cfg.path_memory.camera_to_axle_m;
   el("cornerConfirm").value = cfg.path_memory.corner_confirm_frames;
   el("cornerTheta").value = cfg.path_memory.corner_theta_threshold;
@@ -173,6 +174,7 @@ el("strategySaveBtn").addEventListener("click", () => guard("STRATEGY", async ()
       corner_theta_threshold: Number(el("cornerTheta").value),
       lookahead_m: Number(el("strategyLookahead").value),
     },
+    obstacle: { enabled: el("obstacleEnabled").checked },
   });
   return { message: "selected " + strategyMode.value };
 }));

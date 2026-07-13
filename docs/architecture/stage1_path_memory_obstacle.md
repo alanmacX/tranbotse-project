@@ -3,6 +3,11 @@
 The debug dashboard exposes three mutually exclusive margin strategies. The
 selected mode and all parameters are copied into every debug capture.
 
+## No margin
+
+`none` is the control baseline. It passes the current `visual_fit` directly to
+the existing tracker without corner gating, ground projection, or path memory.
+
 ## Corner event
 
 `corner_event` keeps the original raw-crop tracker. A unilateral branch,

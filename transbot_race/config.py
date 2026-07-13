@@ -33,7 +33,7 @@ class PathMemoryConfig:
     """Selectable camera-to-axle experiment strategy."""
 
     enabled: bool = True
-    mode: str = "corner_event"  # corner_event, ipm_axle, local_pursuit
+    mode: str = "none"  # none, corner_event, ipm_axle, local_pursuit
     camera_to_axle_m: float = 0.10
     corner_confirm_frames: int = 2
     corner_theta_threshold: float = 0.18

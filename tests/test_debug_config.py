@@ -5,6 +5,12 @@ from transbot_race.config import RaceConfig
 
 
 class DebugConfigTests(unittest.TestCase):
+    def test_no_margin_and_obstacle_switch_are_applied(self):
+        cfg = RaceConfig()
+        _deep_update_cfg(cfg, {"path_memory": {"mode": "none"}, "obstacle": {"enabled": False}})
+        self.assertEqual(cfg.path_memory.mode, "none")
+        self.assertFalse(cfg.obstacle.enabled)
+
     def test_path_memory_values_are_applied(self):
         cfg = RaceConfig()
         _deep_update_cfg(cfg, {
