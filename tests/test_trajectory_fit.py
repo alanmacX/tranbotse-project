@@ -90,6 +90,14 @@ def straight_with_chassis_bar(line_w=18):
 
 
 class TrajectoryFitTests(unittest.TestCase):
+    def test_far_connected_corner_is_a_branch_before_reaching_center(self):
+        mask = np.zeros((H, W), dtype=np.uint8)
+        cv.rectangle(mask, (62, 35), (80, H - 1), 255, -1)
+        cv.rectangle(mask, (62, 35), (W - 1, 53), 255, -1)
+        cfg = RaceConfig()
+        features = scan_line_features(mask, cfg.vision, crop_center=50)
+        self.assertIsNotNone(features.branch_right)
+
     def test_straight_is_centered_low_curvature(self):
         fit = _fit(straight(), RaceConfig())
         self.assertTrue(fit.found)

@@ -651,14 +651,18 @@ def scan_line_features(mask: np.ndarray, cfg: VisionConfig, crop_center: float |
 
     branch_left: BranchFeature | None = None
     branch_right: BranchFeature | None = None
-    for band_index in [2, 3, 4, 1]:
+    anchor_component_id = bottom.component_id if bottom is not None else -1
+    # Include the far bands: camera-to-axle margin must latch a visible corner
+    # before its horizontal arm reaches the near-field steering bands.
+    for band_index in [*range(2, len(bands)), 1]:
         if band_index >= len(bands):
             continue
         band = bands[band_index]
         for run in band.runs:
             wide = run.width > max(line_width * cfg.branch_width_ratio, width * cfg.branch_min_crop_ratio)
             crosses_center = run.x0 < crop_center + max(10, line_width * 1.3) and run.x1 > crop_center - max(10, line_width * 1.3)
-            if not (wide and crosses_center):
+            connected_to_anchor = anchor_component_id >= 0 and run.component_id == anchor_component_id
+            if not (wide and (crosses_center or connected_to_anchor)):
                 continue
             y = (band.y0 + band.y1) / 2.0
             if run.x1 > crop_center + max(12, line_width * 1.4):
