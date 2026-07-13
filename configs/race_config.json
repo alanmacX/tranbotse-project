@@ -45,11 +45,14 @@
   },
   "path_memory": {
     "enabled": true,
-    "mode": "none",
-    "camera_to_axle_m": 0.2,
+    "mode": "corner_event",
+    "camera_to_axle_m": 0.04,
     "corner_confirm_frames": 2,
     "corner_theta_threshold": 0.18,
     "corner_e_threshold": 0.48,
+    "corner_record_steps": 5,
+    "corner_hold_max_w": 0.0,
+    "corner_replay_max_w": 0.16,
     "lookahead_m": 0.07,
     "lateral_half_width_m": 0.2,
     "path_max_points": 160,
@@ -57,7 +60,17 @@
     "max_motion_dt_sec": 0.25
   },
   "ground_projection": {
-    "homography": null,
+    "homography": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1
+    ],
     "paper_width_m": 0.21,
     "paper_length_m": 0.297,
     "paper_near_m": 0.05,

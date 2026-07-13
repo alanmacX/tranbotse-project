@@ -38,6 +38,9 @@ class PathMemoryConfig:
     corner_confirm_frames: int = 2
     corner_theta_threshold: float = 0.18
     corner_e_threshold: float = 0.48
+    corner_record_steps: int = 5
+    corner_hold_max_w: float = 0.0
+    corner_replay_max_w: float = 0.16
     lookahead_m: float = 0.07
     lateral_half_width_m: float = 0.20
     path_max_points: int = 160

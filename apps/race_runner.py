@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT))
 from transbot_race.config import RaceConfig  # noqa: E402
 from transbot_race.geometry import apply_occlusion, band_is_occluded  # noqa: E402
 from transbot_race.path_memory import (  # noqa: E402
-    CornerEventMargin,
+    CornerCommandDelay,
     GroundProjector,
     PathStrategyStatus,
     RollingPathPursuit,
@@ -96,6 +96,8 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError(f"unsupported path-memory mode: {cfg.path_memory.mode}")
     if cfg.path_memory.corner_confirm_frames <= 0 or cfg.path_memory.path_max_points <= 0:
         raise ValueError("path-memory frame and point limits must be positive")
+    if cfg.path_memory.corner_record_steps <= 0 or cfg.path_memory.corner_replay_max_w <= 0.0:
+        raise ValueError("corner record steps and replay limit must be positive")
     if cfg.path_memory.max_age_sec <= 0.0 or cfg.path_memory.max_motion_dt_sec <= 0.0:
         raise ValueError("path-memory time limits must be positive")
 
@@ -274,7 +276,7 @@ def run(args: argparse.Namespace) -> int:
     bot = make_bot(args.dry_run)
     sm = RaceStateMachine(cfg)
     projector = GroundProjector(cfg.ground_projection)
-    corner_margin = CornerEventMargin(cfg.path_memory)
+    corner_margin = CornerCommandDelay(cfg.path_memory)
     ipm_pursuit = RollingPathPursuit(cfg.path_memory, "ipm_axle")
     local_pursuit = RollingPathPursuit(cfg.path_memory, "local_pursuit")
     obstacle_monitor = ObstacleMonitor(cfg.obstacle)
@@ -351,7 +353,7 @@ def run(args: argparse.Namespace) -> int:
                 if strategy_mode == "none":
                     memory_status = PathStrategyStatus(False, "none", "passthrough")
                 elif strategy_mode == "corner_event":
-                    fit, memory_status = corner_margin.step(accepted_fit, features, now, motion.linear)
+                    memory_status = PathStrategyStatus(True, "corner_event", corner_margin.state)
                 elif strategy_mode == "ipm_axle":
                     if projector.active:
                         points = bird_path_to_ground(
@@ -371,6 +373,18 @@ def run(args: argparse.Namespace) -> int:
                     else:
                         memory_status = PathStrategyStatus(False, strategy_mode, "calibration_required")
             command = sm.step(fit, now=now, obstacle=obstacle_decision.stop_required)
+            if strategy_mode == "corner_event" and not obstacle_decision.stop_required:
+                delayed = corner_margin.step(
+                    visual_fit, features, command.v, command.w, now, motion.linear,
+                )
+                memory_status = delayed.status
+                if delayed.v != command.v or delayed.w != command.w:
+                    command = replace(
+                        command,
+                        v=delayed.v,
+                        w=delayed.w,
+                        reason=f"corner_{memory_status.reason}",
+                    )
             if obstacle_decision.slow_required and command.v > 0.0:
                 command = replace(
                     command,

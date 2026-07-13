@@ -28,6 +28,13 @@ class PathStrategyStatus:
     target: tuple[float, float] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class CornerCommandResult:
+    v: float
+    w: float
+    status: PathStrategyStatus
+
+
 def read_motion_sample(bot: object, fallback_v: float, fallback_w: float) -> MotionSample:
     getter = getattr(bot, "get_motion_data", None)
     if callable(getter):
@@ -91,28 +98,41 @@ def _intent_direction(features: LineFeatures, fit: TrajectoryFit, cfg: PathMemor
         return -1
     if fit.preview_dir:
         return 1 if fit.preview_dir > 0 else -1
-    uses_theta = abs(fit.theta) >= cfg.corner_theta_threshold
-    signal = fit.theta if uses_theta else fit.e_look
-    threshold = cfg.corner_theta_threshold if uses_theta else cfg.corner_e_threshold
-    if abs(signal) < threshold:
+    if abs(fit.theta) < cfg.corner_theta_threshold:
         return 0
-    return 1 if signal > 0 else -1
+    return 1 if fit.theta > 0 else -1
 
 
-class CornerEventMargin:
+class CornerCommandDelay:
     def __init__(self, cfg: PathMemoryConfig) -> None:
         self.cfg = cfg
         self.state = "armed"
         self.candidate_dir = 0
         self.confirm = 0
         self.remaining_m = 0.0
-        self.baseline_e0 = 0.0
+        self.hold_w = 0.0
+        self.stable_w = 0.0
+        self.profile: list[float] = []
+        self.replay_sign = 0
+        self.replay_index = 0
+        self.clear_frames = 0
         self.last_now: float | None = None
 
-    def step(self, fit: TrajectoryFit, features: LineFeatures, now: float, linear: float) -> tuple[TrajectoryFit, PathStrategyStatus]:
+    def step(
+        self,
+        fit: TrajectoryFit,
+        features: LineFeatures,
+        command_v: float,
+        command_w: float,
+        now: float,
+        linear: float,
+    ) -> CornerCommandResult:
         travelled = self._travel(now, linear)
         direction = _intent_direction(features, fit, self.cfg)
         if self.state == "armed":
+            if direction == 0 and fit.found and fit.conf >= 0.65:
+                limit = self.cfg.corner_hold_max_w
+                self.stable_w = max(-limit, min(limit, command_w))
             if direction and direction == self.candidate_dir:
                 self.confirm += 1
             else:
@@ -120,18 +140,53 @@ class CornerEventMargin:
             if self.confirm >= max(1, self.cfg.corner_confirm_frames):
                 self.state = "waiting"
                 self.remaining_m = self.cfg.camera_to_axle_m
-                self.baseline_e0 = max(-0.35, min(0.35, fit.e0))
+                self.hold_w = self.stable_w
+                self.profile = []
+                self.replay_index = 0
+                self.replay_sign = 1 if command_w > 0.0 else -1 if command_w < 0.0 else 0
+                self._record(command_w)
         elif self.state == "waiting":
+            self._record(command_w)
             self.remaining_m = max(0.0, self.remaining_m - travelled)
             if self.remaining_m <= 1e-6:
-                self.state = "released"
-        elif self.state == "released" and direction == 0:
-            self.state, self.candidate_dir, self.confirm = "armed", 0, 0
+                self.state = "replay"
+        elif self.state == "replay":
+            if self.replay_index >= len(self.profile):
+                self.state = "cooldown"
+                self.clear_frames = 0
+        elif self.state == "cooldown":
+            self.clear_frames = self.clear_frames + 1 if direction == 0 else 0
+            if self.clear_frames >= 3:
+                self.state, self.candidate_dir, self.confirm = "armed", 0, 0
 
         if self.state == "waiting":
-            held = TrajectoryFit(found=True, e0=self.baseline_e0, e_look=self.baseline_e0, conf=max(fit.conf, 0.55), n_bands=fit.n_bands)
-            return held, PathStrategyStatus(True, "corner_event", "waiting_margin", self.remaining_m, self.candidate_dir)
-        return fit, PathStrategyStatus(True, "corner_event", self.state, 0.0, self.candidate_dir)
+            status = PathStrategyStatus(
+                True, "corner_event", "waiting_margin", self.remaining_m,
+                self.candidate_dir, len(self.profile),
+            )
+            return CornerCommandResult(command_v, self.hold_w, status)
+        if self.state == "replay" and self.profile:
+            w = self.profile[min(self.replay_index, len(self.profile) - 1)]
+            self.replay_index += 1
+            status = PathStrategyStatus(
+                True, "corner_event", "replay_step", 0.0,
+                self.candidate_dir, len(self.profile),
+            )
+            return CornerCommandResult(command_v, w, status)
+        status = PathStrategyStatus(
+            True, "corner_event", self.state, 0.0,
+            self.candidate_dir, len(self.profile),
+        )
+        return CornerCommandResult(command_v, command_w, status)
+
+    def _record(self, command_w: float) -> None:
+        if len(self.profile) >= max(1, self.cfg.corner_record_steps):
+            return
+        sign = 1 if command_w > 0.0 else -1 if command_w < 0.0 else 0
+        if self.replay_sign and sign and sign != self.replay_sign:
+            return
+        limit = self.cfg.corner_replay_max_w
+        self.profile.append(max(-limit, min(limit, float(command_w))))
 
     def _travel(self, now: float, linear: float) -> float:
         if self.last_now is None:

@@ -158,6 +158,7 @@ async function loadStrategy() {
   el("strategyMargin").value = cfg.path_memory.camera_to_axle_m;
   el("cornerConfirm").value = cfg.path_memory.corner_confirm_frames;
   el("cornerTheta").value = cfg.path_memory.corner_theta_threshold;
+  el("cornerRecordSteps").value = cfg.path_memory.corner_record_steps;
   el("strategyLookahead").value = cfg.path_memory.lookahead_m;
   el("paperNearM").value = cfg.ground_projection.paper_near_m;
   showStrategyFields();
@@ -172,6 +173,7 @@ el("strategySaveBtn").addEventListener("click", () => guard("STRATEGY", async ()
       camera_to_axle_m: Number(el("strategyMargin").value),
       corner_confirm_frames: Number(el("cornerConfirm").value),
       corner_theta_threshold: Number(el("cornerTheta").value),
+      corner_record_steps: Number(el("cornerRecordSteps").value),
       lookahead_m: Number(el("strategyLookahead").value),
     },
     obstacle: { enabled: el("obstacleEnabled").checked },

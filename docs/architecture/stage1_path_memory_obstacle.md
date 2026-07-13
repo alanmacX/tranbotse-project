@@ -11,9 +11,10 @@ the existing tracker without corner gating, ground projection, or path memory.
 ## Corner event
 
 `corner_event` keeps the original raw-crop tracker. A unilateral branch,
-preview, or confirmed heading/lateral signal latches a turn direction. The
-controller holds the pre-corner lateral baseline until forward travel reaches
-`camera_to_axle_m`, then immediately returns to the current visual fit. It never
+preview, or confirmed heading signal latches a turn direction. The command
+output stays straight until forward travel reaches `camera_to_axle_m`, while
+the first few final steering commands are recorded. Those scalar commands are
+then replayed with a safety limit before returning to live control. It never
 queues an old `TrajectoryFit`. Simultaneous left and right branches are treated
 as an undecided junction and do not latch a direction.
 

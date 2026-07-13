@@ -4,7 +4,7 @@ import numpy as np
 
 from transbot_race.config import GroundProjectionConfig, PathMemoryConfig
 from transbot_race.path_memory import (
-    CornerEventMargin, GroundProjector, RollingPathPursuit, read_motion_sample,
+    CornerCommandDelay, GroundProjector, RollingPathPursuit, read_motion_sample,
 )
 from transbot_race.vision import LineFeatures, TrajectoryFit
 
@@ -21,25 +21,25 @@ class FakeBot:
 
 
 class PathStrategyTests(unittest.TestCase):
-    def test_corner_event_holds_then_returns_current_fit(self):
-        cfg = PathMemoryConfig(camera_to_axle_m=0.05, corner_confirm_frames=2, max_motion_dt_sec=1.0)
-        gate = CornerEventMargin(cfg)
+    def test_corner_event_holds_then_replays_recorded_commands(self):
+        cfg = PathMemoryConfig(camera_to_axle_m=0.02, corner_confirm_frames=2, corner_record_steps=2)
+        gate = CornerCommandDelay(cfg)
         features = LineFeatures(found=True)
-        gate.step(turn_fit(), features, 0.0, 0.0)
-        held, status = gate.step(turn_fit(), features, 0.1, 0.1)
-        self.assertEqual(status.reason, "waiting_margin")
-        self.assertEqual(held.theta, 0.0)
-        current = turn_fit(theta=-0.3)
-        released, status = gate.step(current, features, 0.6, 0.1)
-        self.assertEqual(status.reason, "released")
-        self.assertIs(released, current)
+        gate.step(turn_fit(), features, 0.05, -0.08, 0.0, 0.0)
+        held = gate.step(turn_fit(), features, 0.05, -0.10, 0.1, 0.1)
+        self.assertEqual(held.status.reason, "waiting_margin")
+        self.assertLessEqual(abs(held.w), cfg.corner_hold_max_w)
+        gate.step(turn_fit(), features, 0.05, -0.12, 0.2, 0.1)
+        replay = gate.step(turn_fit(), features, 0.05, -0.15, 0.3, 0.1)
+        self.assertEqual(replay.status.reason, "replay_step")
+        self.assertAlmostEqual(replay.w, -0.10)
 
     def test_corner_event_does_not_delay_every_fit(self):
-        gate = CornerEventMargin(PathMemoryConfig(corner_confirm_frames=2))
+        gate = CornerCommandDelay(PathMemoryConfig(corner_confirm_frames=2))
         straight = TrajectoryFit(found=True, e0=0.08, theta=0.02, conf=0.9)
-        output, status = gate.step(straight, LineFeatures(found=True), 0.0, 0.0)
-        self.assertIs(output, straight)
-        self.assertEqual(status.reason, "armed")
+        output = gate.step(straight, LineFeatures(found=True), 0.05, 0.01, 0.0, 0.0)
+        self.assertEqual(output.w, 0.01)
+        self.assertEqual(output.status.reason, "armed")
 
     def test_projector_identity(self):
         cfg = GroundProjectionConfig(homography=(1, 0, 0, 0, 1, 0, 0, 0, 1))
