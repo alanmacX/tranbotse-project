@@ -50,6 +50,26 @@ class PathStrategyTests(unittest.TestCase):
         self.assertAlmostEqual(waiting.v, 0.06)
         self.assertAlmostEqual(waiting.w, 0.0)
 
+    def test_corner_event_backs_up_the_complete_margin_command_stream(self):
+        cfg = PathMemoryConfig(
+            camera_to_axle_m=0.06,
+            corner_confirm_frames=1,
+            corner_record_steps=2,
+            path_max_points=20,
+        )
+        gate = CornerCommandDelay(cfg)
+        features = LineFeatures(found=True)
+        gate.step(turn_fit(), features, 0.05, -0.04, 0.0, 0.0)
+        for i, w in enumerate((-0.05, -0.06, -0.07, -0.08, -0.09), start=1):
+            output = gate.step(turn_fit(), features, 0.01, w, i * 0.1, 0.1)
+
+        self.assertEqual(output.status.reason, "waiting_margin")
+        self.assertEqual(output.status.point_count, 6)
+        replay = gate.step(turn_fit(), features, 0.0, -0.10, 0.6, 0.1)
+        self.assertEqual(replay.status.reason, "replay_step")
+        self.assertAlmostEqual(replay.v, 0.05)
+        self.assertAlmostEqual(replay.w, -0.04)
+
     def test_corner_event_does_not_delay_every_fit(self):
         gate = CornerCommandDelay(PathMemoryConfig(corner_confirm_frames=2))
         straight = TrajectoryFit(found=True, e0=0.08, theta=0.02, conf=0.9)

@@ -174,7 +174,7 @@ class CornerCommandDelay:
                 True, "corner_event", "replay_step", 0.0,
                 self.candidate_dir, len(self.profile),
             )
-            return CornerCommandResult(command_v, w, status)
+            return CornerCommandResult(self.hold_v, w, status)
         status = PathStrategyStatus(
             True, "corner_event", self.state, 0.0,
             self.candidate_dir, len(self.profile),
@@ -182,7 +182,10 @@ class CornerCommandDelay:
         return CornerCommandResult(command_v, command_w, status)
 
     def _record(self, command_w: float) -> None:
-        if len(self.profile) >= max(1, self.cfg.corner_record_steps):
+        # Capture the complete camera-ahead command stream while straight motion
+        # is active. Replaying only the first few frames truncates the corner.
+        max_steps = max(1, self.cfg.corner_record_steps, self.cfg.path_max_points)
+        if len(self.profile) >= max_steps:
             return
         sign = 1 if command_w > 0.0 else -1 if command_w < 0.0 else 0
         if self.replay_sign and sign and sign != self.replay_sign:
