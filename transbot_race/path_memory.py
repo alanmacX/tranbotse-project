@@ -110,6 +110,7 @@ class CornerCommandDelay:
         self.candidate_dir = 0
         self.confirm = 0
         self.remaining_m = 0.0
+        self.hold_v = 0.0
         self.hold_w = 0.0
         self.stable_w = 0.0
         self.profile: list[float] = []
@@ -140,6 +141,7 @@ class CornerCommandDelay:
             if self.confirm >= max(1, self.cfg.corner_confirm_frames):
                 self.state = "waiting"
                 self.remaining_m = self.cfg.camera_to_axle_m
+                self.hold_v = max(0.0, command_v)
                 self.hold_w = self.stable_w
                 self.profile = []
                 self.replay_index = 0
@@ -164,7 +166,7 @@ class CornerCommandDelay:
                 True, "corner_event", "waiting_margin", self.remaining_m,
                 self.candidate_dir, len(self.profile),
             )
-            return CornerCommandResult(command_v, self.hold_w, status)
+            return CornerCommandResult(self.hold_v, self.hold_w, status)
         if self.state == "replay" and self.profile:
             w = self.profile[min(self.replay_index, len(self.profile) - 1)]
             self.replay_index += 1

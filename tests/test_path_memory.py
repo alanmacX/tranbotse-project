@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 import numpy as np
 
@@ -33,6 +34,21 @@ class PathStrategyTests(unittest.TestCase):
         replay = gate.step(turn_fit(), features, 0.05, -0.15, 0.3, 0.1)
         self.assertEqual(replay.status.reason, "replay_step")
         self.assertAlmostEqual(replay.w, -0.10)
+
+    def test_corner_event_keeps_trigger_speed_when_live_tracker_loses_line(self):
+        cfg = PathMemoryConfig(camera_to_axle_m=0.10, corner_confirm_frames=1)
+        gate = CornerCommandDelay(cfg)
+        features = LineFeatures(found=True)
+
+        triggered = gate.step(turn_fit(), features, 0.06, -0.12, 0.0, 0.0)
+        self.assertEqual(triggered.status.reason, "waiting_margin")
+        self.assertAlmostEqual(triggered.v, 0.06)
+
+        lost_fit = replace(turn_fit(), found=False, conf=0.0)
+        waiting = gate.step(lost_fit, LineFeatures(found=False), 0.0, 0.0, 0.1, 0.04)
+        self.assertEqual(waiting.status.reason, "waiting_margin")
+        self.assertAlmostEqual(waiting.v, 0.06)
+        self.assertAlmostEqual(waiting.w, 0.0)
 
     def test_corner_event_does_not_delay_every_fit(self):
         gate = CornerCommandDelay(PathMemoryConfig(corner_confirm_frames=2))
