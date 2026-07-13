@@ -122,8 +122,10 @@ class CornerCommandDelay:
         geometry: CaptureGeometryObservation | None = None,
         geometry_decision: CaptureGeometryDecision | None = None,
         approach_w: float | None = None,
+        angular_scale: float = 1.0,
     ) -> CornerCommandResult:
-        travelled, turned = self._motion_delta(now, linear, angular)
+        travelled, turned = self._motion_delta(now, linear, angular, angular_scale)
+        visual_align = False
         direction, observed_angle = (0, 0.0)
         if not self.cfg.capture_geometry_enabled:
             direction, observed_angle = _corner_observation(features, fit, self.cfg)
@@ -142,9 +144,10 @@ class CornerCommandDelay:
                     proposed_w = command_w if approach_w is None else approach_w
                     self.stable_w = max(-limit, min(limit, proposed_w))
                     self.hold_w = self.stable_w
+                    calibrated_angle = geometry_decision.angle_rad * self.cfg.corner_capture_angle_scale
                     self.target_angle_rad = min(
                         self.cfg.corner_turn_angle_rad,
-                        max(self.cfg.corner_reacquire_angle_rad, geometry_decision.angle_rad),
+                        max(self.cfg.corner_reacquire_angle_rad, calibrated_angle),
                     )
                     self.gate_frames = 0
                     self.approach_missing_frames = 0
@@ -196,13 +199,17 @@ class CornerCommandDelay:
             self.turned_rad += turned
             ready = self.turned_rad >= self.cfg.corner_reacquire_angle_rad
             visible = self._reacquire_valid(fit)
+            visual_align = ready and visible
             self.reacquire_frames = self.reacquire_frames + 1 if ready and visible else 0
             if self.reacquire_frames >= self.cfg.corner_reacquire_confirm_frames:
                 self.state = "handoff"
                 self.handoff_index = 0
             elif self.turned_rad >= self.target_angle_rad:
-                self.state = "seeking"
-                self.reacquire_frames = 0
+                if self.cfg.capture_geometry_enabled:
+                    self.state = "failed"
+                else:
+                    self.state = "seeking"
+                    self.reacquire_frames = 0
         elif self.state == "seeking":
             self.turned_rad += turned
             visible = self._reacquire_valid(fit)
@@ -249,6 +256,18 @@ class CornerCommandDelay:
         if self.state == "turning":
             turn_v = self.hold_v * max(0.0, min(1.0, self.cfg.corner_turn_speed_ratio))
             turn_w = -self.candidate_dir * abs(self.cfg.corner_replay_max_w)
+            if visual_align:
+                alpha = self.cfg.corner_visual_align_blend
+                status = PathStrategyStatus(
+                    True, "corner_event", "corner_visual_align", 0.0,
+                    self.candidate_dir, self.reacquire_frames,
+                    (self.turned_rad, self.target_angle_rad),
+                )
+                return CornerCommandResult(
+                    (1.0 - alpha) * turn_v + alpha * command_v,
+                    (1.0 - alpha) * turn_w + alpha * command_w,
+                    status,
+                )
             status = PathStrategyStatus(
                 True, "corner_event", "committed_turn", 0.0,
                 self.candidate_dir, 0,
@@ -265,7 +284,10 @@ class CornerCommandDelay:
             return CornerCommandResult(0.0, turn_w, status)
         if self.state == "handoff":
             frames = max(1, self.cfg.corner_handoff_blend_frames)
-            alpha = min(1.0, self.handoff_index / frames)
+            alpha = max(
+                self.cfg.corner_visual_align_blend,
+                min(1.0, (self.handoff_index + 1) / frames),
+            )
             turn_v = self.hold_v * max(0.0, min(1.0, self.cfg.corner_turn_speed_ratio))
             turn_w = -self.candidate_dir * abs(self.cfg.corner_replay_max_w)
             status = PathStrategyStatus(
@@ -319,13 +341,14 @@ class CornerCommandDelay:
         self.approach_missing_frames = 0
         self.capture_votes = 0
 
-    @staticmethod
-    def _reacquire_valid(fit: TrajectoryFit) -> bool:
+    def _reacquire_valid(self, fit: TrajectoryFit) -> bool:
         return bool(
             fit.found
             and fit.conf >= 0.65
             and fit.n_bands >= 3
             and not fit.disconnected
+            and abs(fit.e0) <= self.cfg.corner_reacquire_max_e
+            and abs(fit.theta) <= self.cfg.corner_reacquire_max_theta
         )
 
     def _stable_straight(self, fit: TrajectoryFit, features: LineFeatures) -> bool:
@@ -337,10 +360,12 @@ class CornerCommandDelay:
             and features.branch_right is None
         )
 
-    def _motion_delta(self, now: float, linear: float, angular: float) -> tuple[float, float]:
+    def _motion_delta(
+        self, now: float, linear: float, angular: float, angular_scale: float,
+    ) -> tuple[float, float]:
         if self.last_now is None:
             self.last_now = now
             return 0.0, 0.0
         dt = max(0.0, min(self.cfg.max_motion_dt_sec, now - self.last_now))
         self.last_now = now
-        return max(0.0, linear) * dt, abs(angular) * dt
+        return max(0.0, linear) * dt, abs(angular) * dt * max(0.0, angular_scale)

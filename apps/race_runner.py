@@ -101,6 +101,14 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError("corner turn speed ratio must be within [0, 1]")
     if not 0.0 <= cfg.path_memory.corner_reacquire_angle_rad <= cfg.path_memory.corner_turn_angle_rad:
         raise ValueError("corner reacquire angle must be within [0, turn angle]")
+    if cfg.path_memory.corner_capture_angle_scale <= 0.0:
+        raise ValueError("capture geometry angle scale must be positive")
+    if cfg.path_memory.corner_command_yaw_scale <= 0.0:
+        raise ValueError("corner command yaw scale must be positive")
+    if cfg.path_memory.corner_reacquire_max_e <= 0.0 or cfg.path_memory.corner_reacquire_max_theta <= 0.0:
+        raise ValueError("corner visual reacquire limits must be positive")
+    if not 0.0 <= cfg.path_memory.corner_visual_align_blend <= 1.0:
+        raise ValueError("corner visual alignment blend must be within [0, 1]")
     if cfg.path_memory.corner_image_angle_gain <= 0.0 or cfg.path_memory.corner_search_extra_rad < 0.0:
         raise ValueError("corner angle gain must be positive and extra search angle non-negative")
     if cfg.path_memory.corner_reacquire_confirm_frames <= 0 or cfg.path_memory.corner_handoff_blend_frames <= 0:
@@ -356,7 +364,12 @@ def run(args: argparse.Namespace) -> int:
             geometry_observation = None
             geometry_decision = None
             geometry_debug = None
-            if strategy_mode == "corner_event" and cfg.path_memory.capture_geometry_enabled:
+            geometry_active = corner_margin.state in {"armed", "approach"}
+            if (
+                strategy_mode == "corner_event"
+                and cfg.path_memory.capture_geometry_enabled
+                and geometry_active
+            ):
                 geometry_observation, geometry_debug = analyze_capture_geometry(frame, cfg)
                 geometry_decision = geometry_filter.update(geometry_observation)
 
@@ -369,13 +382,8 @@ def run(args: argparse.Namespace) -> int:
                     memory_status = PathStrategyStatus(True, "corner_event", corner_margin.state)
             command = sm.step(fit, now=now, obstacle=obstacle_decision.stop_required)
             if strategy_mode == "corner_event" and not obstacle_decision.stop_required:
-                approach_w = None
+                approach_w = command.w
                 if geometry_observation is not None:
-                    turn_sign = 1.0 if cfg.tracker.invert_turn else -1.0
-                    approach_w = turn_sign * (
-                        cfg.tracker.k_e * geometry_observation.incoming_e
-                        + cfg.tracker.k_theta * geometry_observation.incoming_theta
-                    )
                     limit = cfg.path_memory.corner_approach_max_w
                     approach_w = max(-limit, min(limit, approach_w))
                 delayed = corner_margin.step(
@@ -384,6 +392,11 @@ def run(args: argparse.Namespace) -> int:
                     geometry=geometry_observation,
                     geometry_decision=geometry_decision,
                     approach_w=approach_w,
+                    angular_scale=(
+                        cfg.path_memory.corner_command_yaw_scale
+                        if motion.source == "command_fallback"
+                        else 1.0
+                    ),
                 )
                 memory_status = delayed.status
                 if delayed.v != command.v or delayed.w != command.w:

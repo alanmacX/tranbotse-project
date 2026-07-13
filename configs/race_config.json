@@ -46,7 +46,7 @@
   "path_memory": {
     "enabled": true,
     "mode": "corner_event",
-    "camera_to_axle_m": 0.34,
+    "camera_to_axle_m": 0.355,
     "capture_geometry_enabled": true,
     "corner_gate_y_frac": 0.52,
     "corner_gate_confirm_frames": 2,
@@ -60,13 +60,18 @@
     "corner_hold_max_w": 0.0,
     "corner_replay_max_w": 0.2,
     "corner_turn_angle_rad": 1.57,
-    "corner_reacquire_angle_rad": 0.7,
+    "corner_capture_angle_scale": 0.7,
+    "corner_command_yaw_scale": 0.5,
+    "corner_reacquire_angle_rad": 0.35,
+    "corner_reacquire_max_e": 0.65,
+    "corner_reacquire_max_theta": 0.45,
+    "corner_visual_align_blend": 0.7,
     "corner_turn_speed_ratio": 0.45,
     "corner_image_angle_gain": 6.8,
     "corner_search_extra_rad": 0.4,
-    "corner_reacquire_confirm_frames": 3,
+    "corner_reacquire_confirm_frames": 2,
     "corner_handoff_blend_frames": 5,
-    "max_motion_dt_sec": 0.25
+    "max_motion_dt_sec": 1.0
   },
   "ground_projection": {
     "homography": [
