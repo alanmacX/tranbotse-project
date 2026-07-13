@@ -85,3 +85,10 @@ button.stop { border-color: var(--lost); color: var(--lost); }
 .c-e0 { color: var(--accent); } .c-theta { color: #d29922; } .c-conf { color: #3fb950; }
 
 @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+.strategy select { min-width: 180px; }
+.strategy .ctlRow label { width: 90px; }
+.strategyFields[hidden] { display: none; }
+.calib-controls { display: grid; grid-template-columns: 1fr auto auto auto; gap: 8px; margin-top: 10px; }
+.calibWrap { position: relative; margin-top: 10px; border: 1px solid #30363d; max-width: 100%; }
+.calibWrap img { display: block; width: 100%; }
+.calibWrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; }

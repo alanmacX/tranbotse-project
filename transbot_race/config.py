@@ -30,13 +30,32 @@ class OcclusionConfig:
 
 @dataclass(slots=True)
 class PathMemoryConfig:
-    """Distance-indexed delay between camera preview and the chassis axle."""
+    """Selectable camera-to-axle experiment strategy."""
 
     enabled: bool = True
+    mode: str = "corner_event"  # corner_event, ipm_axle, local_pursuit
     camera_to_axle_m: float = 0.10
-    max_queue_frames: int = 240
-    max_age_sec: float = 8.0
+    corner_confirm_frames: int = 2
+    corner_theta_threshold: float = 0.18
+    corner_e_threshold: float = 0.48
+    lookahead_m: float = 0.07
+    lateral_half_width_m: float = 0.20
+    path_max_points: int = 160
+    max_age_sec: float = 2.0
     max_motion_dt_sec: float = 0.25
+
+
+@dataclass(slots=True)
+class GroundProjectionConfig:
+    """Pixel-to-ground calibration shared by IPM and point projection."""
+
+    homography: tuple[float, ...] | None = None  # crop pixel -> (forward, left) metres
+    paper_width_m: float = 0.210
+    paper_length_m: float = 0.297
+    paper_near_m: float = 0.05
+    bird_width_px: int = 200
+    bird_height_px: int = 260
+    pixels_per_meter: float = 500.0
 
 @dataclass(slots=True)
 class ObstacleConfig:
@@ -167,5 +186,6 @@ class RaceConfig:
     vision: VisionConfig = field(default_factory=VisionConfig)
     occlusion: OcclusionConfig = field(default_factory=OcclusionConfig)
     path_memory: PathMemoryConfig = field(default_factory=PathMemoryConfig)
+    ground_projection: GroundProjectionConfig = field(default_factory=GroundProjectionConfig)
     obstacle: ObstacleConfig = field(default_factory=ObstacleConfig)
     tracker: TrackerConfig = field(default_factory=TrackerConfig)

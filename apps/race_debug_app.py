@@ -343,7 +343,7 @@ def _tuple_value(value: object, *, cast=int) -> tuple:
 def _deep_update_cfg(cfg: RaceConfig, data: dict) -> None:
     for section_name in (
         "camera", "vision", "occlusion",
-        "path_memory", "obstacle", "tracker",
+        "path_memory", "ground_projection", "obstacle", "tracker",
     ):
         section = getattr(cfg, section_name)
         values = data.get(section_name)
@@ -360,6 +360,8 @@ def _deep_update_cfg(cfg: RaceConfig, data: dict) -> None:
                     setattr(section, key, float(value))
                 elif isinstance(current, tuple):
                     setattr(section, key, _tuple_value(value))
+                elif current is None:
+                    setattr(section, key, None if value is None else _tuple_value(value, cast=float))
                 else:
                     setattr(section, key, str(value))
 
@@ -812,6 +814,12 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/live/stop":
                 _json_response(self, 200, self._stop_live(data))
                 return
+            if self.path == "/api/calibration/capture":
+                _json_response(self, 200, self._calibration_capture(data))
+                return
+            if self.path == "/api/calibration/compute":
+                _json_response(self, 200, self._calibration_compute(data))
+                return
             if self.path == "/api/mock":
                 message = _set_mock(bool(data.get("enabled", True)))
                 _json_response(self, 200, {"ok": True, "message": message})
@@ -856,6 +864,47 @@ class Handler(BaseHTTPRequestHandler):
             raise RuntimeError("failed to encode debug image")
         summary = command_summary(command, fit)
         return {"ok": True, "summary": summary, "image": base64.b64encode(buf).decode("ascii")}
+
+    def _calibration_capture(self, data: dict) -> dict:
+        ssh_target = _ssh_target(data)
+        stop_live_processes(ssh_target)
+        code = (
+            "import cv2\ncap=cv2.VideoCapture(0)\n"
+            "cap.set(cv2.CAP_PROP_FRAME_WIDTH,640)\ncap.set(cv2.CAP_PROP_FRAME_HEIGHT,480)\n"
+            "[cap.read() for _ in range(10)]\nok,frame=cap.read()\ncap.release()\n"
+            "assert ok\ncv2.imwrite('/tmp/transbot_ground_calibration.jpg',frame)\n"
+        )
+        local_path = Path("/tmp/transbot_ground_calibration.jpg")
+        if ssh_target in ("localhost", "127.0.0.1"):
+            subprocess.run([sys.executable, "-c", code], check=True)
+        else:
+            subprocess.run(["ssh", ssh_target, "python3", "-"], input=code, text=True, check=True)
+            subprocess.run(["scp", f"{ssh_target}:{local_path}", str(local_path)], check=True)
+        return {"ok": True, "image": base64.b64encode(local_path.read_bytes()).decode("ascii")}
+
+    def _calibration_compute(self, data: dict) -> dict:
+        import numpy as np
+
+        points = data.get("points")
+        if not isinstance(points, list) or len(points) != 4:
+            raise ValueError("需要依次点击矩形左下、左上、右上、右下四个点")
+        near = max(0.0, float(data.get("paper_near_m", CONFIG.ground_projection.paper_near_m)))
+        width = max(0.05, float(data.get("paper_width_m", CONFIG.ground_projection.paper_width_m)))
+        length = max(0.05, float(data.get("paper_length_m", CONFIG.ground_projection.paper_length_m)))
+        x0, y0, _x1, _y1 = CONFIG.camera.crop
+        crop_x0 = max(0, x0 - CONFIG.camera.expand_left_px)
+        crop_points = np.float32([[float(x) - crop_x0, float(y) - y0] for x, y in points])
+        ground_points = np.float32([
+            [near, width / 2.0], [near + length, width / 2.0],
+            [near + length, -width / 2.0], [near, -width / 2.0],
+        ])
+        matrix = cv.getPerspectiveTransform(crop_points, ground_points)
+        CONFIG.ground_projection.homography = tuple(float(value) for value in matrix.reshape(-1))
+        CONFIG.ground_projection.paper_near_m = near
+        CONFIG.ground_projection.paper_width_m = width
+        CONFIG.ground_projection.paper_length_m = length
+        _write_config_file()
+        return {"ok": True, "message": "矩形地面标定已保存", "homography": list(CONFIG.ground_projection.homography)}
 
     def _camera(self, data: dict) -> dict:
         ssh_target = _ssh_target(data)

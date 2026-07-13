@@ -10,6 +10,7 @@ from dataclasses import asdict, fields, is_dataclass, replace
 from pathlib import Path
 
 import cv2 as cv
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -17,8 +18,12 @@ sys.path.insert(0, str(ROOT))
 from transbot_race.config import RaceConfig  # noqa: E402
 from transbot_race.geometry import apply_occlusion, band_is_occluded  # noqa: E402
 from transbot_race.path_memory import (  # noqa: E402
-    DistanceDelayPathMemory,
-    PathMemoryStatus,
+    CornerEventMargin,
+    GroundProjector,
+    PathStrategyStatus,
+    RollingPathPursuit,
+    bird_path_to_ground,
+    path_pixels,
     read_motion_sample,
 )
 from transbot_race.obstacle import (  # noqa: E402
@@ -56,6 +61,8 @@ def update_dataclass(obj: object, values: dict) -> None:
             update_dataclass(current, value)
         elif isinstance(current, tuple):
             setattr(obj, key, coerce_tuple(value))
+        elif current is None and isinstance(value, list):
+            setattr(obj, key, coerce_tuple(value))
         else:
             setattr(obj, key, value)
 
@@ -85,8 +92,10 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError(f"crop x1 must be > x0, got {cfg.camera.crop}")
     if cfg.path_memory.camera_to_axle_m < 0.0:
         raise ValueError("camera-to-axle distance cannot be negative")
-    if cfg.path_memory.max_queue_frames <= 0:
-        raise ValueError("path_memory.max_queue_frames must be positive")
+    if cfg.path_memory.mode not in ("corner_event", "ipm_axle", "local_pursuit"):
+        raise ValueError(f"unsupported path-memory mode: {cfg.path_memory.mode}")
+    if cfg.path_memory.corner_confirm_frames <= 0 or cfg.path_memory.path_max_points <= 0:
+        raise ValueError("path-memory frame and point limits must be positive")
     if cfg.path_memory.max_age_sec <= 0.0 or cfg.path_memory.max_motion_dt_sec <= 0.0:
         raise ValueError("path-memory time limits must be positive")
 
@@ -190,6 +199,7 @@ class DebugRecorder:
     def record(
         self, summary: dict, frame, crop, mask, features, cfg: RaceConfig, crop_center: float,
         raw_crop=None, obstacle_decision=None, raw_track_center: float | None = None,
+        strategy_status: PathStrategyStatus | None = None,
     ) -> None:
         if not self.enabled or self.root is None:
             return
@@ -204,6 +214,23 @@ class DebugRecorder:
         stem = f"{self.frame_count:05d}_{int(elapsed * 1000):07d}"
         params = [int(cv.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
         overlay = draw_debug_overlay(crop, features, cfg.vision.trigger_y_frac, crop_center=crop_center)
+        if strategy_status is not None:
+            label = f"{strategy_status.mode}: {strategy_status.reason}"
+            if strategy_status.remaining_m > 0.0:
+                label += f" {strategy_status.remaining_m:.3f}m"
+            cv.rectangle(overlay, (0, 0), (min(overlay.shape[1], 300), 24), (0, 0, 0), -1)
+            cv.putText(overlay, label, (6, 17), cv.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1, cv.LINE_AA)
+            if strategy_status.target is not None and strategy_status.mode == "ipm_axle":
+                tx, ty = strategy_status.target
+                px = int(round(overlay.shape[1] / 2.0 - ty * cfg.ground_projection.pixels_per_meter))
+                py = int(round(overlay.shape[0] - 1.0 - (tx - cfg.path_memory.camera_to_axle_m) * cfg.ground_projection.pixels_per_meter))
+                cv.circle(overlay, (px, py), 6, (0, 0, 255), 2)
+            elif strategy_status.target is not None and strategy_status.mode == "local_pursuit" and cfg.ground_projection.homography:
+                tx, ty = strategy_status.target
+                ground = np.asarray([[[tx - cfg.path_memory.camera_to_axle_m, ty]]], dtype=np.float64)
+                inverse = np.linalg.inv(np.asarray(cfg.ground_projection.homography, dtype=np.float64).reshape(3, 3))
+                px, py = cv.perspectiveTransform(ground, inverse).reshape(2)
+                cv.circle(overlay, (int(round(px)), int(round(py))), 6, (0, 0, 255), 2)
 
         cv.imwrite(str(self.frames_dir / f"{stem}.jpg"), frame, params)
         cv.imwrite(str(self.crops_dir / f"{stem}.jpg"), crop, params)
@@ -246,7 +273,10 @@ def run(args: argparse.Namespace) -> int:
     cfg = load_config(Path(args.config))
     bot = make_bot(args.dry_run)
     sm = RaceStateMachine(cfg)
-    path_memory = DistanceDelayPathMemory(cfg.path_memory)
+    projector = GroundProjector(cfg.ground_projection)
+    corner_margin = CornerEventMargin(cfg.path_memory)
+    ipm_pursuit = RollingPathPursuit(cfg.path_memory, "ipm_axle")
+    local_pursuit = RollingPathPursuit(cfg.path_memory, "local_pursuit")
     obstacle_monitor = ObstacleMonitor(cfg.obstacle)
     cap = cv.VideoCapture(args.camera)
     cap.set(cv.CAP_PROP_FRAME_WIDTH, cfg.camera.frame_width)
@@ -276,6 +306,10 @@ def run(args: argparse.Namespace) -> int:
             crop, (x0, y0, x1, y1), track_center = crop_frame(frame, cfg)
             raw_crop = crop.copy()
             raw_track_center = track_center
+            strategy_mode = cfg.path_memory.mode if cfg.path_memory.enabled else "disabled"
+            if strategy_mode == "ipm_axle" and projector.active:
+                crop = projector.warp(raw_crop)
+                track_center = crop.shape[1] / 2.0
             crop_w = crop.shape[1]
             mask = preprocess_blackline(crop, cfg.vision)
             mask = apply_occlusion(mask, cfg.occlusion)
@@ -309,19 +343,31 @@ def run(args: argparse.Namespace) -> int:
             obstacle_decision = obstacle_monitor.update(raw_crop, raw_track_center, obstacle_armed)
 
             fit = visual_fit
-            memory_status = PathMemoryStatus(False, "disabled")
+            memory_status = PathStrategyStatus(False, strategy_mode, "disabled")
             if cfg.path_memory.enabled:
                 accepted_fit = visual_fit
                 if obstacle_decision.state not in (ObstacleState.CLEAR, ObstacleState.DISARMED):
                     accepted_fit = replace(visual_fit, found=False, conf=0.0)
-                buffered_fit, memory_status = path_memory.step(
-                    accepted_fit,
-                    near_e0=features.err_norm,
-                    now=now,
-                    linear_velocity=motion.linear,
-                )
-                if buffered_fit is not None:
-                    fit = buffered_fit
+                if strategy_mode == "corner_event":
+                    fit, memory_status = corner_margin.step(accepted_fit, features, now, motion.linear)
+                elif strategy_mode == "ipm_axle":
+                    if projector.active:
+                        points = bird_path_to_ground(
+                            features, crop.shape[1], crop.shape[0],
+                            cfg.ground_projection.pixels_per_meter,
+                            cfg.path_memory.camera_to_axle_m,
+                        )
+                        fit, memory_status = ipm_pursuit.step(points, accepted_fit, now, motion.linear, motion.angular)
+                    else:
+                        memory_status = PathStrategyStatus(False, strategy_mode, "calibration_required")
+                elif strategy_mode == "local_pursuit":
+                    if projector.active:
+                        points = projector.project(path_pixels(features))
+                        if len(points):
+                            points[:, 0] += cfg.path_memory.camera_to_axle_m
+                        fit, memory_status = local_pursuit.step(points, accepted_fit, now, motion.linear, motion.angular)
+                    else:
+                        memory_status = PathStrategyStatus(False, strategy_mode, "calibration_required")
             command = sm.step(fit, now=now, obstacle=obstacle_decision.stop_required)
             if obstacle_decision.slow_required and command.v > 0.0:
                 command = replace(
@@ -338,11 +384,13 @@ def run(args: argparse.Namespace) -> int:
             summary["motion_v"] = round(motion.linear, 4)
             summary["motion_w"] = round(motion.angular, 4)
             summary["motion_source"] = motion.source
-            summary["path_memory_active"] = memory_status.active
-            summary["path_memory_reason"] = memory_status.reason
-            summary["path_memory_released_age"] = round(memory_status.released_age_sec, 3)
-            summary["path_memory_queue"] = memory_status.queue_count
-            summary["path_memory_remaining_m"] = round(memory_status.remaining_m, 4)
+            summary["path_strategy"] = memory_status.mode
+            summary["path_strategy_active"] = memory_status.active
+            summary["path_strategy_reason"] = memory_status.reason
+            summary["path_strategy_remaining_m"] = round(memory_status.remaining_m, 4)
+            summary["path_strategy_intent_dir"] = memory_status.intent_dir
+            summary["path_strategy_points"] = memory_status.point_count
+            summary["path_strategy_target"] = memory_status.target
             summary["camera_to_axle_m"] = round(cfg.path_memory.camera_to_axle_m, 4)
             summary["obstacle_state"] = obstacle_decision.state.value
             summary["obstacle_conf"] = round(obstacle_decision.confidence, 3)
@@ -355,6 +403,7 @@ def run(args: argparse.Namespace) -> int:
                 raw_crop=raw_crop,
                 obstacle_decision=obstacle_decision,
                 raw_track_center=raw_track_center,
+                strategy_status=memory_status,
             )
             if now - last_log >= args.log_period:
                 print(json.dumps(summary, ensure_ascii=False))

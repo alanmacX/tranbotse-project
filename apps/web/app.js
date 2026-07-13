@@ -35,6 +35,14 @@ function render(s) {
   el("stateLight").className = "light " + state;
   el("stateName").textContent = state;
   el("modeName").textContent = s.mode || "--";
+  if (s.path_strategy) {
+    el("strategyStatus").textContent = [
+      s.path_strategy,
+      s.path_strategy_reason,
+      s.path_strategy_remaining_m != null ? Number(s.path_strategy_remaining_m).toFixed(3) + " m" : "",
+      s.path_strategy_points ? s.path_strategy_points + " pts" : "",
+    ].filter(Boolean).join(" · ");
+  }
 
   const set = (id, v, digits = 3) => (el("val_" + id).textContent = Number(v || 0).toFixed(digits));
   set("e0", s.e0); set("theta", s.theta); set("kappa", s.kappa);
@@ -132,6 +140,88 @@ el("mockBtn").addEventListener("click", toggleMock);
 el("video").src = "/video?ts=" + Date.now();
 loadCropBox();
 connect();
+
+// -- Margin strategy -----------------------------------------------------
+const strategyMode = el("strategyMode");
+let calibrationPoints = [];
+
+function showStrategyFields() {
+  document.querySelectorAll(".strategyFields").forEach((node) => {
+    node.hidden = !node.dataset.modes.split(",").includes(strategyMode.value);
+  });
+}
+
+async function loadStrategy() {
+  const cfg = await (await fetch("/api/config")).json();
+  strategyMode.value = cfg.path_memory.mode;
+  el("strategyMargin").value = cfg.path_memory.camera_to_axle_m;
+  el("cornerConfirm").value = cfg.path_memory.corner_confirm_frames;
+  el("cornerTheta").value = cfg.path_memory.corner_theta_threshold;
+  el("strategyLookahead").value = cfg.path_memory.lookahead_m;
+  el("paperNearM").value = cfg.ground_projection.paper_near_m;
+  showStrategyFields();
+}
+
+strategyMode.addEventListener("change", showStrategyFields);
+el("strategySaveBtn").addEventListener("click", () => guard("STRATEGY", async () => {
+  await post("/api/defaults/save", {
+    path_memory: {
+      enabled: true,
+      mode: strategyMode.value,
+      camera_to_axle_m: Number(el("strategyMargin").value),
+      corner_confirm_frames: Number(el("cornerConfirm").value),
+      corner_theta_threshold: Number(el("cornerTheta").value),
+      lookahead_m: Number(el("strategyLookahead").value),
+    },
+  });
+  return { message: "selected " + strategyMode.value };
+}));
+
+const calibImage = el("calibImage"), calibCanvas = el("calibCanvas");
+const calibCtx = calibCanvas.getContext("2d");
+function drawCalibration() {
+  calibCtx.clearRect(0, 0, calibCanvas.width, calibCanvas.height);
+  calibCtx.fillStyle = "#f85149";
+  calibCtx.strokeStyle = "#f0b429";
+  calibCtx.lineWidth = 2;
+  calibrationPoints.forEach((point, index) => {
+    calibCtx.beginPath(); calibCtx.arc(point.cx, point.cy, 5, 0, Math.PI * 2); calibCtx.fill();
+    calibCtx.fillText(String(index + 1), point.cx + 7, point.cy - 7);
+    if (index) {
+      const previous = calibrationPoints[index - 1];
+      calibCtx.beginPath(); calibCtx.moveTo(previous.cx, previous.cy); calibCtx.lineTo(point.cx, point.cy); calibCtx.stroke();
+    }
+  });
+}
+function sizeCalibration() {
+  calibCanvas.width = calibImage.clientWidth;
+  calibCanvas.height = calibImage.clientHeight;
+  drawCalibration();
+}
+calibCanvas.addEventListener("click", (event) => {
+  if (!calibImage.naturalWidth || calibrationPoints.length >= 4) return;
+  const rect = calibCanvas.getBoundingClientRect();
+  const cx = event.clientX - rect.left, cy = event.clientY - rect.top;
+  calibrationPoints.push({cx, cy, x: cx * calibImage.naturalWidth / rect.width, y: cy * calibImage.naturalHeight / rect.height});
+  drawCalibration();
+});
+el("calibCaptureBtn").addEventListener("click", () => guard("CAPTURE", async () => {
+  const data = await post("/api/calibration/capture", {ssh_target: sshTarget()});
+  calibrationPoints = [];
+  calibImage.src = "data:image/jpeg;base64," + data.image;
+  calibImage.onload = sizeCalibration;
+  return {message: "click BL, TL, TR, BR"};
+}));
+el("calibResetBtn").addEventListener("click", () => { calibrationPoints = []; drawCalibration(); });
+el("calibSaveBtn").addEventListener("click", () => guard("CALIBRATION", async () => {
+  if (calibrationPoints.length !== 4) throw new Error("click exactly four rectangle corners");
+  return post("/api/calibration/compute", {
+    points: calibrationPoints.map((point) => [point.x, point.y]),
+    paper_near_m: Number(el("paperNearM").value),
+  });
+}));
+window.addEventListener("resize", sizeCalibration);
+loadStrategy();
 
 // -- Run controls ---------------------------------------------------------
 const sshTarget = () => el("ssh").value.trim() || "yahboom";

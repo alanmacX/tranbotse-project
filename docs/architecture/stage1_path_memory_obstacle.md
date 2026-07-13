@@ -1,39 +1,39 @@
-# Stage 1: Distance-Delayed Steering and Obstacle Stop
+# Stage 1: Margin Strategy Experiments and Obstacle Stop
 
-## Camera-to-axle margin
+The debug dashboard exposes three mutually exclusive margin strategies. The
+selected mode and all parameters are copied into every debug capture.
 
-The vision pipeline works directly on the configured camera crop. Each valid
-`TrajectoryFit` is queued with this remaining travel distance:
+## Corner event
+
+`corner_event` keeps the original raw-crop tracker. A unilateral branch,
+preview, or confirmed heading/lateral signal latches a turn direction. The
+controller holds the pre-corner lateral baseline until forward travel reaches
+`camera_to_axle_m`, then immediately returns to the current visual fit. It never
+queues an old `TrajectoryFit`. Simultaneous left and right branches are treated
+as an undecided junction and do not latch a direction.
+
+## IPM axle path
+
+`ipm_axle` uses the rectangle calibration to warp the crop into a metric bird
+view. The selected centerline is converted to axle-frame points, advanced with
+linear/angular motion, and tracked with a metric lookahead target.
+
+## Local path pursuit
+
+`local_pursuit` leaves the crop, mask, and visual extraction unchanged. Only
+the selected centerline points are projected through the rectangle calibration
+to local ground coordinates. A rolling path is re-expressed in the current
+robot frame with odometry and supplies a pure-pursuit target.
+
+Both metric modes require four rectangle clicks in this order: bottom-left,
+top-left, top-right, bottom-right. Calibration maps crop pixels directly to
+ground `(forward, left)` metres. IPM warps the image; local pursuit does not.
+
+## Obstacle priority
+
+Obstacle detection always uses the raw crop and remains independent of the
+selected margin strategy:
 
 ```text
-camera_to_axle_m
+obstacle STOP > obstacle slowdown > selected margin strategy > visual tracker
 ```
-
-Commanded or measured forward velocity integrates travelled distance. The
-queued heading, lookahead error, and curvature are released only after that
-distance reaches zero. Increasing the value delays the turn; decreasing it
-advances the turn.
-
-Near-field lateral error remains live while the queue fills, so the chassis can
-still correct its position on a straight line. This method needs no ground-plane
-transform, paper calibration, or separate corner state.
-
-Telemetry exposes `path_memory_reason`, `path_memory_queue`, and
-`path_memory_remaining_m`. A normal startup reports `filling`, then
-`distance_delay` after the first fit reaches the axle.
-
-## Obstacle monitor
-
-Obstacle detection uses the raw crop, independently of the black-line mask. It
-combines chroma, dark-object, neutral horizontal-edge, and line-occlusion cues
-inside the predicted straight corridor.
-
-The detector is armed only after stable straight tracking. A first candidate is
-`SUSPECT`; repeated confirmation is required for slowdown or stop. Command
-priority is:
-
-```text
-obstacle STOP > obstacle slowdown > distance-delayed steering > visual fit
-```
-
-Stage 1 stops for a confirmed near obstacle and does not attempt a go-around.
