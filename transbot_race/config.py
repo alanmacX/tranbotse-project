@@ -33,16 +33,10 @@ class PathMemoryConfig:
     """Distance-indexed delay between camera preview and the chassis axle."""
 
     enabled: bool = True
-    camera_to_axle_physical_m: float = 0.10
-    tracking_offset_m: float = 0.0
+    camera_to_axle_m: float = 0.10
     max_queue_frames: int = 240
     max_age_sec: float = 8.0
     max_motion_dt_sec: float = 0.25
-
-    @property
-    def effective_camera_to_axle_m(self) -> float:
-        return self.camera_to_axle_physical_m + self.tracking_offset_m
-
 
 @dataclass(slots=True)
 class ObstacleConfig:

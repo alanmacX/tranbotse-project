@@ -9,14 +9,11 @@ class DebugConfigTests(unittest.TestCase):
         cfg = RaceConfig()
         _deep_update_cfg(cfg, {
             "path_memory": {
-                "camera_to_axle_physical_m": 0.135,
-                "tracking_offset_m": -0.015,
+                "camera_to_axle_m": 0.12,
                 "max_queue_frames": 64,
             }
         })
-        self.assertAlmostEqual(cfg.path_memory.camera_to_axle_physical_m, 0.135)
-        self.assertAlmostEqual(cfg.path_memory.tracking_offset_m, -0.015)
-        self.assertAlmostEqual(cfg.path_memory.effective_camera_to_axle_m, 0.12)
+        self.assertAlmostEqual(cfg.path_memory.camera_to_axle_m, 0.12)
         self.assertEqual(cfg.path_memory.max_queue_frames, 64)
 
     def test_nested_occlusion_rects_stay_nested(self):

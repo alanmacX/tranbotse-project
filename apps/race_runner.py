@@ -83,8 +83,8 @@ def _validate_config(cfg: RaceConfig) -> None:
         )
     if x1 <= x0:
         raise ValueError(f"crop x1 must be > x0, got {cfg.camera.crop}")
-    if cfg.path_memory.effective_camera_to_axle_m < 0.0:
-        raise ValueError("effective camera-to-axle distance cannot be negative")
+    if cfg.path_memory.camera_to_axle_m < 0.0:
+        raise ValueError("camera-to-axle distance cannot be negative")
     if cfg.path_memory.max_queue_frames <= 0:
         raise ValueError("path_memory.max_queue_frames must be positive")
     if cfg.path_memory.max_age_sec <= 0.0 or cfg.path_memory.max_motion_dt_sec <= 0.0:
@@ -343,7 +343,7 @@ def run(args: argparse.Namespace) -> int:
             summary["path_memory_released_age"] = round(memory_status.released_age_sec, 3)
             summary["path_memory_queue"] = memory_status.queue_count
             summary["path_memory_remaining_m"] = round(memory_status.remaining_m, 4)
-            summary["camera_to_axle_effective_m"] = round(cfg.path_memory.effective_camera_to_axle_m, 4)
+            summary["camera_to_axle_m"] = round(cfg.path_memory.camera_to_axle_m, 4)
             summary["obstacle_state"] = obstacle_decision.state.value
             summary["obstacle_conf"] = round(obstacle_decision.confidence, 3)
             summary["obstacle_armed"] = obstacle_armed

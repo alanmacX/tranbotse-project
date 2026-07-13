@@ -88,7 +88,7 @@ class DistanceDelayPathMemory:
             self._queue.append(_QueuedFit(
                 fit=visual_fit,
                 captured_at=now,
-                remaining_m=max(0.0, self.cfg.effective_camera_to_axle_m),
+                remaining_m=max(0.0, self.cfg.camera_to_axle_m),
             ))
             while len(self._queue) > max(1, self.cfg.max_queue_frames):
                 self._queue.popleft()

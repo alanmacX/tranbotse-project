@@ -6,13 +6,13 @@ The vision pipeline works directly on the configured camera crop. Each valid
 `TrajectoryFit` is queued with this remaining travel distance:
 
 ```text
-camera_to_axle_physical_m + tracking_offset_m
+camera_to_axle_m
 ```
 
 Commanded or measured forward velocity integrates travelled distance. The
 queued heading, lookahead error, and curvature are released only after that
-distance reaches zero. Increasing either distance delays the turn; decreasing
-it advances the turn.
+distance reaches zero. Increasing the value delays the turn; decreasing it
+advances the turn.
 
 Near-field lateral error remains live while the queue fills, so the chassis can
 still correct its position on a straight line. This method needs no ground-plane

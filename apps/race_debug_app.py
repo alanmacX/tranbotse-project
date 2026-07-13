@@ -263,10 +263,9 @@ HTML = """
       </section>
       <section>
         <h2>车轴路径缓存</h2>
-        <div class="row"><label>物理轴距</label><input id="path_memory.camera_to_axle_physical_m" type="range" min="0.00" max="0.25" step="0.005"><input id="path_memory.camera_to_axle_physical_mn" type="number" step="0.005"></div>
-        <div class="row"><label>现场微调</label><input id="path_memory.tracking_offset_m" type="range" min="-0.05" max="0.05" step="0.005"><input id="path_memory.tracking_offset_mn" type="number" step="0.005"></div>
+        <div class="row"><label>延迟距离</label><input id="path_memory.camera_to_axle_m" type="range" min="0.00" max="0.25" step="0.005"><input id="path_memory.camera_to_axle_mn" type="number" step="0.005"></div>
         <button onclick="saveConfig()">应用</button>
-        <p class="hint">按实际行驶距离延迟转弯信号。轴距或微调增大时转弯更晚，减小时更早。</p>
+        <p class="hint">按实际行驶距离延迟转弯信号。数值增大时转弯更晚，减小时更早。</p>
       </section>
       <section>
         <h2>Crop / 视野</h2>
@@ -289,7 +288,7 @@ HTML = """
     </aside>
   </main>
   <script>
-    const ids = ["tracker.v_max","tracker.k_e","tracker.k_theta","tracker.k_ff","tracker.max_w","tracker.e_pivot","tracker.theta_pivot","tracker.w_pivot","tracker.v_pivot_ratio","tracker.conf_decay","tracker.e_bias","path_memory.camera_to_axle_physical_m","path_memory.tracking_offset_m","vision.trigger_y_frac","vision.min_run_width_px","vision.min_run_area_px","camera.crop.0","camera.crop.1","camera.crop.2","camera.crop.3","ui.cam1","ui.cam2","ui.j1","ui.j2","ui.j3","ui.arm_ms","live_max_sec"];
+    const ids = ["tracker.v_max","tracker.k_e","tracker.k_theta","tracker.k_ff","tracker.max_w","tracker.e_pivot","tracker.theta_pivot","tracker.w_pivot","tracker.v_pivot_ratio","tracker.conf_decay","tracker.e_bias","path_memory.camera_to_axle_m","vision.trigger_y_frac","vision.min_run_width_px","vision.min_run_area_px","camera.crop.0","camera.crop.1","camera.crop.2","camera.crop.3","ui.cam1","ui.cam2","ui.j1","ui.j2","ui.j3","ui.arm_ms","live_max_sec"];
     function log(msg){ const el=document.getElementById("log"); el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}\\n` + el.textContent; }
     function bind(id){ const r=document.getElementById(id), n=document.getElementById(id+"n"); if(!r||!n)return; const sync=(from)=>{ if(from===r)n.value=r.value; else r.value=n.value; if(id.startsWith("camera.crop")) updateCropBox(); }; r.addEventListener("input",()=>sync(r)); n.addEventListener("input",()=>sync(n)); }
     ids.forEach(bind);

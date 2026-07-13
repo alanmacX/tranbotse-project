@@ -44,8 +44,7 @@
   },
   "path_memory": {
     "enabled": true,
-    "camera_to_axle_physical_m": 0.1,
-    "tracking_offset_m": 0.0,
+    "camera_to_axle_m": 0.1,
     "max_queue_frames": 240,
     "max_age_sec": 8.0,
     "max_motion_dt_sec": 0.25

@@ -38,7 +38,7 @@ def advance(memory, distance, *, start=0.0, speed=0.1, step=0.2):
 
 class PathMemoryTests(unittest.TestCase):
     def test_turn_is_released_after_travelled_camera_offset(self):
-        memory = DistanceDelayPathMemory(PathMemoryConfig(camera_to_axle_physical_m=0.10))
+        memory = DistanceDelayPathMemory(PathMemoryConfig(camera_to_axle_m=0.10))
         initial, status = memory.step(turn_fit(), near_e0=0.08, now=0.0, linear_velocity=0.0)
         self.assertEqual(status.reason, "filling")
         self.assertFalse(initial.path_memory)
@@ -53,8 +53,8 @@ class PathMemoryTests(unittest.TestCase):
         self.assertAlmostEqual(released.theta, 0.6)
 
     def test_larger_offset_releases_later(self):
-        close = DistanceDelayPathMemory(PathMemoryConfig(camera_to_axle_physical_m=0.05))
-        far = DistanceDelayPathMemory(PathMemoryConfig(camera_to_axle_physical_m=0.15))
+        close = DistanceDelayPathMemory(PathMemoryConfig(camera_to_axle_m=0.05))
+        far = DistanceDelayPathMemory(PathMemoryConfig(camera_to_axle_m=0.15))
         close.step(turn_fit(), near_e0=0.0, now=0.0, linear_velocity=0.0)
         far.step(turn_fit(), near_e0=0.0, now=0.0, linear_velocity=0.0)
         close_fit, _, _ = advance(close, 0.06)
@@ -64,7 +64,7 @@ class PathMemoryTests(unittest.TestCase):
         self.assertGreater(far_status.remaining_m, 0.08)
 
     def test_live_near_error_is_not_delayed(self):
-        memory = DistanceDelayPathMemory(PathMemoryConfig(camera_to_axle_physical_m=0.2))
+        memory = DistanceDelayPathMemory(PathMemoryConfig(camera_to_axle_m=0.2))
         fit, _ = memory.step(turn_fit(), near_e0=-0.17, now=0.0, linear_velocity=0.0)
         self.assertAlmostEqual(fit.e0, -0.17)
         self.assertEqual(fit.theta, 0.0)
