@@ -38,16 +38,6 @@
     "preview_min_dx_ratio": 0.16,
     "preview_corridor_width_ratio": 1.8
   },
-  "perspective": {
-    "enabled": false,
-    "undistort": false,
-    "camera_matrix": null,
-    "dist_coeffs": null,
-    "homography": null,
-    "output_width": 160,
-    "output_height": 240,
-    "px_per_cm": 4.0
-  },
   "occlusion": {
     "enabled": false,
     "rects": []
@@ -56,13 +46,8 @@
     "enabled": true,
     "camera_to_axle_physical_m": 0.1,
     "tracking_offset_m": 0.0,
-    "lookahead_m": 0.07,
-    "heading_lookahead_m": 0.04,
-    "max_age_sec": 1.2,
-    "max_horizon_m": 0.8,
-    "behind_tolerance_m": 0.04,
-    "sample_spacing_m": 0.01,
-    "max_snapshots": 12,
+    "max_queue_frames": 240,
+    "max_age_sec": 8.0,
     "max_motion_dt_sec": 0.25
   },
   "obstacle": {

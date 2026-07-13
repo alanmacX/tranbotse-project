@@ -3,12 +3,8 @@ import unittest
 import cv2 as cv
 import numpy as np
 
-from transbot_race.config import OcclusionConfig, PerspectiveConfig, RaceConfig
-from transbot_race.geometry import (
-    PerspectiveTransformer,
-    apply_occlusion,
-    band_is_occluded,
-)
+from transbot_race.config import OcclusionConfig, RaceConfig
+from transbot_race.geometry import apply_occlusion, band_is_occluded
 from transbot_race.vision import fit_line_trajectory, scan_line_features
 
 
@@ -54,23 +50,6 @@ class OcclusionTests(unittest.TestCase):
         )
         self.assertTrue(clean.found)
         self.assertLess(abs(clean.e0), 0.2)
-
-
-class PerspectiveTests(unittest.TestCase):
-    def test_disabled_is_passthrough(self):
-        pt = PerspectiveTransformer(PerspectiveConfig(enabled=False))
-        self.assertFalse(pt.active)
-        crop = straight()
-        self.assertTrue(np.array_equal(pt.to_birdseye(crop), crop))
-
-    def test_identity_homography_active(self):
-        h = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
-        pt = PerspectiveTransformer(
-            PerspectiveConfig(enabled=True, homography=h, output_width=W, output_height=H)
-        )
-        self.assertTrue(pt.active)
-        out = pt.to_birdseye(straight())
-        self.assertEqual(out.shape[:2], (H, W))
 
 
 if __name__ == "__main__":

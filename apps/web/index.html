@@ -52,24 +52,6 @@
         amber box shows the configured crop.</p>
     </section>
 
-    <section class="panel calibration">
-      <h2>IPM Calibration</h2>
-      <div class="ctlRow">
-        <label>纸张近边 cm</label>
-        <input id="paperNearCm" type="number" min="0" max="25" step="0.5" value="5" />
-      </div>
-      <div class="calib-controls">
-        <button id="calibCaptureBtn">Capture</button>
-        <button id="calibResetBtn">Reset points</button>
-        <button id="calibSaveBtn">Calibrate & save</button>
-      </div>
-      <div class="calibWrap" style="position: relative; display: inline-block; margin-top: 10px;">
-        <img id="calibImage" alt="Calibration Snapshot" style="max-width: 100%; display: block;" />
-        <canvas id="calibCanvas" style="position: absolute; top: 0; left: 0; cursor: crosshair;"></canvas>
-      </div>
-      <p class="hint">测量相机垂直投影点到 A4 纸近边的地面距离，再依次点击：左下、左上、右上、右下。</p>
-    </section>
-
     <section class="panel state">
       <h2>Controller</h2>
       <div class="stateRow">

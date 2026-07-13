@@ -265,9 +265,8 @@ HTML = """
         <h2>车轴路径缓存</h2>
         <div class="row"><label>物理轴距</label><input id="path_memory.camera_to_axle_physical_m" type="range" min="0.00" max="0.25" step="0.005"><input id="path_memory.camera_to_axle_physical_mn" type="number" step="0.005"></div>
         <div class="row"><label>现场微调</label><input id="path_memory.tracking_offset_m" type="range" min="-0.05" max="0.05" step="0.005"><input id="path_memory.tracking_offset_mn" type="number" step="0.005"></div>
-        <div class="row"><label>前视距离</label><input id="path_memory.lookahead_m" type="range" min="0.02" max="0.20" step="0.005"><input id="path_memory.lookahead_mn" type="number" step="0.005"></div>
         <button onclick="saveConfig()">应用</button>
-        <p class="hint">仅在 IPM 已标定时生效。轴距或微调增大时转弯更晚，减小时更早。</p>
+        <p class="hint">按实际行驶距离延迟转弯信号。轴距或微调增大时转弯更晚，减小时更早。</p>
       </section>
       <section>
         <h2>Crop / 视野</h2>
@@ -290,7 +289,7 @@ HTML = """
     </aside>
   </main>
   <script>
-    const ids = ["tracker.v_max","tracker.k_e","tracker.k_theta","tracker.k_ff","tracker.max_w","tracker.e_pivot","tracker.theta_pivot","tracker.w_pivot","tracker.v_pivot_ratio","tracker.conf_decay","tracker.e_bias","path_memory.camera_to_axle_physical_m","path_memory.tracking_offset_m","path_memory.lookahead_m","vision.trigger_y_frac","vision.min_run_width_px","vision.min_run_area_px","camera.crop.0","camera.crop.1","camera.crop.2","camera.crop.3","ui.cam1","ui.cam2","ui.j1","ui.j2","ui.j3","ui.arm_ms","live_max_sec"];
+    const ids = ["tracker.v_max","tracker.k_e","tracker.k_theta","tracker.k_ff","tracker.max_w","tracker.e_pivot","tracker.theta_pivot","tracker.w_pivot","tracker.v_pivot_ratio","tracker.conf_decay","tracker.e_bias","path_memory.camera_to_axle_physical_m","path_memory.tracking_offset_m","vision.trigger_y_frac","vision.min_run_width_px","vision.min_run_area_px","camera.crop.0","camera.crop.1","camera.crop.2","camera.crop.3","ui.cam1","ui.cam2","ui.j1","ui.j2","ui.j3","ui.arm_ms","live_max_sec"];
     function log(msg){ const el=document.getElementById("log"); el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}\\n` + el.textContent; }
     function bind(id){ const r=document.getElementById(id), n=document.getElementById(id+"n"); if(!r||!n)return; const sync=(from)=>{ if(from===r)n.value=r.value; else r.value=n.value; if(id.startsWith("camera.crop")) updateCropBox(); }; r.addEventListener("input",()=>sync(r)); n.addEventListener("input",()=>sync(n)); }
     ids.forEach(bind);
@@ -344,7 +343,7 @@ def _tuple_value(value: object, *, cast=int) -> tuple:
 
 def _deep_update_cfg(cfg: RaceConfig, data: dict) -> None:
     for section_name in (
-        "camera", "vision", "perspective", "occlusion",
+        "camera", "vision", "occlusion",
         "path_memory", "obstacle", "tracker",
     ):
         section = getattr(cfg, section_name)
@@ -362,11 +361,6 @@ def _deep_update_cfg(cfg: RaceConfig, data: dict) -> None:
                     setattr(section, key, float(value))
                 elif isinstance(current, tuple):
                     setattr(section, key, _tuple_value(value))
-                elif current is None:
-                    if value is None:
-                        setattr(section, key, None)
-                    elif key in ("camera_matrix", "dist_coeffs", "homography"):
-                        setattr(section, key, _tuple_value(value, cast=float))
                 else:
                     setattr(section, key, str(value))
 
@@ -819,12 +813,6 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/live/stop":
                 _json_response(self, 200, self._stop_live(data))
                 return
-            if self.path == "/api/calibration/capture":
-                _json_response(self, 200, self._calibration_capture(data))
-                return
-            if self.path == "/api/calibration/compute":
-                _json_response(self, 200, self._calibration_compute(data))
-                return
             if self.path == "/api/mock":
                 message = _set_mock(bool(data.get("enabled", True)))
                 _json_response(self, 200, {"ok": True, "message": message})
@@ -869,88 +857,6 @@ class Handler(BaseHTTPRequestHandler):
             raise RuntimeError("failed to encode debug image")
         summary = command_summary(command, fit)
         return {"ok": True, "summary": summary, "image": base64.b64encode(buf).decode("ascii")}
-
-    def _calibration_capture(self, data: dict) -> dict:
-        ssh_target = _ssh_target(data)
-        stop_live_processes(ssh_target)
-        time.sleep(1.0)
-
-        py_cmd = (
-            "import cv2\\n"
-            "cap=cv2.VideoCapture(0)\\n"
-            "cap.set(cv.CAP_PROP_FRAME_WIDTH, 640)\\n"
-            "cap.set(cv.CAP_PROP_FRAME_HEIGHT, 480)\\n"
-            "for _ in range(10): cap.read()\\n"
-            "ret, frame = cap.read()\\n"
-            "cap.release()\\n"
-            "if ret: cv2.imwrite('/tmp/calib.jpg', frame)\\n"
-        )
-
-        if ssh_target == "localhost" or ssh_target == "127.0.0.1":
-            subprocess.run(["python3", "-c", py_cmd.replace("\\n", "\n")], check=True)
-            img_path = "/tmp/calib.jpg"
-        else:
-            subprocess.run(["ssh", ssh_target, f"python3 -c \"{py_cmd}\""], check=True)
-            subprocess.run(["scp", f"{ssh_target}:/tmp/calib.jpg", "/tmp/calib_local.jpg"], check=True)
-            img_path = "/tmp/calib_local.jpg"
-
-        with open(img_path, "rb") as f:
-            buf = f.read()
-
-        return {"ok": True, "image": base64.b64encode(buf).decode("ascii")}
-
-    def _calibration_compute(self, data: dict) -> dict:
-        pts = data.get("points")
-        if not pts or len(pts) != 4:
-            raise ValueError("Exactly 4 points are required (BL, TL, TR, BR)")
-        paper_near_cm = max(0.0, min(25.0, float(data.get("paper_near_cm", 5.0))))
-
-        import numpy as np
-        # Raw coords from canvas might be offset, but assuming they are relative to the 640x480 frame.
-        # Wait, the pipeline crops the image first! We need to adjust coordinates to be relative to the crop
-        # or apply the homography on the crop. The PerspectiveTransformer works on the CROP.
-        # So we MUST calculate the homography mapping crop_pts -> dst_pts.
-
-        # User clicks on the full 640x480 image. We must subtract crop offsets!
-        x0, y0, x1, y1 = CONFIG.camera.crop
-        ex_l = CONFIG.camera.expand_left_px
-        ex_r = CONFIG.camera.expand_right_px
-        crop_x0 = max(0, x0 - ex_l)
-        crop_y0 = y0
-
-        src_pts = []
-        for p in pts:
-            src_pts.append([p[0] - crop_x0, p[1] - crop_y0])
-
-        src_pts = np.float32(src_pts)
-
-        PX_PER_CM = float(CONFIG.perspective.px_per_cm)
-        DST_W = int(21.0 * PX_PER_CM)
-        DST_H = int(29.7 * PX_PER_CM)
-        OUT_W = int(CONFIG.perspective.output_width)
-        OUT_H = int(CONFIG.perspective.output_height)
-        OFFSET_X = (OUT_W - DST_W) // 2
-        OFFSET_Y = OUT_H - DST_H - int(round(paper_near_cm * PX_PER_CM))
-        if OFFSET_Y < 0:
-            raise ValueError("纸张近边距离超出当前 BEV 纵向范围")
-
-        dst_pts = np.float32([
-            [OFFSET_X, OFFSET_Y + DST_H],
-            [OFFSET_X, OFFSET_Y],
-            [OFFSET_X + DST_W, OFFSET_Y],
-            [OFFSET_X + DST_W, OFFSET_Y + DST_H]
-        ])
-
-        homography = cv.getPerspectiveTransform(src_pts, dst_pts)
-
-        CONFIG.perspective.enabled = True
-        CONFIG.perspective.homography = homography.flatten().tolist()
-        CONFIG.perspective.output_width = OUT_W
-        CONFIG.perspective.output_height = OUT_H
-
-        _write_config_file()
-        _log_event("CONFIG: perspective calibration updated and enabled")
-        return {"ok": True, "message": f"透视矩阵已保存；纸张近边={paper_near_cm:.1f}cm"}
 
     def _camera(self, data: dict) -> dict:
         ssh_target = _ssh_target(data)

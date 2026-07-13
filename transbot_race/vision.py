@@ -700,7 +700,7 @@ class TrajectoryFit:
     preview_e: float = 0.0
     preview_theta: float = 0.0
     preview_conf: float = 0.0
-    path_memory: bool = False  # fit is referenced to the axle-frame path buffer
+    path_memory: bool = False  # preview steering was released by distance delay
 
 
 def _band_confidence(run: Run, band_height: float, line_width: float, cfg: VisionConfig) -> float:

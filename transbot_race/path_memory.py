@@ -1,13 +1,11 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import math
-from typing import Iterable
-
-import numpy as np
 
 from .config import PathMemoryConfig
-from .vision import PathPoint, TrajectoryFit
+from .vision import TrajectoryFit
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,20 +19,20 @@ class MotionSample:
 class PathMemoryStatus:
     active: bool
     reason: str
-    snapshot_age_sec: float = 0.0
-    snapshot_count: int = 0
-    point_count: int = 0
+    queue_count: int = 0
+    remaining_m: float = 0.0
+    released_age_sec: float = 0.0
 
 
 @dataclass(slots=True)
-class _Snapshot:
-    points: np.ndarray
-    observed_at: float
+class _QueuedFit:
     fit: TrajectoryFit
+    captured_at: float
+    remaining_m: float
 
 
 def read_motion_sample(bot: object, fallback_v: float, fallback_w: float) -> MotionSample:
-    """Read cached encoder-derived velocity, with a bounded command fallback."""
+    """Read encoder velocity, rejecting missing/stale zero reports while moving."""
 
     getter = getattr(bot, "get_motion_data", None)
     if callable(getter):
@@ -42,130 +40,103 @@ def read_motion_sample(bot: object, fallback_v: float, fallback_w: float) -> Mot
             value = getter()
             if isinstance(value, (tuple, list)) and len(value) >= 2:
                 linear, angular = float(value[0]), float(value[1])
-                if math.isfinite(linear) and math.isfinite(angular) and abs(linear) <= 0.5 and abs(angular) <= 3.0:
+                valid = (
+                    math.isfinite(linear)
+                    and math.isfinite(angular)
+                    and abs(linear) <= 0.5
+                    and abs(angular) <= 3.0
+                )
+                stale_zero = abs(fallback_v) > 0.01 and abs(linear) < 0.002
+                if valid and not stale_zero:
                     return MotionSample(linear, angular, "measured")
         except Exception:
             pass
     return MotionSample(float(fallback_v), float(fallback_w), "command_fallback")
 
 
-def image_path_to_axle(
-    path: Iterable[PathPoint],
-    *,
-    image_width: int,
-    image_height: int,
-    center_x: float,
-    pixels_per_meter: float,
-    camera_to_axle_m: float,
-) -> np.ndarray:
-    """Convert an ordered BEV image path into (forward, left) axle coordinates."""
-
-    if pixels_per_meter <= 0.0:
-        return np.empty((0, 2), dtype=np.float64)
-    points = [
-        (
-            (float(image_height - 1) - point.y) / pixels_per_meter + camera_to_axle_m,
-            -(point.x - center_x) / pixels_per_meter,
-        )
-        for point in path
-        if 0.0 <= point.x < image_width and 0.0 <= point.y < image_height
-    ]
-    if not points:
-        return np.empty((0, 2), dtype=np.float64)
-    return np.asarray(points, dtype=np.float64)
-
-
-def _resample(points: np.ndarray, spacing: float) -> np.ndarray:
-    if len(points) < 2:
-        return points.copy()
-    spacing = max(0.002, float(spacing))
-    chunks = [points[0]]
-    for p0, p1 in zip(points, points[1:]):
-        distance = float(np.linalg.norm(p1 - p0))
-        steps = max(1, int(math.ceil(distance / spacing)))
-        for index in range(1, steps + 1):
-            chunks.append(p0 + (p1 - p0) * (index / steps))
-    return np.asarray(chunks, dtype=np.float64)
-
-
-def _advance_points(points: np.ndarray, ds: float, dyaw: float) -> np.ndarray:
-    """Express old axle-frame points in the new axle frame after an SE(2) motion."""
-
-    shifted = points - np.asarray([ds, 0.0], dtype=np.float64)
-    c, s = math.cos(dyaw), math.sin(dyaw)
-    rotation_inverse = np.asarray([[c, s], [-s, c]], dtype=np.float64)
-    return shifted @ rotation_inverse.T
-
-
-def _point_at_arc(points: np.ndarray, distance: float) -> np.ndarray:
-    if len(points) == 1 or distance <= 0.0:
-        return points[0]
-    remaining = distance
-    for p0, p1 in zip(points, points[1:]):
-        segment = float(np.linalg.norm(p1 - p0))
-        if segment >= remaining and segment > 1e-9:
-            return p0 + (p1 - p0) * (remaining / segment)
-        remaining -= segment
-    return points[-1]
-
-
-def _signed_curvature(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray) -> float:
-    a = float(np.linalg.norm(p1 - p0))
-    b = float(np.linalg.norm(p2 - p1))
-    c = float(np.linalg.norm(p2 - p0))
-    denom = a * b * c
-    if denom <= 1e-9:
-        return 0.0
-    v1, v2 = p1 - p0, p2 - p1
-    cross = float(v1[0] * v2[1] - v1[1] * v2[0])
-    return 2.0 * cross / denom
-
-
-class ShortHorizonPathMemory:
-    """Keep recent visual paths in the moving axle frame and fit one for control."""
+class DistanceDelayPathMemory:
+    """Delay preview steering by travelled distance while keeping near e0 live."""
 
     def __init__(self, cfg: PathMemoryConfig) -> None:
         self.cfg = cfg
-        self._snapshots: list[_Snapshot] = []
+        self._queue: deque[_QueuedFit] = deque()
+        self._released: _QueuedFit | None = None
+        self._released_at: float | None = None
         self._last_now: float | None = None
 
     def reset(self) -> None:
-        self._snapshots.clear()
+        self._queue.clear()
+        self._released = None
+        self._released_at = None
         self._last_now = None
 
     def step(
         self,
-        observed_points: np.ndarray,
-        source_fit: TrajectoryFit,
+        visual_fit: TrajectoryFit,
         *,
+        near_e0: float,
         now: float,
         linear_velocity: float,
-        angular_velocity: float,
-        lateral_half_width_m: float,
     ) -> tuple[TrajectoryFit | None, PathMemoryStatus]:
         if not self.cfg.enabled:
             self.reset()
             return None, PathMemoryStatus(False, "disabled")
 
-        self._propagate(now, linear_velocity, angular_velocity)
+        self._advance(now, linear_velocity)
         self._prune(now)
+        if visual_fit.found and visual_fit.conf > 0.0:
+            self._queue.append(_QueuedFit(
+                fit=visual_fit,
+                captured_at=now,
+                remaining_m=max(0.0, self.cfg.effective_camera_to_axle_m),
+            ))
+            while len(self._queue) > max(1, self.cfg.max_queue_frames):
+                self._queue.popleft()
 
-        if len(observed_points) >= 2 and source_fit.found and source_fit.conf > 0.0:
-            sampled = _resample(observed_points, self.cfg.sample_spacing_m)
-            self._snapshots.append(_Snapshot(sampled, now, source_fit))
-            self._snapshots = self._snapshots[-max(1, self.cfg.max_snapshots) :]
+        while self._queue and self._queue[0].remaining_m <= 1e-6:
+            self._released = self._queue.popleft()
+            self._released_at = now
 
-        snapshot = self._select_snapshot(now)
-        if snapshot is None:
-            return None, PathMemoryStatus(False, "no_metric_path", snapshot_count=len(self._snapshots))
+        delayed = self._released
+        remaining = self._queue[0].remaining_m if self._queue else 0.0
+        if delayed is None:
+            # Before the first camera-to-axle interval has elapsed, keep only the
+            # live near-field correction and suppress preview-induced turning.
+            return TrajectoryFit(
+                found=visual_fit.found,
+                e0=near_e0,
+                e_look=near_e0,
+                theta=0.0,
+                kappa=0.0,
+                conf=visual_fit.conf,
+                n_bands=visual_fit.n_bands,
+                disconnected=visual_fit.disconnected,
+                path_memory=False,
+            ), PathMemoryStatus(True, "filling", len(self._queue), remaining, 0.0)
 
-        fit, point_count = self._fit_snapshot(snapshot, now, lateral_half_width_m)
-        if fit is None:
-            return None, PathMemoryStatus(False, "path_exhausted", snapshot_count=len(self._snapshots))
-        age = max(0.0, now - snapshot.observed_at)
-        return fit, PathMemoryStatus(True, "buffered", age, len(self._snapshots), point_count)
+        released_at = now if self._released_at is None else self._released_at
+        age = max(0.0, now - released_at)
+        delayed_conf = delayed.fit.conf * max(0.25, 1.0 - age / max(self.cfg.max_age_sec, 1e-6))
+        found = visual_fit.found or delayed_conf > 0.0
+        conf = max(visual_fit.conf if visual_fit.found else 0.0, delayed_conf)
+        return TrajectoryFit(
+            found=found,
+            e0=near_e0,
+            e_look=delayed.fit.e_look,
+            theta=delayed.fit.theta,
+            kappa=delayed.fit.kappa,
+            conf=conf,
+            n_bands=max(visual_fit.n_bands, delayed.fit.n_bands),
+            quadratic=delayed.fit.quadratic,
+            disconnected=visual_fit.disconnected and delayed.fit.disconnected,
+            preview_dir=delayed.fit.preview_dir,
+            preview_e=delayed.fit.preview_e,
+            preview_theta=delayed.fit.preview_theta,
+            preview_conf=delayed.fit.preview_conf,
+            path_memory=True,
+        ), PathMemoryStatus(True, "distance_delay", len(self._queue), remaining, age)
 
-    def _propagate(self, now: float, linear: float, angular: float) -> None:
+    def _advance(self, now: float, linear_velocity: float) -> None:
         if self._last_now is None:
             self._last_now = now
             return
@@ -174,94 +145,17 @@ class ShortHorizonPathMemory:
         if dt <= 0.0:
             return
         if dt > self.cfg.max_motion_dt_sec:
-            self._snapshots.clear()
+            self._queue.clear()
+            self._released = None
+            self._released_at = None
             return
-        ds, dyaw = linear * dt, angular * dt
-        for snapshot in self._snapshots:
-            snapshot.points = _advance_points(snapshot.points, ds, dyaw)
+        travelled = max(0.0, linear_velocity) * dt
+        for item in self._queue:
+            item.remaining_m -= travelled
 
     def _prune(self, now: float) -> None:
-        kept = []
-        for snapshot in self._snapshots:
-            if now - snapshot.observed_at > self.cfg.max_age_sec:
-                continue
-            points = snapshot.points
-            useful = (
-                (points[:, 0] >= -self.cfg.behind_tolerance_m)
-                & (points[:, 0] <= self.cfg.max_horizon_m)
-                & (np.linalg.norm(points, axis=1) <= self.cfg.max_horizon_m * 1.5)
-            )
-            snapshot.points = points[useful]
-            if len(snapshot.points) >= 2:
-                kept.append(snapshot)
-        self._snapshots = kept
-
-    def _select_snapshot(self, now: float) -> _Snapshot | None:
-        if not self._snapshots:
-            return None
-        # Prefer the snapshot that currently reaches closest to the axle. This is
-        # usually an older observation propagated through the camera blind zone.
-        # A small age term lets fresh vision win when geometric coverage is equal.
-        def score(snapshot: _Snapshot) -> float:
-            nearest = float(np.min(np.linalg.norm(snapshot.points, axis=1)))
-            age = max(0.0, now - snapshot.observed_at)
-            return nearest + 0.02 * age
-
-        return min(self._snapshots, key=score)
-
-    def _fit_snapshot(
-        self,
-        snapshot: _Snapshot,
-        now: float,
-        lateral_half_width_m: float,
-    ) -> tuple[TrajectoryFit | None, int]:
-        points = snapshot.points
-        valid_indices = np.flatnonzero(points[:, 0] >= -self.cfg.behind_tolerance_m)
-        if valid_indices.size == 0:
-            return None, 0
-        nearest_local = int(np.argmin(np.linalg.norm(points[valid_indices], axis=1)))
-        nearest_index = int(valid_indices[nearest_local])
-        path = points[nearest_index:]
-        if len(path) < 2:
-            return None, len(path)
-
-        # The camera cannot observe the strip between its ground projection and
-        # the axle. Account for that spatial gap when measuring lookahead; without
-        # this bridge, translating every point by camera_to_axle would have no
-        # effect because lookahead would incorrectly start at the first image point.
-        if path[0, 0] > 0.002:
-            axle_projection = np.asarray([[0.0, path[0, 1]]], dtype=np.float64)
-            path = np.vstack((axle_projection, path))
-
-        half_width = max(0.01, lateral_half_width_m)
-        near = path[0]
-        target = _point_at_arc(path, self.cfg.lookahead_m)
-        heading_point = _point_at_arc(path, self.cfg.heading_lookahead_m)
-        e0 = float(np.clip(-near[1] / half_width, -1.0, 1.0))
-        e_look = float(np.clip(-target[1] / half_width, -1.0, 1.0))
-        heading_delta = heading_point - near
-        theta = float(math.atan2(-heading_delta[1], max(1e-6, heading_delta[0])))
-
-        middle = _point_at_arc(path, self.cfg.lookahead_m * 0.5)
-        curvature = _signed_curvature(near, middle, target)
-        kappa = float(np.clip(-curvature * max(self.cfg.lookahead_m, 0.01), -1.0, 1.0))
-
-        age = max(0.0, now - snapshot.observed_at)
-        age_conf = max(0.0, 1.0 - age / max(self.cfg.max_age_sec, 1e-6))
-        conf = float(np.clip(snapshot.fit.conf * max(0.25, age_conf), 0.0, 1.0))
-        return TrajectoryFit(
-            found=True,
-            e0=e0,
-            e_look=e_look,
-            theta=theta,
-            kappa=kappa,
-            conf=conf,
-            n_bands=snapshot.fit.n_bands,
-            quadratic=snapshot.fit.quadratic,
-            disconnected=snapshot.fit.disconnected,
-            preview_dir=snapshot.fit.preview_dir,
-            preview_e=snapshot.fit.preview_e,
-            preview_theta=snapshot.fit.preview_theta,
-            preview_conf=snapshot.fit.preview_conf,
-            path_memory=True,
-        ), len(path)
+        while self._queue and now - self._queue[0].captured_at > self.cfg.max_age_sec:
+            self._queue.popleft()
+        if self._released_at is not None and now - self._released_at > self.cfg.max_age_sec:
+            self._released = None
+            self._released_at = None

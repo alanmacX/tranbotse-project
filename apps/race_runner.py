@@ -15,15 +15,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from transbot_race.config import RaceConfig  # noqa: E402
-from transbot_race.geometry import (  # noqa: E402
-    PerspectiveTransformer,
-    apply_occlusion,
-    band_is_occluded,
-)
+from transbot_race.geometry import apply_occlusion, band_is_occluded  # noqa: E402
 from transbot_race.path_memory import (  # noqa: E402
+    DistanceDelayPathMemory,
     PathMemoryStatus,
-    ShortHorizonPathMemory,
-    image_path_to_axle,
     read_motion_sample,
 )
 from transbot_race.obstacle import (  # noqa: E402
@@ -90,10 +85,10 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError(f"crop x1 must be > x0, got {cfg.camera.crop}")
     if cfg.path_memory.effective_camera_to_axle_m < 0.0:
         raise ValueError("effective camera-to-axle distance cannot be negative")
-    if cfg.path_memory.lookahead_m <= 0.0 or cfg.path_memory.heading_lookahead_m <= 0.0:
-        raise ValueError("path-memory lookahead distances must be positive")
-    if cfg.perspective.enabled and cfg.path_memory.enabled and cfg.perspective.px_per_cm <= 0.0:
-        raise ValueError("path memory requires a positive perspective.px_per_cm")
+    if cfg.path_memory.max_queue_frames <= 0:
+        raise ValueError("path_memory.max_queue_frames must be positive")
+    if cfg.path_memory.max_age_sec <= 0.0 or cfg.path_memory.max_motion_dt_sec <= 0.0:
+        raise ValueError("path-memory time limits must be positive")
 
 
 class DryBot:
@@ -251,8 +246,7 @@ def run(args: argparse.Namespace) -> int:
     cfg = load_config(Path(args.config))
     bot = make_bot(args.dry_run)
     sm = RaceStateMachine(cfg)
-    perspective = PerspectiveTransformer(cfg.perspective)
-    path_memory = ShortHorizonPathMemory(cfg.path_memory)
+    path_memory = DistanceDelayPathMemory(cfg.path_memory)
     obstacle_monitor = ObstacleMonitor(cfg.obstacle)
     cap = cv.VideoCapture(args.camera)
     cap.set(cv.CAP_PROP_FRAME_WIDTH, cfg.camera.frame_width)
@@ -279,13 +273,9 @@ def run(args: argparse.Namespace) -> int:
                 bot.set_car_motion(0.0, 0.0)
                 time.sleep(0.05)
                 continue
-            frame = perspective.undistort(frame)
             crop, (x0, y0, x1, y1), track_center = crop_frame(frame, cfg)
             raw_crop = crop.copy()
             raw_track_center = track_center
-            if perspective.active:
-                crop = perspective.to_birdseye(crop)
-                track_center = crop.shape[1] / 2.0
             crop_w = crop.shape[1]
             mask = preprocess_blackline(crop, cfg.vision)
             mask = apply_occlusion(mask, cfg.occlusion)
@@ -319,27 +309,16 @@ def run(args: argparse.Namespace) -> int:
             obstacle_decision = obstacle_monitor.update(raw_crop, raw_track_center, obstacle_armed)
 
             fit = visual_fit
-            memory_status = PathMemoryStatus(False, "perspective_inactive")
-            if cfg.path_memory.enabled and perspective.active:
-                pixels_per_meter = cfg.perspective.px_per_cm * 100.0
-                accepted_path = features.path
+            memory_status = PathMemoryStatus(False, "disabled")
+            if cfg.path_memory.enabled:
+                accepted_fit = visual_fit
                 if obstacle_decision.state not in (ObstacleState.CLEAR, ObstacleState.DISARMED):
-                    accepted_path = ()
-                metric_points = image_path_to_axle(
-                    accepted_path,
-                    image_width=crop.shape[1],
-                    image_height=crop.shape[0],
-                    center_x=track_center,
-                    pixels_per_meter=pixels_per_meter,
-                    camera_to_axle_m=cfg.path_memory.effective_camera_to_axle_m,
-                )
+                    accepted_fit = replace(visual_fit, found=False, conf=0.0)
                 buffered_fit, memory_status = path_memory.step(
-                    metric_points,
-                    visual_fit,
+                    accepted_fit,
+                    near_e0=features.err_norm,
                     now=now,
                     linear_velocity=motion.linear,
-                    angular_velocity=motion.angular,
-                    lateral_half_width_m=(crop_w / 2.0) / max(pixels_per_meter, 1e-6),
                 )
                 if buffered_fit is not None:
                     fit = buffered_fit
@@ -361,9 +340,9 @@ def run(args: argparse.Namespace) -> int:
             summary["motion_source"] = motion.source
             summary["path_memory_active"] = memory_status.active
             summary["path_memory_reason"] = memory_status.reason
-            summary["path_memory_age"] = round(memory_status.snapshot_age_sec, 3)
-            summary["path_memory_snapshots"] = memory_status.snapshot_count
-            summary["path_memory_points"] = memory_status.point_count
+            summary["path_memory_released_age"] = round(memory_status.released_age_sec, 3)
+            summary["path_memory_queue"] = memory_status.queue_count
+            summary["path_memory_remaining_m"] = round(memory_status.remaining_m, 4)
             summary["camera_to_axle_effective_m"] = round(cfg.path_memory.effective_camera_to_axle_m, 4)
             summary["obstacle_state"] = obstacle_decision.state.value
             summary["obstacle_conf"] = round(obstacle_decision.confidence, 3)
