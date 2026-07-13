@@ -38,7 +38,6 @@ class PathMemoryConfig:
     corner_confirm_frames: int = 3
     corner_theta_threshold: float = 0.18
     corner_e_threshold: float = 0.48
-    corner_record_steps: int = 5
     corner_hold_max_w: float = 0.0
     corner_replay_max_w: float = 0.20
     corner_turn_angle_rad: float = 1.57
@@ -46,6 +45,8 @@ class PathMemoryConfig:
     corner_turn_speed_ratio: float = 0.45
     corner_image_angle_gain: float = 6.8
     corner_search_extra_rad: float = 0.40
+    corner_reacquire_confirm_frames: int = 3
+    corner_handoff_blend_frames: int = 5
     max_motion_dt_sec: float = 0.25
 
 

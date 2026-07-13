@@ -161,6 +161,8 @@ async function loadStrategy() {
   el("cornerReacquireAngle").value = cfg.path_memory.corner_reacquire_angle_rad;
   el("cornerTurnW").value = cfg.path_memory.corner_replay_max_w;
   el("cornerTurnSpeed").value = cfg.path_memory.corner_turn_speed_ratio;
+  el("cornerReacquireFrames").value = cfg.path_memory.corner_reacquire_confirm_frames;
+  el("cornerHandoffFrames").value = cfg.path_memory.corner_handoff_blend_frames;
   showStrategyFields();
 }
 
@@ -177,6 +179,8 @@ el("strategySaveBtn").addEventListener("click", () => guard("STRATEGY", async ()
       corner_reacquire_angle_rad: Number(el("cornerReacquireAngle").value),
       corner_replay_max_w: Number(el("cornerTurnW").value),
       corner_turn_speed_ratio: Number(el("cornerTurnSpeed").value),
+      corner_reacquire_confirm_frames: Number(el("cornerReacquireFrames").value),
+      corner_handoff_blend_frames: Number(el("cornerHandoffFrames").value),
     },
     obstacle: { enabled: el("obstacleEnabled").checked },
   });

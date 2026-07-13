@@ -98,6 +98,8 @@ class CornerCommandDelay:
         self.hold_w = 0.0
         self.stable_w = 0.0
         self.turned_rad = 0.0
+        self.reacquire_frames = 0
+        self.handoff_index = 0
         self.clear_frames = 0
         self.last_now: float | None = None
 
@@ -129,6 +131,7 @@ class CornerCommandDelay:
                 self.hold_v = max(0.0, command_v)
                 self.hold_w = self.stable_w
                 self.turned_rad = 0.0
+                self.reacquire_frames = 0
                 angles = [angle for angle in self.candidate_angles if angle > 0.0]
                 fitted_angle = float(np.median(angles)) if angles else self.cfg.corner_turn_angle_rad
                 self.target_angle_rad = max(self.cfg.corner_reacquire_angle_rad, fitted_angle)
@@ -140,22 +143,41 @@ class CornerCommandDelay:
         elif self.state == "turning":
             self.turned_rad += turned
             ready = self.turned_rad >= self.cfg.corner_reacquire_angle_rad
-            visible = bool(fit.found and fit.conf >= 0.48 and fit.n_bands >= 2)
-            if ready and visible:
-                self.state = "cooldown"
-                self.clear_frames = 0
+            visible = self._reacquire_valid(fit)
+            self.reacquire_frames = self.reacquire_frames + 1 if ready and visible else 0
+            if self.reacquire_frames >= self.cfg.corner_reacquire_confirm_frames:
+                self.state = "handoff"
+                self.handoff_index = 0
             elif self.turned_rad >= self.target_angle_rad:
                 self.state = "seeking"
+                self.reacquire_frames = 0
         elif self.state == "seeking":
             self.turned_rad += turned
-            visible = bool(fit.found and fit.conf >= 0.48 and fit.n_bands >= 2)
-            if visible or self.turned_rad >= self.target_angle_rad + self.cfg.corner_search_extra_rad:
-                self.state = "cooldown"
-                self.clear_frames = 0
+            visible = self._reacquire_valid(fit)
+            self.reacquire_frames = self.reacquire_frames + 1 if visible else 0
+            if self.reacquire_frames >= self.cfg.corner_reacquire_confirm_frames:
+                self.state = "handoff"
+                self.handoff_index = 0
+            elif self.turned_rad >= self.target_angle_rad + self.cfg.corner_search_extra_rad:
+                self.state = "failed"
+        elif self.state == "handoff":
+            if not self._reacquire_valid(fit):
+                self.state = "turning" if self.turned_rad < self.target_angle_rad else "seeking"
+                self.reacquire_frames = 0
+            else:
+                self.handoff_index += 1
+                if self.handoff_index >= self.cfg.corner_handoff_blend_frames:
+                    self.state = "cooldown"
+                    self.clear_frames = 0
+        elif self.state == "failed":
+            pass
         elif self.state == "cooldown":
-            self.clear_frames = self.clear_frames + 1 if direction == 0 else 0
+            stable = self._stable_straight(fit, features)
+            self.clear_frames = self.clear_frames + 1 if stable else 0
             if self.clear_frames >= 3:
                 self.state, self.candidate_dir, self.confirm = "armed", 0, 0
+                self.candidate_angles = []
+                self.reacquire_frames = 0
 
         if self.state == "waiting":
             status = PathStrategyStatus(
@@ -181,11 +203,51 @@ class CornerCommandDelay:
                 (self.turned_rad, self.target_angle_rad),
             )
             return CornerCommandResult(0.0, turn_w, status)
+        if self.state == "handoff":
+            frames = max(1, self.cfg.corner_handoff_blend_frames)
+            alpha = min(1.0, self.handoff_index / frames)
+            turn_v = self.hold_v * max(0.0, min(1.0, self.cfg.corner_turn_speed_ratio))
+            turn_w = -self.candidate_dir * abs(self.cfg.corner_replay_max_w)
+            status = PathStrategyStatus(
+                True, "corner_event", "corner_visual_handoff", 0.0,
+                self.candidate_dir, self.handoff_index,
+                (self.turned_rad, self.target_angle_rad),
+            )
+            return CornerCommandResult(
+                (1.0 - alpha) * turn_v + alpha * command_v,
+                (1.0 - alpha) * turn_w + alpha * command_w,
+                status,
+            )
+        if self.state == "failed":
+            status = PathStrategyStatus(
+                True, "corner_event", "corner_reacquire_failed", 0.0,
+                self.candidate_dir, 0,
+                (self.turned_rad, self.target_angle_rad),
+            )
+            return CornerCommandResult(0.0, 0.0, status)
         status = PathStrategyStatus(
             True, "corner_event", self.state, 0.0,
             self.candidate_dir, 0,
         )
         return CornerCommandResult(command_v, command_w, status)
+
+    @staticmethod
+    def _reacquire_valid(fit: TrajectoryFit) -> bool:
+        return bool(
+            fit.found
+            and fit.conf >= 0.65
+            and fit.n_bands >= 3
+            and not fit.disconnected
+        )
+
+    def _stable_straight(self, fit: TrajectoryFit, features: LineFeatures) -> bool:
+        return bool(
+            self._reacquire_valid(fit)
+            and abs(fit.e0) <= min(0.28, self.cfg.corner_e_threshold)
+            and abs(fit.theta) <= min(0.16, self.cfg.corner_theta_threshold)
+            and features.branch_left is None
+            and features.branch_right is None
+        )
 
     def _motion_delta(self, now: float, linear: float, angular: float) -> tuple[float, float]:
         if self.last_now is None:

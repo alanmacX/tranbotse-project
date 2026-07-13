@@ -98,6 +98,8 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError("corner reacquire angle must be within [0, turn angle]")
     if cfg.path_memory.corner_image_angle_gain <= 0.0 or cfg.path_memory.corner_search_extra_rad < 0.0:
         raise ValueError("corner angle gain must be positive and extra search angle non-negative")
+    if cfg.path_memory.corner_reacquire_confirm_frames <= 0 or cfg.path_memory.corner_handoff_blend_frames <= 0:
+        raise ValueError("corner reacquire and handoff frame counts must be positive")
     if cfg.path_memory.max_motion_dt_sec <= 0.0:
         raise ValueError("path-memory motion interval must be positive")
 

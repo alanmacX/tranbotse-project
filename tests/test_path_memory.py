@@ -60,6 +60,8 @@ class PathStrategyTests(unittest.TestCase):
             corner_confirm_frames=3,
             corner_turn_angle_rad=1.2,
             corner_reacquire_angle_rad=0.5,
+            corner_reacquire_confirm_frames=3,
+            corner_handoff_blend_frames=3,
         )
         gate = CornerCommandDelay(cfg)
         features = LineFeatures(found=True)
@@ -75,9 +77,36 @@ class PathStrategyTests(unittest.TestCase):
         self.assertAlmostEqual(turning.status.target[0], 0.25)
 
         aligned = TrajectoryFit(found=True, e0=0.1, theta=0.05, conf=0.9, n_bands=5)
-        reacquired = gate.step(aligned, features, 0.03, -0.02, 1.3, 0.0, -1.0)
+        gate.step(aligned, features, 0.03, -0.02, 1.3, 0.0, -1.0)
+        gate.step(aligned, features, 0.03, -0.02, 1.8, 0.0, -1.0)
+        handoff = gate.step(aligned, features, 0.03, -0.02, 2.3, 0.0, -1.0)
+        self.assertEqual(handoff.status.reason, "corner_visual_handoff")
+        self.assertAlmostEqual(handoff.w, -cfg.corner_replay_max_w)
+
+        blended = gate.step(aligned, features, 0.03, -0.02, 2.4, 0.0, 0.0)
+        self.assertEqual(blended.status.reason, "corner_visual_handoff")
+        self.assertGreater(blended.w, -cfg.corner_replay_max_w)
+        gate.step(aligned, features, 0.03, -0.02, 2.5, 0.0, 0.0)
+        reacquired = gate.step(aligned, features, 0.03, -0.02, 2.6, 0.0, 0.0)
         self.assertEqual(reacquired.status.reason, "cooldown")
         self.assertAlmostEqual(reacquired.v, 0.03)
+
+    def test_corner_event_stays_latched_while_following_a_curve(self):
+        cfg = PathMemoryConfig(corner_confirm_frames=3)
+        gate = CornerCommandDelay(cfg)
+        gate.state = "cooldown"
+        gate.candidate_dir = 1
+        curve = TrajectoryFit(found=True, e0=0.12, theta=0.3, conf=0.9, n_bands=4)
+        features = LineFeatures(found=True)
+
+        for i in range(8):
+            output = gate.step(curve, features, 0.04, -0.08, i * 0.1, 0.04, -0.08)
+        self.assertEqual(output.status.reason, "cooldown")
+
+        straight = TrajectoryFit(found=True, e0=0.02, theta=0.03, conf=0.9, n_bands=4)
+        for i in range(3):
+            output = gate.step(straight, features, 0.05, 0.0, 1.0 + i * 0.1, 0.05, 0.0)
+        self.assertEqual(output.status.reason, "armed")
 
     def test_corner_event_rejects_heading_lateral_sign_conflict(self):
         gate = CornerCommandDelay(PathMemoryConfig(corner_confirm_frames=3))
