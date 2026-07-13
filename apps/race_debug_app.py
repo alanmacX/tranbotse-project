@@ -263,7 +263,7 @@ HTML = """
       </section>
       <section>
         <h2>车轴路径缓存</h2>
-        <div class="row"><label>延迟距离</label><input id="path_memory.camera_to_axle_m" type="range" min="0.00" max="0.25" step="0.005"><input id="path_memory.camera_to_axle_mn" type="number" step="0.005"></div>
+        <div class="row"><label>转弯延迟距离</label><input id="path_memory.camera_to_axle_m" type="range" min="0.00" max="0.80" step="0.005"><input id="path_memory.camera_to_axle_mn" type="number" step="0.005"></div>
         <button onclick="saveConfig()">应用</button>
         <p class="hint">按实际行驶距离延迟转弯信号。数值增大时转弯更晚，减小时更早。</p>
       </section>

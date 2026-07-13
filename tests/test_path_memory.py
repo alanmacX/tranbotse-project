@@ -3,6 +3,10 @@ from dataclasses import replace
 import math
 
 from transbot_race.config import PathMemoryConfig
+from transbot_race.capture_geometry import (
+    CaptureGeometryDecision,
+    CaptureGeometryObservation,
+)
 from transbot_race.path_memory import (
     CornerCommandDelay, read_motion_sample,
 )
@@ -22,7 +26,11 @@ class FakeBot:
 
 class PathStrategyTests(unittest.TestCase):
     def test_corner_event_holds_then_commits_to_detected_turn(self):
-        cfg = PathMemoryConfig(camera_to_axle_m=0.02, corner_confirm_frames=3)
+        cfg = PathMemoryConfig(
+            camera_to_axle_m=0.02,
+            corner_confirm_frames=3,
+            capture_geometry_enabled=False,
+        )
         gate = CornerCommandDelay(cfg)
         features = LineFeatures(found=True)
         gate.step(turn_fit(), features, 0.05, -0.08, 0.0, 0.0)
@@ -38,7 +46,11 @@ class PathStrategyTests(unittest.TestCase):
         self.assertAlmostEqual(turning.v, 0.05 * cfg.corner_turn_speed_ratio)
 
     def test_corner_event_keeps_trigger_speed_when_live_tracker_loses_line(self):
-        cfg = PathMemoryConfig(camera_to_axle_m=0.10, corner_confirm_frames=3)
+        cfg = PathMemoryConfig(
+            camera_to_axle_m=0.10,
+            corner_confirm_frames=3,
+            capture_geometry_enabled=False,
+        )
         gate = CornerCommandDelay(cfg)
         features = LineFeatures(found=True)
 
@@ -62,6 +74,7 @@ class PathStrategyTests(unittest.TestCase):
             corner_reacquire_angle_rad=0.5,
             corner_reacquire_confirm_frames=3,
             corner_handoff_blend_frames=3,
+            capture_geometry_enabled=False,
         )
         gate = CornerCommandDelay(cfg)
         features = LineFeatures(found=True)
@@ -109,14 +122,20 @@ class PathStrategyTests(unittest.TestCase):
         self.assertEqual(output.status.reason, "armed")
 
     def test_corner_event_rejects_heading_lateral_sign_conflict(self):
-        gate = CornerCommandDelay(PathMemoryConfig(corner_confirm_frames=3))
+        gate = CornerCommandDelay(PathMemoryConfig(
+            corner_confirm_frames=3,
+            capture_geometry_enabled=False,
+        ))
         conflict = TrajectoryFit(found=True, e0=-0.08, theta=0.42, conf=0.9, n_bands=3)
         for i in range(6):
             output = gate.step(conflict, LineFeatures(found=True), 0.05, 0.0, i * 0.1, 0.05)
         self.assertEqual(output.status.reason, "armed")
 
     def test_corner_event_does_not_delay_every_fit(self):
-        gate = CornerCommandDelay(PathMemoryConfig(corner_confirm_frames=2))
+        gate = CornerCommandDelay(PathMemoryConfig(
+            corner_confirm_frames=2,
+            capture_geometry_enabled=False,
+        ))
         straight = TrajectoryFit(found=True, e0=0.08, theta=0.02, conf=0.9)
         output = gate.step(straight, LineFeatures(found=True), 0.05, 0.01, 0.0, 0.0)
         self.assertEqual(output.w, 0.01)
@@ -127,6 +146,81 @@ class PathStrategyTests(unittest.TestCase):
         self.assertEqual(measured.source, "measured")
         stale = read_motion_sample(FakeBot((0.0, 0.0)), 0.03, -0.1)
         self.assertEqual(stale.source, "command_fallback")
+
+    def test_capture_geometry_waits_for_distance_and_vertex_gate(self):
+        cfg = PathMemoryConfig(
+            camera_to_axle_m=0.02,
+            corner_gate_y_frac=0.50,
+            corner_gate_confirm_frames=2,
+        )
+        gate = CornerCommandDelay(cfg)
+        features = LineFeatures(found=True)
+        fit = turn_fit()
+        decision = CaptureGeometryDecision(
+            kind="corner",
+            direction=1,
+            angle_rad=math.pi / 2.0,
+            vertex_y_frac=0.35,
+            incoming_e=0.0,
+            incoming_theta=0.0,
+            votes=3,
+        )
+        below = CaptureGeometryObservation(kind="corner", direction=1, vertex_y_frac=0.40)
+        above = CaptureGeometryObservation(kind="curve", direction=1, vertex_y_frac=0.60)
+
+        captured = gate.step(
+            fit, features, 0.10, -0.12, 0.0, 0.0,
+            geometry=below, geometry_decision=decision, approach_w=0.01,
+        )
+        self.assertEqual(captured.status.reason, "approaching_corner")
+        self.assertAlmostEqual(captured.w, 0.01)
+
+        gate.step(fit, features, 0.10, -0.12, 0.1, 0.10, geometry=below)
+        first_gate = gate.step(fit, features, 0.10, -0.12, 0.2, 0.10, geometry=above)
+        self.assertEqual(first_gate.status.reason, "approaching_corner")
+        self.assertAlmostEqual(first_gate.status.remaining_m, 0.0)
+
+        waiting = gate.step(fit, features, 0.10, -0.12, 0.3, 0.10, geometry=above)
+        self.assertEqual(waiting.status.reason, "waiting_margin")
+        turning = gate.step(fit, features, 0.10, -0.12, 0.4, 0.10, geometry=above)
+        self.assertEqual(turning.status.reason, "committed_turn")
+
+    def test_capture_geometry_gate_does_not_skip_remaining_distance(self):
+        cfg = PathMemoryConfig(
+            camera_to_axle_m=0.10,
+            corner_gate_y_frac=0.50,
+            corner_gate_confirm_frames=1,
+        )
+        gate = CornerCommandDelay(cfg)
+        observation = CaptureGeometryObservation(kind="corner", direction=-1, vertex_y_frac=0.60)
+        decision = CaptureGeometryDecision(
+            kind="corner", direction=-1, angle_rad=math.pi / 2.0,
+            vertex_y_frac=0.60, incoming_e=0.0, incoming_theta=0.0, votes=3,
+        )
+        gate.step(
+            turn_fit(-0.4), LineFeatures(found=True), 0.05, 0.1, 0.0, 0.0,
+            geometry=observation, geometry_decision=decision,
+        )
+        waiting = gate.step(
+            turn_fit(-0.4), LineFeatures(found=True), 0.05, 0.1, 0.1, 0.05,
+            geometry=observation,
+        )
+        self.assertEqual(waiting.status.reason, "waiting_margin")
+        self.assertAlmostEqual(waiting.status.remaining_m, 0.095)
+
+    def test_capture_geometry_circle_never_starts_corner_margin(self):
+        gate = CornerCommandDelay(PathMemoryConfig())
+        observation = CaptureGeometryObservation(kind="circle", confidence=0.9)
+        decision = CaptureGeometryDecision(
+            kind="circle", direction=0, angle_rad=0.0,
+            vertex_y_frac=0.5, incoming_e=0.0, incoming_theta=0.0, votes=3,
+        )
+        output = gate.step(
+            turn_fit(), LineFeatures(found=True), 0.05, -0.1, 0.0, 0.0,
+            geometry=observation, geometry_decision=decision,
+        )
+        self.assertEqual(output.status.reason, "geometry_circle_passthrough")
+        self.assertAlmostEqual(output.w, -0.1)
 
 
 if __name__ == "__main__": unittest.main()

@@ -35,6 +35,13 @@ class PathMemoryConfig:
     enabled: bool = True
     mode: str = "none"  # none, corner_event
     camera_to_axle_m: float = 0.10
+    capture_geometry_enabled: bool = True
+    corner_gate_y_frac: float = 0.52
+    corner_gate_confirm_frames: int = 2
+    corner_approach_max_w: float = 0.08
+    corner_approach_missing_frames: int = 4
+    geometry_roi_top_offset_px: int = 80
+    geometry_chassis_trim_px: int = 45
     corner_confirm_frames: int = 3
     corner_theta_threshold: float = 0.18
     corner_e_threshold: float = 0.48

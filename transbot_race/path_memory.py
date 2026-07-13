@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from .config import PathMemoryConfig
 from .vision import LineFeatures, TrajectoryFit
+
+if TYPE_CHECKING:
+    from .capture_geometry import CaptureGeometryDecision, CaptureGeometryObservation
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +105,9 @@ class CornerCommandDelay:
         self.reacquire_frames = 0
         self.handoff_index = 0
         self.clear_frames = 0
+        self.gate_frames = 0
+        self.approach_missing_frames = 0
+        self.capture_votes = 0
         self.last_now: float | None = None
 
     def step(
@@ -112,29 +119,74 @@ class CornerCommandDelay:
         now: float,
         linear: float,
         angular: float = 0.0,
+        geometry: CaptureGeometryObservation | None = None,
+        geometry_decision: CaptureGeometryDecision | None = None,
+        approach_w: float | None = None,
     ) -> CornerCommandResult:
         travelled, turned = self._motion_delta(now, linear, angular)
-        direction, observed_angle = _corner_observation(features, fit, self.cfg)
+        direction, observed_angle = (0, 0.0)
+        if not self.cfg.capture_geometry_enabled:
+            direction, observed_angle = _corner_observation(features, fit, self.cfg)
         if self.state == "armed":
             if direction == 0 and fit.found and fit.conf >= 0.65:
                 limit = self.cfg.corner_hold_max_w
                 self.stable_w = max(-limit, min(limit, command_w))
-            if direction and direction == self.candidate_dir:
-                self.confirm += 1
-                self.candidate_angles.append(observed_angle)
+            if self.cfg.capture_geometry_enabled:
+                if geometry_decision is not None and geometry_decision.kind == "corner":
+                    self.state = "approach"
+                    self.candidate_dir = geometry_decision.direction
+                    self.capture_votes = geometry_decision.votes
+                    self.hold_v = max(0.0, command_v)
+                    self.remaining_m = self.cfg.camera_to_axle_m
+                    limit = self.cfg.corner_approach_max_w
+                    proposed_w = command_w if approach_w is None else approach_w
+                    self.stable_w = max(-limit, min(limit, proposed_w))
+                    self.hold_w = self.stable_w
+                    self.target_angle_rad = min(
+                        self.cfg.corner_turn_angle_rad,
+                        max(self.cfg.corner_reacquire_angle_rad, geometry_decision.angle_rad),
+                    )
+                    self.gate_frames = 0
+                    self.approach_missing_frames = 0
+                    self.turned_rad = 0.0
+                    self.reacquire_frames = 0
             else:
-                self.candidate_dir, self.confirm = direction, int(direction != 0)
-                self.candidate_angles = [observed_angle] if direction else []
-            if self.confirm >= max(3, self.cfg.corner_confirm_frames):
-                self.state = "waiting"
-                self.remaining_m = self.cfg.camera_to_axle_m
-                self.hold_v = max(0.0, command_v)
+                if direction and direction == self.candidate_dir:
+                    self.confirm += 1
+                    self.candidate_angles.append(observed_angle)
+                else:
+                    self.candidate_dir, self.confirm = direction, int(direction != 0)
+                    self.candidate_angles = [observed_angle] if direction else []
+                if self.confirm >= max(3, self.cfg.corner_confirm_frames):
+                    self._start_margin(command_v)
+                    angles = [angle for angle in self.candidate_angles if angle > 0.0]
+                    fitted_angle = float(np.median(angles)) if angles else self.cfg.corner_turn_angle_rad
+                    self.target_angle_rad = max(self.cfg.corner_reacquire_angle_rad, fitted_angle)
+        elif self.state == "approach":
+            self.remaining_m = max(0.0, self.remaining_m - travelled)
+            vertex_valid = bool(
+                geometry is not None
+                and geometry.vertex_y_frac is not None
+                and geometry.direction == self.candidate_dir
+                and geometry.kind in {"corner", "curve"}
+            )
+            if vertex_valid:
+                self.approach_missing_frames = 0
+                if geometry.vertex_y_frac >= self.cfg.corner_gate_y_frac:
+                    self.gate_frames += 1
+                else:
+                    self.gate_frames = 0
+                limit = self.cfg.corner_approach_max_w
+                proposed_w = command_w if approach_w is None else approach_w
+                self.stable_w = max(-limit, min(limit, proposed_w))
                 self.hold_w = self.stable_w
-                self.turned_rad = 0.0
-                self.reacquire_frames = 0
-                angles = [angle for angle in self.candidate_angles if angle > 0.0]
-                fitted_angle = float(np.median(angles)) if angles else self.cfg.corner_turn_angle_rad
-                self.target_angle_rad = max(self.cfg.corner_reacquire_angle_rad, fitted_angle)
+            else:
+                self.approach_missing_frames += 1
+                self.gate_frames = 0
+            if self.gate_frames >= self.cfg.corner_gate_confirm_frames:
+                self._start_margin(self.hold_v, reset_distance=False)
+            elif self.approach_missing_frames > self.cfg.corner_approach_missing_frames:
+                self._reset_armed()
         elif self.state == "waiting":
             self.remaining_m = max(0.0, self.remaining_m - travelled)
             if self.remaining_m <= 1e-6:
@@ -175,10 +227,18 @@ class CornerCommandDelay:
             stable = self._stable_straight(fit, features)
             self.clear_frames = self.clear_frames + 1 if stable else 0
             if self.clear_frames >= 3:
-                self.state, self.candidate_dir, self.confirm = "armed", 0, 0
-                self.candidate_angles = []
-                self.reacquire_frames = 0
+                self._reset_armed()
 
+        if self.state == "approach":
+            status = PathStrategyStatus(
+                True, "corner_event", "approaching_corner", self.remaining_m,
+                self.candidate_dir, self.capture_votes,
+                (
+                    -1.0 if geometry is None or geometry.vertex_y_frac is None else geometry.vertex_y_frac,
+                    self.cfg.corner_gate_y_frac,
+                ),
+            )
+            return CornerCommandResult(self.hold_v, self.stable_w, status)
         if self.state == "waiting":
             status = PathStrategyStatus(
                 True, "corner_event", "waiting_margin", self.remaining_m,
@@ -225,11 +285,39 @@ class CornerCommandDelay:
                 (self.turned_rad, self.target_angle_rad),
             )
             return CornerCommandResult(0.0, 0.0, status)
+        if self.state == "armed" and self.cfg.capture_geometry_enabled and geometry is not None:
+            if geometry.kind == "circle":
+                reason = "geometry_circle_passthrough"
+            elif geometry.kind == "curve":
+                reason = "geometry_curve_passthrough"
+            else:
+                reason = "armed"
+            status = PathStrategyStatus(True, "corner_event", reason, 0.0, 0, 0)
+            return CornerCommandResult(command_v, command_w, status)
         status = PathStrategyStatus(
             True, "corner_event", self.state, 0.0,
             self.candidate_dir, 0,
         )
         return CornerCommandResult(command_v, command_w, status)
+
+    def _start_margin(self, hold_v: float, reset_distance: bool = True) -> None:
+        self.state = "waiting"
+        if reset_distance:
+            self.remaining_m = self.cfg.camera_to_axle_m
+        self.hold_v = max(0.0, hold_v)
+        hold_limit = self.cfg.corner_hold_max_w
+        self.hold_w = max(-hold_limit, min(hold_limit, self.stable_w))
+        self.turned_rad = 0.0
+        self.reacquire_frames = 0
+
+    def _reset_armed(self) -> None:
+        self.state, self.candidate_dir, self.confirm = "armed", 0, 0
+        self.candidate_angles = []
+        self.remaining_m = 0.0
+        self.reacquire_frames = 0
+        self.gate_frames = 0
+        self.approach_missing_frames = 0
+        self.capture_votes = 0
 
     @staticmethod
     def _reacquire_valid(fit: TrajectoryFit) -> bool:

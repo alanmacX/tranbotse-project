@@ -15,6 +15,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from transbot_race.config import RaceConfig  # noqa: E402
+from transbot_race.capture_geometry import (  # noqa: E402
+    CaptureGeometryFilter,
+    analyze_capture_geometry,
+    draw_capture_geometry,
+)
 from transbot_race.geometry import apply_occlusion, band_is_occluded  # noqa: E402
 from transbot_race.path_memory import (  # noqa: E402
     CornerCommandDelay,
@@ -102,6 +107,16 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError("corner reacquire and handoff frame counts must be positive")
     if cfg.path_memory.max_motion_dt_sec <= 0.0:
         raise ValueError("path-memory motion interval must be positive")
+    if not 0.0 < cfg.path_memory.corner_gate_y_frac < 1.0:
+        raise ValueError("corner geometry gate must be within (0, 1)")
+    if cfg.path_memory.corner_gate_confirm_frames <= 0:
+        raise ValueError("corner geometry gate confirmation must be positive")
+    if cfg.path_memory.corner_approach_max_w < 0.0:
+        raise ValueError("corner approach angular speed cannot be negative")
+    if cfg.path_memory.corner_approach_missing_frames < 0:
+        raise ValueError("corner approach missing-frame tolerance cannot be negative")
+    if cfg.path_memory.geometry_roi_top_offset_px < 0 or cfg.path_memory.geometry_chassis_trim_px <= 0:
+        raise ValueError("capture geometry ROI values are invalid")
 
 
 class DryBot:
@@ -177,7 +192,8 @@ class DebugRecorder:
         self.overlays_dir = self.root / "overlays"
         self.masks_dir = self.root / "masks"
         self.obstacles_dir = self.root / "obstacles"
-        for path in (self.frames_dir, self.crops_dir, self.overlays_dir, self.masks_dir, self.obstacles_dir):
+        self.geometry_dir = self.root / "geometry"
+        for path in (self.frames_dir, self.crops_dir, self.overlays_dir, self.masks_dir, self.obstacles_dir, self.geometry_dir):
             path.mkdir(parents=True, exist_ok=True)
 
         with (self.root / "meta.json").open("w", encoding="utf-8") as f:
@@ -204,6 +220,7 @@ class DebugRecorder:
         self, summary: dict, frame, crop, mask, features, cfg: RaceConfig, crop_center: float,
         raw_crop=None, obstacle_decision=None, raw_track_center: float | None = None,
         strategy_status: PathStrategyStatus | None = None,
+        geometry_observation=None, geometry_debug=None,
     ) -> None:
         if not self.enabled or self.root is None:
             return
@@ -232,6 +249,11 @@ class DebugRecorder:
         if raw_crop is not None and obstacle_decision is not None and raw_track_center is not None:
             obstacle_overlay = draw_obstacle_overlay(raw_crop, obstacle_decision, raw_track_center, cfg.obstacle)
             cv.imwrite(str(self.obstacles_dir / f"{stem}.jpg"), obstacle_overlay, params)
+        if geometry_observation is not None and geometry_debug is not None:
+            geometry_overlay = draw_capture_geometry(
+                geometry_debug, geometry_observation, cfg.path_memory.corner_gate_y_frac,
+            )
+            cv.imwrite(str(self.geometry_dir / f"{stem}.jpg"), geometry_overlay, params)
 
         self.last_frame_t = elapsed
         self.frame_count += 1
@@ -254,6 +276,7 @@ class DebugRecorder:
                     "overlays": "overlays/",
                     "masks": "masks/",
                     "obstacles": "obstacles/",
+                    "geometry": "geometry/",
                 },
                 f,
                 ensure_ascii=False,
@@ -267,6 +290,7 @@ def run(args: argparse.Namespace) -> int:
     bot = make_bot(args.dry_run)
     sm = RaceStateMachine(cfg)
     corner_margin = CornerCommandDelay(cfg.path_memory)
+    geometry_filter = CaptureGeometryFilter(cfg.path_memory.corner_confirm_frames)
     obstacle_monitor = ObstacleMonitor(cfg.obstacle)
     cap = cv.VideoCapture(args.camera)
     cap.set(cv.CAP_PROP_FRAME_WIDTH, cfg.camera.frame_width)
@@ -329,6 +353,13 @@ def run(args: argparse.Namespace) -> int:
             obstacle_armed = now <= obstacle_armed_until
             obstacle_decision = obstacle_monitor.update(raw_crop, raw_track_center, obstacle_armed)
 
+            geometry_observation = None
+            geometry_decision = None
+            geometry_debug = None
+            if strategy_mode == "corner_event" and cfg.path_memory.capture_geometry_enabled:
+                geometry_observation, geometry_debug = analyze_capture_geometry(frame, cfg)
+                geometry_decision = geometry_filter.update(geometry_observation)
+
             fit = visual_fit
             memory_status = PathStrategyStatus(False, strategy_mode, "disabled")
             if cfg.path_memory.enabled:
@@ -338,9 +369,21 @@ def run(args: argparse.Namespace) -> int:
                     memory_status = PathStrategyStatus(True, "corner_event", corner_margin.state)
             command = sm.step(fit, now=now, obstacle=obstacle_decision.stop_required)
             if strategy_mode == "corner_event" and not obstacle_decision.stop_required:
+                approach_w = None
+                if geometry_observation is not None:
+                    turn_sign = 1.0 if cfg.tracker.invert_turn else -1.0
+                    approach_w = turn_sign * (
+                        cfg.tracker.k_e * geometry_observation.incoming_e
+                        + cfg.tracker.k_theta * geometry_observation.incoming_theta
+                    )
+                    limit = cfg.path_memory.corner_approach_max_w
+                    approach_w = max(-limit, min(limit, approach_w))
                 delayed = corner_margin.step(
                     visual_fit, features, command.v, command.w, now,
                     motion.linear, motion.angular,
+                    geometry=geometry_observation,
+                    geometry_decision=geometry_decision,
+                    approach_w=approach_w,
                 )
                 memory_status = delayed.status
                 if delayed.v != command.v or delayed.w != command.w:
@@ -373,6 +416,16 @@ def run(args: argparse.Namespace) -> int:
             summary["path_strategy_points"] = memory_status.point_count
             summary["path_strategy_target"] = memory_status.target
             summary["camera_to_axle_m"] = round(cfg.path_memory.camera_to_axle_m, 4)
+            summary["geometry_kind"] = None if geometry_observation is None else geometry_observation.kind
+            summary["geometry_direction"] = None if geometry_observation is None else geometry_observation.direction
+            summary["geometry_angle_deg"] = None if geometry_observation is None else round(
+                geometry_observation.angle_rad * 180.0 / 3.141592653589793, 2,
+            )
+            summary["geometry_vertex_y_frac"] = (
+                None if geometry_observation is None or geometry_observation.vertex_y_frac is None
+                else round(geometry_observation.vertex_y_frac, 4)
+            )
+            summary["geometry_decision"] = None if geometry_decision is None else geometry_decision.kind
             summary["obstacle_state"] = obstacle_decision.state.value
             summary["obstacle_conf"] = round(obstacle_decision.confidence, 3)
             summary["obstacle_armed"] = obstacle_armed
@@ -385,6 +438,8 @@ def run(args: argparse.Namespace) -> int:
                 obstacle_decision=obstacle_decision,
                 raw_track_center=raw_track_center,
                 strategy_status=memory_status,
+                geometry_observation=geometry_observation,
+                geometry_debug=geometry_debug,
             )
             if now - last_log >= args.log_period:
                 print(json.dumps(summary, ensure_ascii=False))
