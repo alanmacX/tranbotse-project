@@ -263,7 +263,7 @@ HTML = """
       </section>
       <section>
         <h2>车轴路径缓存</h2>
-        <div class="row"><label>转弯延迟距离</label><input id="path_memory.camera_to_axle_m" type="range" min="0.00" max="0.80" step="0.005"><input id="path_memory.camera_to_axle_mn" type="number" step="0.005"></div>
+        <div class="row"><label>门线→驱动轴</label><input id="path_memory.camera_to_axle_m" type="range" min="0.00" max="0.30" step="0.005"><input id="path_memory.camera_to_axle_mn" type="number" step="0.005"></div>
         <button onclick="saveConfig()">应用</button>
         <p class="hint">按实际行驶距离延迟转弯信号。数值增大时转弯更晚，减小时更早。</p>
       </section>
@@ -676,6 +676,7 @@ def _reset_legacy_single_state_defaults() -> None:
     CONFIG.vision.fit_mode = "classic"
     CONFIG.vision.component_min_area_px = 45
     CONFIG.vision.component_min_fill_ratio = 0.10
+    CONFIG.vision.component_min_thickness_px = 2.5
     CONFIG.vision.component_max_width_ratio = 0.92
     CONFIG.vision.component_bottom_bar_width_ratio = 0.34
     CONFIG.vision.component_bottom_bar_height_ratio = 0.20
@@ -852,7 +853,11 @@ class Handler(BaseHTTPRequestHandler):
         frame = cv.imread(str(path))
         if frame is None:
             raise RuntimeError(f"cannot read image: {path}")
-        mask = preprocess_blackline(frame, CONFIG.vision)
+        mask = preprocess_blackline(
+            frame,
+            CONFIG.vision,
+            anchor_x=frame.shape[1] / 2.0,
+        )
         crop_w = float(frame.shape[1])
         features = scan_line_features(mask, CONFIG.vision)
         fit = fit_line_trajectory(features, CONFIG.vision, crop_center=crop_w / 2.0, crop_width=crop_w)

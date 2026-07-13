@@ -156,15 +156,14 @@ async function loadStrategy() {
   el("obstacleEnabled").checked = !!cfg.obstacle.enabled;
   el("strategyMargin").value = cfg.path_memory.camera_to_axle_m;
   el("cornerConfirm").value = cfg.path_memory.corner_confirm_frames;
-  el("cornerTheta").value = cfg.path_memory.corner_theta_threshold;
   el("cornerTurnAngle").value = cfg.path_memory.corner_turn_angle_rad;
-  el("cornerAngleScale").value = cfg.path_memory.corner_capture_angle_scale;
   el("cornerYawScale").value = cfg.path_memory.corner_command_yaw_scale;
   el("cornerReacquireAngle").value = cfg.path_memory.corner_reacquire_angle_rad;
   el("cornerTurnW").value = cfg.path_memory.corner_replay_max_w;
-  el("cornerTurnSpeed").value = cfg.path_memory.corner_turn_speed_ratio;
+  el("roundaboutDirection").value = String(cfg.path_memory.roundabout_direction);
+  el("roundaboutTurnW").value = cfg.path_memory.roundabout_replay_max_w;
+  el("roundaboutMargin").checked = !!cfg.path_memory.roundabout_margin_enabled;
   el("cornerReacquireFrames").value = cfg.path_memory.corner_reacquire_confirm_frames;
-  el("cornerHandoffFrames").value = cfg.path_memory.corner_handoff_blend_frames;
   showStrategyFields();
 }
 
@@ -176,15 +175,14 @@ el("strategySaveBtn").addEventListener("click", () => guard("STRATEGY", async ()
       mode: strategyMode.value,
       camera_to_axle_m: Number(el("strategyMargin").value),
       corner_confirm_frames: Number(el("cornerConfirm").value),
-      corner_theta_threshold: Number(el("cornerTheta").value),
       corner_turn_angle_rad: Number(el("cornerTurnAngle").value),
-      corner_capture_angle_scale: Number(el("cornerAngleScale").value),
       corner_command_yaw_scale: Number(el("cornerYawScale").value),
       corner_reacquire_angle_rad: Number(el("cornerReacquireAngle").value),
       corner_replay_max_w: Number(el("cornerTurnW").value),
-      corner_turn_speed_ratio: Number(el("cornerTurnSpeed").value),
+      roundabout_direction: Number(el("roundaboutDirection").value),
+      roundabout_replay_max_w: Number(el("roundaboutTurnW").value),
+      roundabout_margin_enabled: el("roundaboutMargin").checked,
       corner_reacquire_confirm_frames: Number(el("cornerReacquireFrames").value),
-      corner_handoff_blend_frames: Number(el("cornerHandoffFrames").value),
     },
     obstacle: { enabled: el("obstacleEnabled").checked },
   });

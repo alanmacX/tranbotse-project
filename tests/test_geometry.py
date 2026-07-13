@@ -19,7 +19,27 @@ def straight(x=CENTER, line_w=18):
 
 
 class OcclusionTests(unittest.TestCase):
-    def test_large_corner_survives_near_reflection_guard(self):
+    def test_thin_low_contrast_grout_is_rejected_but_black_tape_is_kept(self):
+        mask = np.zeros((H, W), dtype=np.uint8)
+        cv.line(mask, (25, H - 1), (125, 10), 255, 3)
+        hard = np.zeros_like(mask)
+        near = np.zeros_like(mask)
+
+        grout_gray = np.full((H, W), 110, dtype=np.uint8)
+        grout_gray[mask > 0] = 63  # 63/110: latest night grout signature.
+        grout = _filter_preprocess_components(
+            mask, hard, near, min_thickness_px=2.5, gray=grout_gray,
+        )
+        self.assertEqual(cv.countNonZero(grout), 0)
+
+        tape_gray = np.full((H, W), 112, dtype=np.uint8)
+        tape_gray[mask > 0] = 30  # Far tape is thin but decisively black.
+        tape = _filter_preprocess_components(
+            mask, hard, near, min_thickness_px=2.5, gray=tape_gray,
+        )
+        self.assertGreater(cv.countNonZero(tape), 0)
+
+    def test_large_sparse_shape_near_reflection_is_rejected(self):
         mask = np.zeros((H, W), dtype=np.uint8)
         cv.rectangle(mask, (50, 55), (68, H - 1), 255, -1)
         cv.rectangle(mask, (50, 55), (145, 73), 255, -1)
@@ -27,7 +47,24 @@ class OcclusionTests(unittest.TestCase):
         near = np.zeros_like(mask)
         cv.rectangle(near, (45, 45), (95, 95), 255, -1)
         clean = _filter_preprocess_components(mask, hard, near)
-        self.assertGreater(cv.countNonZero(clean), 2000)
+        self.assertEqual(cv.countNonZero(clean), 0)
+
+    def test_near_reflection_exemption_requires_track_anchor_corridor(self):
+        mask = np.zeros((H, W), dtype=np.uint8)
+        cv.rectangle(mask, (50, 55), (68, H - 1), 255, -1)
+        cv.rectangle(mask, (50, 55), (145, 73), 255, -1)
+        hard = np.zeros_like(mask)
+        near = np.zeros_like(mask)
+        cv.rectangle(near, (45, 45), (95, 95), 255, -1)
+
+        anchored = _filter_preprocess_components(
+            mask, hard, near, anchor_x=60.0, anchor_margin_px=32.0,
+        )
+        off_corridor = _filter_preprocess_components(
+            mask, hard, near, anchor_x=10.0, anchor_margin_px=32.0,
+        )
+        self.assertGreater(cv.countNonZero(anchored), 0)
+        self.assertEqual(cv.countNonZero(off_corridor), 0)
 
     def test_disabled_is_passthrough(self):
         mask = straight()

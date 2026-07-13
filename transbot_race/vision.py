@@ -81,13 +81,22 @@ class LineFeatures:
         return self.branch_left is not None or self.branch_right is not None
 
 
-def _raw_dark_cap(gray: np.ndarray) -> int:
+def _raw_dark_cap(gray: np.ndarray, cfg: VisionConfig) -> int:
     """Dynamic raw-gray cap that keeps black tape and rejects gray shadows."""
 
     p50 = float(np.percentile(gray, 50))
     p35 = float(np.percentile(gray, 35))
     p08 = float(np.percentile(gray, 8))
-    return int(min(112, max(58, min(p50 - 5, p35 + 12, p08 + 24))))
+    configured_percentile = float(
+        np.percentile(gray, max(1, min(49, int(cfg.percentile))))
+    )
+    dynamic = max(
+        58.0,
+        min(112.0, p50 - 5.0, p35 + 12.0, p08 + 24.0, configured_percentile + 12.0),
+    )
+    lower = max(0, min(255, int(cfg.threshold_min)))
+    upper = max(lower, min(255, int(cfg.threshold_max)))
+    return int(np.clip(dynamic, lower, upper))
 
 
 def _reflection_guards(frame_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -100,6 +109,11 @@ def _reflection_guards(frame_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         (gray >= bright_threshold)
         | ((hsv[:, :, 2] >= bright_threshold) & (hsv[:, :, 1] <= 75))
     ).astype(np.uint8) * 255
+    # A guard is meaningful only for sparse highlights.  Uniformly bright
+    # floor (and synthetic calibration boards) is illumination, not glare;
+    # classifying most of the ROI as specular erases every dark-line cue.
+    if cv.countNonZero(core) > int(core.size * 0.18):
+        core[:] = 0
     core = cv.morphologyEx(
         core,
         cv.MORPH_OPEN,
@@ -124,7 +138,15 @@ def _reflection_guards(frame_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return hard_guard, near_guard
 
 
-def _filter_preprocess_components(mask: np.ndarray, hard_guard: np.ndarray, near_guard: np.ndarray) -> np.ndarray:
+def _filter_preprocess_components(
+    mask: np.ndarray,
+    hard_guard: np.ndarray,
+    near_guard: np.ndarray,
+    min_thickness_px: float = 2.5,
+    gray: np.ndarray | None = None,
+    anchor_x: float | None = None,
+    anchor_margin_px: float | None = None,
+) -> np.ndarray:
     """Remove reflection rims, tile seams, and border slivers from a raw mask."""
 
     height, width = mask.shape[:2]
@@ -132,6 +154,7 @@ def _filter_preprocess_components(mask: np.ndarray, hard_guard: np.ndarray, near
     clean = np.zeros_like(mask)
     hard_bool = hard_guard > 0
     near_bool = near_guard > 0
+    thickness = cv.distanceTransform(mask, cv.DIST_L2, 5)
     for component_id in range(1, count):
         x = int(stats[component_id, cv.CC_STAT_LEFT])
         y = int(stats[component_id, cv.CC_STAT_TOP])
@@ -158,25 +181,84 @@ def _filter_preprocess_components(mask: np.ndarray, hard_guard: np.ndarray, near
             continue
 
         component = labels == component_id
+        core_radius = float(np.percentile(thickness[component], 90))
+        # A diagonal grout seam can have a large bounding box and cross five or
+        # more scan bands (193907 at 26.27 s), so area/aspect alone cannot
+        # reject it.  Tape retains a several-pixel interior core; preserve
+        # small solid far-field dashes through the fill-ratio exception.
+        if (
+            gray is not None
+            and core_radius < max(0.0, float(min_thickness_px))
+            and fill < 0.45
+        ):
+            local_ring = cv.dilate(
+                component.astype(np.uint8),
+                cv.getStructuringElement(cv.MORPH_ELLIPSE, (15, 15)),
+                iterations=1,
+            ).astype(bool) & ~component
+            component_gray = float(np.median(gray[component]))
+            surround_gray = (
+                float(np.median(gray[local_ring]))
+                if np.any(local_ring)
+                else component_gray
+            )
+            local_dark_ratio = component_gray / max(1.0, surround_gray)
+            # Perspective can shrink far black tape to a two-pixel core too.
+            # Keep it when it remains decisively darker than its immediate
+            # floor (historical true exits: 63--86 levels).  Night grout in
+            # 193907 was 63/110 ~= .57 despite spanning five scan bands, while
+            # historical thin true tape was .27--.31.  A ratio is invariant to
+            # global exposure changes, unlike a fixed gray-level difference.
+            if local_dark_ratio > 0.50:
+                continue
+        # Absolute-dark fallback masks used to turn an underexposed half-floor
+        # into one dense component.  A tape corner/ring is sparse in its box;
+        # a large filled floor shadow is not.
+        if w > width * 0.45 and h > height * 0.30 and fill > 0.60:
+            continue
+
         hard_overlap = float(np.count_nonzero(component & hard_bool)) / float(max(1, area))
         near_overlap = float(np.count_nonzero(component & near_bool)) / float(max(1, area))
         effective_thickness = area / float(max(w, h, 1))
-        track_structure = (
+        track_structure = bool(
             area >= 900
             and h >= height * 0.45
             and effective_thickness >= 10.0
             and (w >= width * 0.18 or fill >= 0.50)
         )
+        bbox_anchor_distance = float("inf")
+        if anchor_x is not None:
+            bbox_anchor_distance = max(
+                float(x) - float(anchor_x),
+                float(anchor_x) - float(x + w - 1),
+                0.0,
+            )
+        anchor_corridor = (
+            max(width * 0.16, 1.0)
+            if anchor_margin_px is None
+            else max(1.0, float(anchor_margin_px))
+        )
+        anchored_track_structure = bool(
+            track_structure and bbox_anchor_distance <= anchor_corridor
+        )
         if hard_overlap > 0.18 and fill < 0.65:
             continue
-        if near_overlap > 0.16 and fill < 0.50 and not track_structure:
+        if (
+            near_overlap > 0.16
+            and fill < 0.50
+            and not anchored_track_structure
+        ):
             continue
 
         clean[component] = 255
     return clean
 
 
-def preprocess_blackline(frame_bgr: np.ndarray, cfg: VisionConfig) -> np.ndarray:
+def preprocess_blackline(
+    frame_bgr: np.ndarray,
+    cfg: VisionConfig,
+    anchor_x: float | None = None,
+) -> np.ndarray:
     """Return a binary mask where likely black track pixels are 255."""
 
     gray = cv.cvtColor(frame_bgr, cv.COLOR_BGR2GRAY)
@@ -194,7 +276,7 @@ def preprocess_blackline(frame_bgr: np.ndarray, cfg: VisionConfig) -> np.ndarray
         81,
         5,
     )
-    mask[gray > _raw_dark_cap(gray)] = 0
+    mask[gray > _raw_dark_cap(gray, cfg)] = 0
     mask[hard_guard > 0] = 0
 
     mask = cv.morphologyEx(
@@ -209,7 +291,15 @@ def preprocess_blackline(frame_bgr: np.ndarray, cfg: VisionConfig) -> np.ndarray
         cv.getStructuringElement(cv.MORPH_RECT, (3, 7)),
         iterations=1,
     )
-    return _filter_preprocess_components(mask, hard_guard, near_guard)
+    return _filter_preprocess_components(
+        mask,
+        hard_guard,
+        near_guard,
+        cfg.component_min_thickness_px,
+        gray,
+        anchor_x,
+        max(float(cfg.sliding_window_margin_px), mask.shape[1] * 0.16),
+    )
 
 
 def _band_bounds(index: int, height: int, band_count: int) -> tuple[int, int]:
@@ -857,7 +947,11 @@ def fit_line_trajectory(
     for sample in samples[1:]:
         prev_index, _prev_y, prev_x, _prev_w = near_samples[-1]
         index, _y, x, _w = sample
-        if index == prev_index + 1 and abs(x - prev_x) <= max_jump_px:
+        gap = index - prev_index
+        if (
+            1 <= gap <= cfg.sliding_window_max_gap_bands + 1
+            and abs(x - prev_x) <= max_jump_px
+        ):
             near_samples.append(sample)
         else:
             disconnected = True

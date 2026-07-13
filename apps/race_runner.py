@@ -30,7 +30,12 @@ from transbot_race.obstacle import (  # noqa: E402
     ObstacleMonitor,
     draw_obstacle_overlay,
 )
-from transbot_race.state_machine import RaceStateMachine, command_summary  # noqa: E402
+from transbot_race.state_machine import (  # noqa: E402
+    MotionCommand,
+    RaceState,
+    RaceStateMachine,
+    command_summary,
+)
 from transbot_race.vision import (  # noqa: E402
     _band_bounds,
     draw_debug_overlay,
@@ -89,6 +94,12 @@ def _validate_config(cfg: RaceConfig) -> None:
         )
     if x1 <= x0:
         raise ValueError(f"crop x1 must be > x0, got {cfg.camera.crop}")
+    if not 0 <= cfg.vision.percentile <= 100:
+        raise ValueError("vision percentile must be within [0, 100]")
+    if not 0 <= cfg.vision.threshold_min <= cfg.vision.threshold_max <= 255:
+        raise ValueError("vision thresholds must satisfy 0 <= min <= max <= 255")
+    if cfg.vision.component_min_thickness_px < 0.0:
+        raise ValueError("vision component thickness cannot be negative")
     if cfg.path_memory.camera_to_axle_m < 0.0:
         raise ValueError("camera-to-axle distance cannot be negative")
     if cfg.path_memory.mode not in ("none", "corner_event"):
@@ -97,22 +108,20 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError("corner confirmation frame count must be positive")
     if cfg.path_memory.corner_replay_max_w <= 0.0 or cfg.path_memory.corner_turn_angle_rad <= 0.0:
         raise ValueError("corner turn angle and angular speed must be positive")
-    if not 0.0 <= cfg.path_memory.corner_turn_speed_ratio <= 1.0:
-        raise ValueError("corner turn speed ratio must be within [0, 1]")
+    if cfg.path_memory.roundabout_direction not in (-1, 1):
+        raise ValueError("roundabout_direction must be -1 (left) or +1 (right)")
+    if cfg.path_memory.roundabout_replay_max_w <= 0.0:
+        raise ValueError("roundabout angular speed must be positive")
     if not 0.0 <= cfg.path_memory.corner_reacquire_angle_rad <= cfg.path_memory.corner_turn_angle_rad:
         raise ValueError("corner reacquire angle must be within [0, turn angle]")
-    if cfg.path_memory.corner_capture_angle_scale <= 0.0:
-        raise ValueError("capture geometry angle scale must be positive")
     if cfg.path_memory.corner_command_yaw_scale <= 0.0:
         raise ValueError("corner command yaw scale must be positive")
     if cfg.path_memory.corner_reacquire_max_e <= 0.0 or cfg.path_memory.corner_reacquire_max_theta <= 0.0:
         raise ValueError("corner visual reacquire limits must be positive")
-    if not 0.0 <= cfg.path_memory.corner_visual_align_blend <= 1.0:
-        raise ValueError("corner visual alignment blend must be within [0, 1]")
     if cfg.path_memory.corner_image_angle_gain <= 0.0 or cfg.path_memory.corner_search_extra_rad < 0.0:
         raise ValueError("corner angle gain must be positive and extra search angle non-negative")
-    if cfg.path_memory.corner_reacquire_confirm_frames <= 0 or cfg.path_memory.corner_handoff_blend_frames <= 0:
-        raise ValueError("corner reacquire and handoff frame counts must be positive")
+    if cfg.path_memory.corner_reacquire_confirm_frames <= 0:
+        raise ValueError("corner reacquire frame count must be positive")
     if cfg.path_memory.max_motion_dt_sec <= 0.0:
         raise ValueError("path-memory motion interval must be positive")
     if not 0.0 < cfg.path_memory.corner_gate_y_frac < 1.0:
@@ -123,8 +132,31 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError("corner approach angular speed cannot be negative")
     if cfg.path_memory.corner_approach_missing_frames < 0:
         raise ValueError("corner approach missing-frame tolerance cannot be negative")
+    if cfg.path_memory.corner_align_missing_frames < 0:
+        raise ValueError("corner alignment missing-frame tolerance cannot be negative")
     if cfg.path_memory.geometry_roi_top_offset_px < 0 or cfg.path_memory.geometry_chassis_trim_px <= 0:
         raise ValueError("capture geometry ROI values are invalid")
+
+
+def _corner_control_allowed(
+    strategy_mode: str,
+    obstacle_stop_required: bool,
+    state_machine: RaceStateMachine,
+) -> bool:
+    obstacle_stop_latched = (
+        state_machine.state == RaceState.STOPPED
+        and state_machine.last_event == "obstacle"
+    )
+    return bool(
+        strategy_mode == "corner_event"
+        and not obstacle_stop_required
+        and not obstacle_stop_latched
+    )
+
+
+def _corner_has_motor_ownership(state: str, pending_takeover: bool = False) -> bool:
+    """Single arbitration rule for every corner shape, including forks."""
+    return bool(state not in {"armed", "cooldown"} or pending_takeover)
 
 
 class DryBot:
@@ -297,7 +329,10 @@ def run(args: argparse.Namespace) -> int:
     cfg = load_config(Path(args.config))
     bot = make_bot(args.dry_run)
     sm = RaceStateMachine(cfg)
-    corner_margin = CornerCommandDelay(cfg.path_memory)
+    corner_margin = CornerCommandDelay(
+        cfg.path_memory,
+        handoff_conf_min=cfg.tracker.conf_predict,
+    )
     geometry_filter = CaptureGeometryFilter(cfg.path_memory.corner_confirm_frames)
     obstacle_monitor = ObstacleMonitor(cfg.obstacle)
     cap = cv.VideoCapture(args.camera)
@@ -330,7 +365,7 @@ def run(args: argparse.Namespace) -> int:
             raw_track_center = track_center
             strategy_mode = cfg.path_memory.mode if cfg.path_memory.enabled else "disabled"
             crop_w = crop.shape[1]
-            mask = preprocess_blackline(crop, cfg.vision)
+            mask = preprocess_blackline(crop, cfg.vision, anchor_x=track_center)
             mask = apply_occlusion(mask, cfg.occlusion)
             if not occluded and cfg.occlusion.enabled:
                 occluded = occluded_band_indices(crop.shape[0], crop.shape[1], cfg)
@@ -380,18 +415,42 @@ def run(args: argparse.Namespace) -> int:
                     memory_status = PathStrategyStatus(False, "none", "passthrough")
                 elif strategy_mode == "corner_event":
                     memory_status = PathStrategyStatus(True, "corner_event", corner_margin.state)
-            command = sm.step(fit, now=now, obstacle=obstacle_decision.stop_required)
-            if strategy_mode == "corner_event" and not obstacle_decision.stop_required:
-                approach_w = command.w
-                if geometry_observation is not None:
-                    limit = cfg.path_memory.corner_approach_max_w
-                    approach_w = max(-limit, min(limit, approach_w))
+            fork_straight_phase = bool(
+                corner_margin.event_shape == "fork"
+                and corner_margin.state in {"approach", "waiting"}
+            )
+            effective_geometry_decision = geometry_decision
+            if corner_margin.state == "armed" and sm.state == RaceState.STOPPED:
+                # A stopped cruise controller may observe geometry, but must
+                # first recover a trustworthy line before a new event can take
+                # motor ownership.
+                effective_geometry_decision = None
+            pending_corner_takeover = corner_margin.will_accept_geometry(
+                effective_geometry_decision
+            )
+            corner_owns_chassis = _corner_has_motor_ownership(
+                corner_margin.state,
+                pending_corner_takeover,
+            )
+            if corner_owns_chassis and not obstacle_decision.stop_required:
+                # Do not even advance the cruise TRACK/LOST/PIVOT state while
+                # a turn is active.  Its output used to be overwritten later,
+                # but its hidden state still timed out or flipped search/pivot
+                # direction, then leaked back at handoff.
+                command = MotionCommand(0.0, 0.0, "corner_owned", sm.state, None)
+            else:
+                command = sm.step(
+                    fit, now=now,
+                    obstacle=obstacle_decision.stop_required,
+                )
+            if _corner_control_allowed(strategy_mode, obstacle_decision.stop_required, sm):
+                corner_state_before = corner_margin.state
                 delayed = corner_margin.step(
                     visual_fit, features, command.v, command.w, now,
                     motion.linear, motion.angular,
                     geometry=geometry_observation,
-                    geometry_decision=geometry_decision,
-                    approach_w=approach_w,
+                    geometry_decision=effective_geometry_decision,
+                    invert_turn=cfg.tracker.invert_turn,
                     angular_scale=(
                         cfg.path_memory.corner_command_yaw_scale
                         if motion.source == "command_fallback"
@@ -399,8 +458,23 @@ def run(args: argparse.Namespace) -> int:
                     ),
                 )
                 memory_status = delayed.status
+                if (
+                    memory_status.reason == "corner_visual_takeover"
+                    or (corner_state_before != "armed" and corner_margin.state == "armed")
+                ):
+                    geometry_filter.reset()
                 if memory_status.reason == "corner_visual_takeover":
                     command = sm.reacquire_from(visual_fit, now)
+                elif corner_state_before == "approach" and corner_margin.state == "armed":
+                    # Approach rejection is an ownership hand-back, not a
+                    # continuation of the cruise filter that was frozen before
+                    # the event.  Rebuild it atomically from the current view.
+                    sm.reset()
+                    command = sm.step(
+                        visual_fit,
+                        now=now,
+                        obstacle=obstacle_decision.stop_required,
+                    )
                 elif delayed.v != command.v or delayed.w != command.w:
                     command = replace(
                         command,
@@ -430,9 +504,16 @@ def run(args: argparse.Namespace) -> int:
             summary["path_strategy_intent_dir"] = memory_status.intent_dir
             summary["path_strategy_points"] = memory_status.point_count
             summary["path_strategy_target"] = memory_status.target
+            summary["turn_exit_latched"] = corner_margin.exit_latch.latched
+            summary["turn_exit_last_e"] = (
+                round(corner_margin.exit_latch.last_e, 4)
+                if corner_margin.exit_latch.latched else None
+            )
             summary["camera_to_axle_m"] = round(cfg.path_memory.camera_to_axle_m, 4)
+            summary["turn_entry_delay_m"] = round(cfg.path_memory.camera_to_axle_m, 4)
             summary["geometry_kind"] = None if geometry_observation is None else geometry_observation.kind
             summary["geometry_direction"] = None if geometry_observation is None else geometry_observation.direction
+            summary["geometry_is_fork"] = None if geometry_observation is None else geometry_observation.is_fork
             summary["geometry_angle_deg"] = None if geometry_observation is None else round(
                 geometry_observation.angle_rad * 180.0 / 3.141592653589793, 2,
             )
@@ -440,7 +521,20 @@ def run(args: argparse.Namespace) -> int:
                 None if geometry_observation is None or geometry_observation.vertex_y_frac is None
                 else round(geometry_observation.vertex_y_frac, 4)
             )
+            summary["geometry_turn_onset_y_frac"] = summary["geometry_vertex_y_frac"]
+            summary["geometry_incoming_e"] = (
+                None if geometry_observation is None
+                else round(geometry_observation.incoming_e, 4)
+            )
+            summary["geometry_incoming_theta"] = (
+                None if geometry_observation is None
+                else round(geometry_observation.incoming_theta, 4)
+            )
             summary["geometry_decision"] = None if geometry_decision is None else geometry_decision.kind
+            summary["fork_straight_phase"] = fork_straight_phase
+            summary["roundabout_direction"] = cfg.path_memory.roundabout_direction
+            summary["roundabout_margin_enabled"] = cfg.path_memory.roundabout_margin_enabled
+            summary["roundabout_turn_w"] = cfg.path_memory.roundabout_replay_max_w
             summary["obstacle_state"] = obstacle_decision.state.value
             summary["obstacle_conf"] = round(obstacle_decision.confidence, 3)
             summary["obstacle_armed"] = obstacle_armed

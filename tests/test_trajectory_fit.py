@@ -127,6 +127,19 @@ class TrajectoryFitTests(unittest.TestCase):
         self.assertGreaterEqual(fit.n_bands, 2)
         self.assertLess(abs(fit.e0), 0.15)
 
+    def test_intentional_sliding_window_gap_is_not_disconnected(self):
+        mask = np.zeros((H, W), dtype=np.uint8)
+        # Two collinear dashes separated by one complete scan band.  The
+        # sliding-window policy explicitly permits this gap, so the fit layer
+        # must not contradict it and halve confidence afterwards.
+        cv.rectangle(mask, (CENTER - 9, 172), (CENTER + 9, H - 1), 255, -1)
+        cv.rectangle(mask, (CENTER - 9, 115), (CENTER + 9, 142), 255, -1)
+        fit = _fit(mask, RaceConfig())
+        self.assertTrue(fit.found)
+        self.assertFalse(fit.disconnected)
+        self.assertGreaterEqual(fit.n_bands, 2)
+        self.assertGreater(fit.conf, 0.30)
+
     def test_right_angle_produces_strong_signal(self):
         # A right-angle corner should surface as large heading/curvature so the
         # continuous controller slows and pivots - no dedicated corner state.

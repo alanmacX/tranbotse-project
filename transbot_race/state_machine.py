@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import math
 
 from .config import RaceConfig
 from .vision import TrajectoryFit
@@ -73,6 +74,9 @@ class RaceStateMachine:
         self.f_theta = 0.0
         self.f_kappa = 0.0
         self.f_conf = 0.0
+        self.observed_e0 = 0.0
+        self.observed_theta = 0.0
+        self.observation_reliable = False
         self.d_e0 = 0.0
         self.in_pivot = False
         self.use_path_lookahead = False
@@ -83,6 +87,9 @@ class RaceStateMachine:
         self.plan_active_since: float | None = None
         self.plan_forward_until = 0.0
         self.plan_turn_until = 0.0
+        self.stopped_reacquire_frames = 0
+        self.stopped_reacquire_e: float | None = None
+        self.stopped_reacquire_theta: float | None = None
         self.last_event = "init"
 
     def reset(self) -> None:
@@ -92,18 +99,28 @@ class RaceStateMachine:
         """Restart normal tracking from the current line without stale turn history."""
         self.state = RaceState.TRACK
         self.state_started_at = now
+        self._seed_filter(fit)
+        self.in_pivot = False
+        self.ever_acquired = True
+        self._clear_plan()
+        self.stopped_reacquire_frames = 0
+        self.stopped_reacquire_e = None
+        self.stopped_reacquire_theta = None
+        self.last_event = "corner_visual_takeover"
+        return self._track_step(now)
+
+    def _seed_filter(self, fit: TrajectoryFit) -> None:
+        """Replace, rather than blend, pose history at an ownership boundary."""
         self.f_e0 = fit.e0
         self.f_e_look = fit.e_look
         self.f_theta = fit.theta
         self.f_kappa = fit.kappa
         self.f_conf = fit.conf
+        self.observed_e0 = fit.e0
+        self.observed_theta = fit.theta
+        self.observation_reliable = self._trackable_observation(fit)
         self.d_e0 = 0.0
-        self.in_pivot = False
         self.use_path_lookahead = fit.path_memory
-        self.ever_acquired = True
-        self._clear_plan()
-        self.last_event = "corner_visual_takeover"
-        return self._track_step(now)
 
     # -- public API -------------------------------------------------------
     def step(self, fit: TrajectoryFit, now: float, obstacle: bool = False) -> MotionCommand:
@@ -112,18 +129,55 @@ class RaceStateMachine:
             return MotionCommand(0.0, 0.0, "obstacle", self.state, None)
 
         if self.state == RaceState.STOPPED:
+            # Obstacle STOP is a hard safety latch.  Search timeout is only an
+            # exhausted motion search: keep the chassis still, but allow a
+            # complete line that remains visible for three frames to reseed the
+            # tracker.  In 193907 the line was good again at 26.63 s, yet the
+            # old terminal STOP ignored it forever.
+            recoverable = bool(
+                self.last_event == "search_timeout"
+                and self._trackable_observation(fit)
+            )
+            continuous = bool(
+                recoverable
+                and (
+                    self.stopped_reacquire_e is None
+                    or (
+                        abs(fit.e0 - self.stopped_reacquire_e) <= 0.32
+                        and self.stopped_reacquire_theta is not None
+                        and abs(fit.theta - self.stopped_reacquire_theta) <= 0.45
+                    )
+                )
+            )
+            self.stopped_reacquire_frames = (
+                self.stopped_reacquire_frames + 1
+                if continuous else int(recoverable)
+            )
+            if recoverable:
+                self.stopped_reacquire_e = fit.e0
+                self.stopped_reacquire_theta = fit.theta
+            else:
+                self.stopped_reacquire_e = None
+                self.stopped_reacquire_theta = None
+            if self.stopped_reacquire_frames >= 3:
+                return self.reacquire_from(fit, now)
             return MotionCommand(0.0, 0.0, "stopped", self.state, None)
 
-        self._update_plan_latch(fit, now)
-        self._update_filter(fit)
-        if fit.found and fit.conf > 0.0:
-            self.ever_acquired = True
-
-        # Camera exposure and the first preprocessing frames may be blank. Do
-        # not rotate before the tracker has established which side the line is
-        # on; LOST search is only meaningful after a real acquisition.
+        # Before the first complete observation, weak two-band fragments are
+        # neither motion evidence nor filter history.  Blending them while
+        # stopped lets night grout poison the first real command several
+        # frames later.  The first trackable line atomically seeds pose.
         if not self.ever_acquired:
-            return MotionCommand(0.0, 0.0, "await_first_line", self.state, None)
+            if not self._trackable_observation(fit):
+                return MotionCommand(0.0, 0.0, "await_first_line", self.state, None)
+            self._seed_filter(fit)
+            self.ever_acquired = True
+        else:
+            self._update_filter(fit)
+        # Preview memory starts only after the current line has established a
+        # pose.  A weak startup fragment must not leave a latent turn plan that
+        # executes after an unrelated first acquisition.
+        self._update_plan_latch(fit, now)
 
         if self.state == RaceState.LOST:
             return self._lost_step(now)
@@ -140,9 +194,31 @@ class RaceStateMachine:
         return self._track_step(now)
 
     # -- filtering --------------------------------------------------------
+    def _trackable_observation(self, fit: TrajectoryFit) -> bool:
+        return bool(
+            fit.found
+            and fit.conf >= self.cfg.tracker.conf_predict
+            and fit.n_bands >= 3
+            and not fit.disconnected
+        )
+
+    def _pose_observation_usable(self, fit: TrajectoryFit) -> bool:
+        """A weaker, still coherent dash may update pose but not mode gates."""
+        return bool(
+            fit.found
+            and fit.conf >= 0.60 * self.cfg.tracker.conf_predict
+            and fit.n_bands >= 2
+            and not fit.disconnected
+        )
+
     def _update_filter(self, fit: TrajectoryFit) -> None:
         t = self.cfg.tracker
-        if fit.found and fit.conf > 0.0:
+        self.observation_reliable = self._trackable_observation(fit)
+        if self.observation_reliable:
+            self.observed_e0 = fit.e0
+            self.observed_theta = fit.theta
+        pose_observation_usable = self._pose_observation_usable(fit)
+        if pose_observation_usable:
             self.use_path_lookahead = fit.path_memory
             prev_e0 = self.f_e0
             a, b = t.filter_alpha, t.filter_beta
@@ -241,17 +317,78 @@ class RaceStateMachine:
             lateral = t.k_e * e0
 
         sign = 1.0 if t.invert_turn else -1.0
-        w = sign * (lateral + t.k_theta * theta + t.k_ff * kappa)
+        heading_curve = t.k_theta * theta + t.k_ff * kappa
+        steering = lateral + heading_curve
+
+        # After a sharp turn the line commonly crosses the bottom of the image
+        # before the chassis is parallel to it.  Then lateral and heading terms
+        # have opposite signs.  Letting heading/curvature cancel a substantial
+        # lateral error produced an almost-zero (and sometimes wrong-way)
+        # command throughout the first-corner recovery in run 173927.  Outside
+        # the inner half of the pivot band, keep at least the lateral correction
+        # itself; heading still shapes the command once the chassis is close.
+        exit_thr_e = t.e_pivot * (1.0 - t.pivot_hysteresis)
+        if (
+            abs(e0) > 0.5 * exit_thr_e
+            and lateral * heading_curve < 0.0
+            and (
+                steering * lateral <= 0.0
+                or abs(steering) < abs(lateral)
+            )
+        ):
+            steering = lateral
+        w = sign * steering
 
         # Pivot assist: saturation branch for sharp bends / corners of any angle.
-        enter = abs(e0) > t.e_pivot or abs(theta) > t.theta_pivot
-        exit_thr_e = t.e_pivot * (1.0 - t.pivot_hysteresis)
-        exit_thr_th = t.theta_pivot * (1.0 - t.pivot_hysteresis)
-        stay = abs(e0) > exit_thr_e or abs(theta) > exit_thr_th
+        # Pivot is the stationary, saturated part of tracking.  Its old exit
+        # threshold was 0.572 rad (32.8 deg) with the live configuration, so a
+        # visibly diagonal line was declared ready for moving follow.  Rotation
+        # cannot remove lateral offset, therefore exit on heading alignment and
+        # leave the remaining lateral convergence to moving follow.  Half the
+        # existing entry threshold is an inner saturation boundary, not a new
+        # tuned parameter.
+        # If lateral and heading have opposite signs, the exposed line has
+        # already crossed the chassis centre.  More stationary rotation would
+        # chase past it; translation is now required to remove the offset.
+        crossing_e = self.observed_e0 if self.observation_reliable else e0
+        crossing_theta = self.observed_theta if self.observation_reliable else theta
+        line_crossed_centre = crossing_e * crossing_theta < -1e-4
+        # A complete line inside the inner lateral corridor is already a safe
+        # moving-follow target even if its fitted heading is still diagonal.
+        # Continuing stationary rotation discarded the textbook centre entry
+        # visible at 27.86 s in run 190809. The protected moving controller now
+        # owns the remaining angular convergence.
+        line_in_control_corridor = bool(
+            abs(crossing_e) <= exit_thr_e
+            and abs(crossing_theta) <= t.theta_pivot
+        )
+        # Entry and stay must use the same geometric eligibility.  Otherwise a
+        # line that has just crossed centre exits pivot for one frame, then the
+        # still-large |e|/|theta| immediately enters it again on the next
+        # frame.  That pivot/follow oscillation is stationary over-rotation,
+        # not convergence; translation owns the pose after centre crossing.
+        pivot_threshold_exceeded = (
+            abs(e0) > t.e_pivot or abs(theta) > t.theta_pivot
+        )
+        enter = bool(
+            pivot_threshold_exceeded
+            and not line_crossed_centre
+            and not line_in_control_corridor
+        )
+        # Use one geometric release rule while pivot is active.  Previously an
+        # almost-parallel line with large lateral error exited on heading alone,
+        # then immediately re-entered on |e| (193907: pivot/follow/pivot).  Keep
+        # rotating until the line reaches the inner corridor or crosses centre;
+        # moving follow owns the remaining alignment from that point.
+        stay = not line_crossed_centre and not line_in_control_corridor
         self.in_pivot = enter if not self.in_pivot else stay
 
         if self.in_pivot:
-            pivot_sign = -1.0 if w < 0 else 1.0
+            # Use the protected unified steering sign.  Before centre crossing
+            # this reduces the exposed line's heading; at/after crossing pivot
+            # exits instead of reversing into another stationary chase.
+            pivot_reference = w
+            pivot_sign = -1.0 if pivot_reference < 0 else 1.0
             w = pivot_sign * t.w_pivot
             v = t.v_max * t.v_pivot_ratio
             mode = TrackMode.PIVOT
@@ -287,6 +424,9 @@ class RaceStateMachine:
         self.state = state
         self.state_started_at = now
         self.last_event = event
+        self.stopped_reacquire_frames = 0
+        self.stopped_reacquire_e = None
+        self.stopped_reacquire_theta = None
         if state != RaceState.TRACK:
             self.in_pivot = False
             self._clear_plan()

@@ -34,12 +34,16 @@ class PathMemoryConfig:
 
     enabled: bool = True
     mode: str = "none"  # none, corner_event
+    # Odometric distance from the near-field curvature-onset gate to the axle
+    # turn point.  This is a gate-to-axle longitudinal extrinsic compensation,
+    # not an image-processing margin and not a delay from first detection.
     camera_to_axle_m: float = 0.10
     capture_geometry_enabled: bool = True
     corner_gate_y_frac: float = 0.52
     corner_gate_confirm_frames: int = 2
     corner_approach_max_w: float = 0.08
     corner_approach_missing_frames: int = 4
+    corner_align_missing_frames: int = 4
     geometry_roi_top_offset_px: int = 80
     geometry_chassis_trim_px: int = 45
     corner_confirm_frames: int = 3
@@ -47,18 +51,22 @@ class PathMemoryConfig:
     corner_e_threshold: float = 0.48
     corner_hold_max_w: float = 0.0
     corner_replay_max_w: float = 0.20
+    # A roundabout fork is route-selected rather than inferred from the longest
+    # visible skeleton.  +1 is image/right, -1 image/left.
+    roundabout_direction: int = 1
+    # Oblique line/circle intersections do not share the corner gate-to-axle
+    # geometry.  Keep a rollback switch, disabled by default.
+    roundabout_margin_enabled: bool = True
+    roundabout_replay_max_w: float = 0.20
     corner_turn_angle_rad: float = 1.57
-    corner_capture_angle_scale: float = 0.70
-    corner_command_yaw_scale: float = 0.50
+    corner_command_yaw_scale: float = 1.00
+    # Minimum accumulated yaw before the first same-side exit line is eligible.
     corner_reacquire_angle_rad: float = 0.35
-    corner_reacquire_max_e: float = 0.25
-    corner_reacquire_max_theta: float = 0.45
-    corner_visual_align_blend: float = 0.70
-    corner_turn_speed_ratio: float = 0.45
+    corner_reacquire_max_e: float = 0.18
+    corner_reacquire_max_theta: float = 0.20
     corner_image_angle_gain: float = 6.8
     corner_search_extra_rad: float = 0.40
-    corner_reacquire_confirm_frames: int = 2
-    corner_handoff_blend_frames: int = 5
+    corner_reacquire_confirm_frames: int = 3
     max_motion_dt_sec: float = 1.0
 
 
@@ -113,6 +121,9 @@ class VisionConfig:
     # components first, then follow one bottom-anchored window path.
     component_min_area_px: int = 45
     component_min_fill_ratio: float = 0.10
+    # 90th-percentile inscribed radius (distance-transform pixels).  Thin tile
+    # grout can span every scan band, but unlike tape it has no component core.
+    component_min_thickness_px: float = 2.5
     component_max_width_ratio: float = 0.92
     component_bottom_bar_width_ratio: float = 0.34
     component_bottom_bar_height_ratio: float = 0.20
