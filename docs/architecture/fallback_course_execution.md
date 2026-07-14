@@ -13,9 +13,10 @@
 - [ ] 不改完整赛道的 `FixedSessionMission` 任务链。
 - [ ] 不删除或重命名原版模块、配置、测试和入口。
 - [ ] 不复制原 runner 全文件后再删逻辑；仅按明确依赖复用成熟模块。
-- [ ] 不假设测距或风扇 API；实机适配器必须建立在现场证据上。
+- [ ] 本阶段不新增、不依赖任何测距传感器接口。
+- [ ] 不假设风扇 API；实机适配器必须建立在现场证据上。
 - [ ] 不使用车灯接口冒充风扇接口。
-- [ ] 不以固定时间盲倒作为唯一完成判据。
+- [ ] 限时倒车仅作为显式解锁的低速标定动作，不描述为已验证闭环。
 - [ ] 未经用户明确要求，不提交、不推送、不创建 PR。
 
 ## 2. 目标架构
@@ -28,7 +29,7 @@ configs/fallback_course.json
 transbot_race/fallback_mission.py
 transbot_race/parking.py
 transbot_race/fan.py
-transbot_race/range_sensor.py
+transbot_race/fallback_config.py
 ```
 
 职责：
@@ -36,8 +37,8 @@ transbot_race/range_sensor.py
 - `fallback_runner.py`：唯一循环、唯一相机、统一调度和安全收尾；
 - `fallback_course.json`：独立参数，不读取完整赛道任务参数；
 - `fallback_mission.py`：小型显式状态机和合法转换；
-- `parking.py`：库位触发、stage、倒车和完成判据；
-- `range_sensor.py`：协议接口、dry-run fake、后续实机适配；
+- `parking.py`：库位触发、stage、限时倒车和硬超时；
+- `fallback_config.py`：仅含退化版需要的独立配置和严格校验；
 - `fan.py`：协议接口、dry-run fake、后续实机适配；
 - 继续复用 `vision.py` 的黑线处理和拟合；
 - 继续复用 `state_machine.py` 的普通巡线；
@@ -80,9 +81,9 @@ FAULT
 ```text
 fan_on => commanded_v == 0 and commanded_w == 0
 FAULT or FINISHED => commanded_v == 0 and commanded_w == 0
-range_invalid_during_reverse => latch FAULT
-camera_failure => latch FAULT
-parking_timeout => latch FAULT
+parking_geometry_lost => latch FAULT
+camera_failure or camera_frame_timeout => latch FAULT
+parking_timeout or runtime_timeout => latch FAULT
 ```
 
 ## 4. 感知契约
@@ -108,29 +109,9 @@ parking_timeout => latch FAULT
 - 仅凭运行时间或从起点估算时间触发；
 - 让普通巡线器在主线和库位边线之间自由选最大轮廓。
 
-### 测距
+### 倒车期视觉
 
-协议最小输出：
-
-```python
-RangeReading(
-    valid: bool,
-    distance_m: float | None,
-    timestamp: float,
-    reason: str,
-)
-```
-
-必须定义：
-
-- 单位固定为 metre；
-- 有效量程；
-- 无回波、超时、NaN、零值和离群值行为；
-- 最大数据年龄；
-- 倒车时连续异常多少帧立即停车；
-- 停车阈值、减速阈值和滞回。
-
-没有真实 API 前只实现协议和 fake，不写猜测式反射调用。
+进入倒车后继续检查同一库位候选是否存在；只允许配置数量的短时缺帧。连续缺失超过阈值、相机读取失败或达到硬超时，均进入锁存 `FAULT` 并停止。当前实现不使用测距传感器，也不声称可输出厘米级停车距离。
 
 ### 风扇
 
@@ -152,22 +133,17 @@ fan.close()  # 必须保证 off
 
 ## 5. 倒车策略
 
-首选闭环：
+当前无测距标定策略：
 
 1. 视觉连续确认库位；
-2. 停车，固定一次 parking target，禁止重新选主线；
-3. 以现场标定的低速进入倒车起始姿态；
-4. 倒车阶段用库位边线做横向/角度修正；
-5. 后向测距进入减速区后进一步限速；
-6. 达到停止距离并连续确认后停车；
-7. 同时检查最大倒车时间和最大估算距离；任一超限进入 `FAULT`。
+2. 停车并锁定任务状态，禁止重新交给普通巡线选线；
+3. 默认停在 `PARK_TRIGGER`，不允许真实倒车；
+4. 只有显式传入 `--allow-unvalidated-parking` 才进入低速 stage/倒车标定序列；
+5. 倒车期间持续要求库位几何存在，只容忍配置数量的短时缺帧；
+6. 达到配置动作时长后停车，另有更严格的独立硬超时；
+7. 停车保持时间完成后才允许请求风扇。
 
-若倒车时相机看不到库位边线：
-
-- 先评估是否可通过停车前对准，使倒车段只需直退；
-- 使用后向测距完成末端停车；
-- 固定时间/距离只能作为上限，不作为成功判据；
-- 无稳定闭环证据时不进入风扇状态。
+这不是测距闭环，也不是已验证的最终比赛参数。若倒车时相机看不到库位边线，当前策略只能立即停车，不能继续猜测动作。
 
 ## 6. 配置原则
 
@@ -178,7 +154,6 @@ camera
 tracker
 parking_trigger
 parking_motion
-range_sensor
 fan
 safety
 logging
@@ -189,11 +164,10 @@ logging
 - 巡线速度/角速度上限；
 - 入库触发窗口和确认帧数；
 - stage 速度/角速度/最大时长；
-- 倒车速度、修正角速度、slew limit；
-- 测距减速/停车阈值；
-- 最大倒车时长和最大估算距离；
+- 倒车速度、角速度、动作时长与硬超时；
+- 倒车期视觉缺帧容忍上限；
 - 风扇运行时长与硬上限；
-- 相机失败、丢线、测距失效的停止策略。
+- 相机失败/帧超时、丢线、视觉失效和动作/总运行超时的停止策略。
 
 ## 7. 测试清单
 
@@ -204,9 +178,9 @@ logging
 - [ ] 入库触发要求连续帧，单帧假矩形不触发；
 - [ ] 触发锁定后目标不跳回主线；
 - [ ] 倒车命令始终满足 `v <= 0` 和速度上限；
-- [ ] 测距 NaN/负值/超时/陈旧数据触发停车；
-- [ ] 停止距离确认包含滞回，避免抖动反复启停；
-- [ ] parking timeout 进入锁存 `FAULT`；
+- [ ] 未显式解锁时识别到库位也不产生倒车命令；
+- [ ] 倒车期视觉连续缺失触发锁存 `FAULT`；
+- [ ] parking 硬超时进入锁存 `FAULT`；
 - [ ] `FAN_RUN` 中底盘命令恒为零；
 - [ ] 任意异常路径均调用 `fan.off()` 和底盘停车；
 - [ ] dry-run 不加载实机 Transbot/GPIO 库。
@@ -224,8 +198,8 @@ logging
 1. [ ] `--dry-run` 完整状态模拟；
 2. [ ] 仅相机 shadow mode，电机永远为零；
 3. [ ] 只跑普通巡线，入库检测只记日志；
-4. [ ] 人工单步标定 stage 动作；
-5. [ ] 单独读测距，车轮悬空/底盘不动；
+4. [ ] 人工单步标定 stage 和倒车动作；
+5. [ ] 验证倒车期视觉丢失和硬超时会停车；
 6. [ ] 单独控制风扇，底盘锁定停车；
 7. [ ] 低速倒车，不启动风扇；
 8. [ ] 入库完成后人工确认，再允许风扇；
@@ -236,7 +210,7 @@ logging
 - 原始相机帧或视频；
 - 黑线 mask、巡线 fit 和入库 overlay；
 - 当前状态、状态进入时间、转换原因；
-- range 原始值、滤波值、有效性和数据年龄；
+- 库位候选、连续确认帧和倒车期缺帧计数；
 - 候选命令、最终命令和控制所有者；
 - parking target、误差、累计倒车时间/估算距离；
 - 风扇 on/off 时间和关闭原因；
@@ -247,7 +221,6 @@ logging
 
 以下信息未获得前，不实现对应实机适配器：
 
-- [ ] 测距传感器型号、接线和可运行读取示例；
 - [ ] 风扇驱动板/继电器型号、供电、电平和可运行启停示例；
 - [ ] 库位实测宽度、深度和目标后向间距；
 - [ ] 车体宽度、长度、轴距及相机相对位置；
