@@ -20,6 +20,7 @@ from .mission import (
     DetectorKind,
     ExecutorKind,
     FixedSessionMission,
+    MissionEvent,
     SessionSpec,
 )
 from .ring_entry import RingPhaseEvent
@@ -49,6 +50,7 @@ __all__ = [
     "TransitionEvent",
     "CourseSession",
     "FixedSessionMission",
+    "MissionEvent",
     "DetectorKind",
     "ExecutorKind",
     "SessionSpec",

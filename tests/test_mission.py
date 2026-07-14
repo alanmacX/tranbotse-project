@@ -12,6 +12,7 @@ from transbot_race.mission import (
     DetectorKind,
     ExecutorKind,
     FixedSessionMission,
+    MissionEvent,
 )
 from transbot_race.vision import TrajectoryFit
 
@@ -39,6 +40,25 @@ GOOD_FIT = TrajectoryFit(found=True, conf=0.95, n_bands=6)
 
 
 class FixedSessionMissionTests(unittest.TestCase):
+    def test_phase_progress_requires_typed_mission_event(self):
+        mission = FixedSessionMission(MissionConfig(initial_session="corner"))
+        self.assertEqual(
+            mission.transition(MissionEvent.PHASE_COMPLETED),
+            CourseSession.RING_ENTRY,
+        )
+        self.assertEqual(mission.last_transition_event, MissionEvent.PHASE_COMPLETED)
+
+    def test_mission_completed_and_reset_are_explicit(self):
+        mission = FixedSessionMission(MissionConfig(initial_session="corner"))
+        self.assertEqual(
+            mission.transition(MissionEvent.MISSION_COMPLETED),
+            CourseSession.FINISHED,
+        )
+        self.assertEqual(
+            mission.transition(MissionEvent.MISSION_RESET),
+            CourseSession.CORNER,
+        )
+
     def test_only_corner_is_allowed_first(self):
         mission = FixedSessionMission(MissionConfig())
         accepted = mission.gate(decision(-1, False), observation(), GOOD_FIT)

@@ -20,6 +20,12 @@ class CourseSession(str, Enum):
     STOPPED = "stopped"
 
 
+class MissionEvent(str, Enum):
+    PHASE_COMPLETED = "phase_completed"
+    MISSION_COMPLETED = "mission_completed"
+    MISSION_RESET = "mission_reset"
+
+
 class DetectorKind(str, Enum):
     NONE = "none"
     CORNER = "corner"
@@ -70,6 +76,8 @@ class FixedSessionMission:
             raise ValueError(f"unsupported initial session: {cfg.initial_session}") from exc
         self.last_gate_reason = "not_evaluated"
         self.ring_entry_alignment_frames = 0
+        self.last_transition_event: MissionEvent | None = None
+        self._initial_session = self.session
 
     @property
     def detector_enabled(self) -> bool:
@@ -179,7 +187,19 @@ class FixedSessionMission:
         self.last_gate_reason = f"detector_disabled_{self.session.value}"
         return None
 
-    def advance(self) -> CourseSession:
+    def transition(self, event: MissionEvent) -> CourseSession:
+        if event == MissionEvent.MISSION_RESET:
+            self.session = self._initial_session
+            self.ring_entry_alignment_frames = 0
+            self.last_transition_event = event
+            return self.session
+        if event == MissionEvent.MISSION_COMPLETED:
+            self.session = CourseSession.FINISHED
+            self.ring_entry_alignment_frames = 0
+            self.last_transition_event = event
+            return self.session
+        if event != MissionEvent.PHASE_COMPLETED:
+            raise ValueError(f"unsupported mission event: {event!r}")
         try:
             index = self.ORDER.index(self.session)
         except ValueError:
@@ -187,4 +207,9 @@ class FixedSessionMission:
         if index + 1 < len(self.ORDER):
             self.session = self.ORDER[index + 1]
         self.ring_entry_alignment_frames = 0
+        self.last_transition_event = event
         return self.session
+
+    def advance(self) -> CourseSession:
+        """Compatibility wrapper; new control code must emit MissionEvent."""
+        return self.transition(MissionEvent.PHASE_COMPLETED)

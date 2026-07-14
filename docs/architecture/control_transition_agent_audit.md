@@ -5,6 +5,26 @@
 > **审计基准**：`a580c0ab0acb64fb9b3c17cfcf88e58812fdd36d` + 当前 dirty 工作树  
 > **重要边界**：`CURRENT` 是当前代码事实；`TARGET` 是建议目标，尚未实现。不得把目标架构描述成现有能力。
 
+## 2026-07-14 implementation status
+
+Implemented on `codex/control-transition-refactor`:
+
+- explicit `ControlOwner`, `SafetyState`, `StopCause`, owner epoch and a single
+  candidate/final command arbiter;
+- persistent stop latch with explicit clear for non-recoverable causes;
+- typed mission, corner handoff and ring phase events;
+- `FINISHED`, route-loss and executor-failure safety stops;
+- obstacle hold semantics that do not advance a non-owning cruise controller;
+- process-level motor lease and bounded gateway for auto/manual runners;
+- manual action generation invalidation and worker join before recorder close;
+- consecutive geometry epochs and temporal confirmation for strong exit lines;
+- safe boolean config coercion and repository-local pytest collection.
+
+Still not implemented: color classification, fork/terminal executors, complete
+return mission graph, shared config schema for every UI save path, and physical
+full-course replay/robot validation. The CURRENT sections below remain the
+historical audit baseline and should not be read as post-refactor behavior.
+
 ---
 
 ## 0. 给实现 Agent 的强制指令

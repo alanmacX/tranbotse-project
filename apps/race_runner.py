@@ -43,6 +43,7 @@ from transbot_race.mission import (  # noqa: E402
     DetectorKind,
     ExecutorKind,
     FixedSessionMission,
+    MissionEvent,
 )
 from transbot_race.motor import MotorGateway  # noqa: E402
 from transbot_race.ring_entry import (  # noqa: E402
@@ -649,7 +650,7 @@ def run(args: argparse.Namespace) -> int:
                     in {RingPhaseEvent.ENTRY_ESTABLISHED, RingPhaseEvent.EXECUTOR_COMPLETED}
                     and mission is not None
                 ):
-                    next_session = mission.advance()
+                    next_session = mission.transition(MissionEvent.PHASE_COMPLETED)
                     for session_filter in session_geometry_filters.values():
                         session_filter.reset()
                     legacy_geometry_filter.reset()
@@ -734,7 +735,7 @@ def run(args: argparse.Namespace) -> int:
                 if memory_status.transition_event == TransitionEvent.HANDOFF_READY:
                     command = sm.reacquire_from(visual_fit, now)
                     if mission is not None:
-                        mission.advance()
+                        mission.transition(MissionEvent.PHASE_COMPLETED)
                         # Session progress itself prevents duplicate triggers.
                         # Begin the next detector fresh instead of cooldown.
                         corner_margin = CornerCommandDelay(
@@ -814,6 +815,11 @@ def run(args: argparse.Namespace) -> int:
             summary["motion_source"] = motion.source
             summary["path_strategy"] = memory_status.mode
             summary["mission_state"] = None if mission is None else mission.session.value
+            summary["mission_transition_event"] = (
+                None
+                if mission is None or mission.last_transition_event is None
+                else mission.last_transition_event.value
+            )
             summary["control_owner"] = arbitration.owner.value
             summary["owner_epoch"] = arbitration.owner_epoch
             summary["executor_phase"] = (

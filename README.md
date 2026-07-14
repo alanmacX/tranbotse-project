@@ -17,10 +17,15 @@ New clean logic lives in:
 
 - `transbot_race/vision.py`: black-line preprocessing, scan-line features, and
   `fit_line_trajectory()` (continuous e0/theta/kappa/conf estimate).
-- `transbot_race/state_machine.py`: unified continuous tracker with only three
-  states (TRACK / LOST / STOPPED). Corners of any angle, dashed lines and
-  roundabouts emerge from one control law plus a confidence filter, not from
-  per-case states or timed open-loop maneuvers.
+- `transbot_race/state_machine.py`: ordinary line-following controller with
+  TRACK / LOST / STOPPED behavior. It does not own corner or roundabout phases.
+- `transbot_race/mission.py`: fixed course phase and typed mission transitions.
+- `transbot_race/control.py`: the single command arbiter, typed control owner,
+  stop latch, safety override, and owner epoch.
+- `transbot_race/path_memory.py` and `transbot_race/ring_entry.py`: dedicated
+  corner and roundabout executors with typed handoff/phase events.
+- `transbot_race/motor.py`: bounded motor gateway and process-wide exclusive
+  lease shared by automatic and manual control.
 - `transbot_race/config.py`: typed configuration (single `tracker` section).
 - `apps/race_debug_app.py`: merged debug frontend for saved-image analysis plus
   optional live deploy/start/stop/video controls.
@@ -62,7 +67,8 @@ The default race config now uses the fixed course order (`obstacle -> corner ->
 ring_entry -> ring_exit -> fork -> return`). Obstacle handling is deferred, so
 the current default starts at `corner`. Ring entry defaults right and the fork
 defaults to the rightmost path; both are route choices for the same tracker.
-Only the current session's event detector may take control. The
+Only the current session's event detector may request control. The arbiter
+selects one owner and emits one candidate/final command pair per tick. The
 legacy global detector remains available by setting `path_memory.mode` to
 `corner_event`.
 
@@ -79,6 +85,9 @@ backward, left-angle, or right-angle step and stops. Raw camera frames, before
 and after snapshots, requested commands, measured/fallback motion samples and
 action results are saved under `artifacts/manual_runs/`.
 
+Automatic and manual runners use the same process lease. If either runner is
+active, the other refuses motor access before sending a non-zero command.
+
 For a no-motor smoke test:
 
 ```bash
@@ -91,13 +100,15 @@ Dry-run mode does not open the host computer's camera. Pass
 ## Known Status
 
 - Straight-line navigation is the most reliable component.
-- Curves, circles and corners are all handled by the same continuous
-  trajectory tracker (line-center + heading + curvature feedback).
-- Sharp bends (including right angles) trigger the `pivot` sub-mode of TRACK:
-  near-zero speed + strong steering until re-aligned. There is no separate
-  corner state and no timed open-loop turn.
+- Corners and roundabouts are handled by dedicated executors; generic cruise
+  is frozen while another owner controls the chassis.
+- Geometry votes must be consecutive, and irreversible exit identity requires
+  temporal confirmation even for a strong observation.
 - Dashed / missing line is carried by the confidence filter's predict mode;
   only a sustained loss drops into LOST (search sweep, then STOPPED on timeout).
+- `FINISHED`, selected-route loss, executor failure, invalid commands, and
+  operator/process failures use typed stop causes. Non-recoverable causes stay
+  latched until an explicit clear.
 - No SSH or live robot access is assumed for the next refactor phase.
 - Remaining tuning is field calibration only (see
   `docs/architecture/unified_tracker_plan.md`, Phase 4).
@@ -122,5 +133,5 @@ The app expects the robot to be reachable through the local SSH alias
 Use the bundled or local Python environment with OpenCV installed:
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m pytest -q
 ```
