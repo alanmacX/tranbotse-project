@@ -2,7 +2,7 @@ import unittest
 from dataclasses import replace
 import math
 
-from transbot_race.config import PathMemoryConfig
+from transbot_race.config import PathMemoryConfig, RaceConfig
 from transbot_race.capture_geometry import (
     CaptureGeometryDecision,
     CaptureGeometryObservation,
@@ -10,6 +10,7 @@ from transbot_race.capture_geometry import (
 from transbot_race.path_memory import (
     CornerCommandDelay, FirstEntryLineLatch, read_motion_sample,
 )
+from transbot_race.state_machine import RaceStateMachine, TrackMode
 from transbot_race.vision import LineFeatures, TrajectoryFit
 
 
@@ -66,7 +67,7 @@ class PathStrategyTests(unittest.TestCase):
         self.assertAlmostEqual(waiting.v, 0.06)
         self.assertAlmostEqual(waiting.w, 0.0)
 
-    def test_corner_event_uses_measured_yaw_then_reacquires_line(self):
+    def test_corner_switches_from_pivot_to_first_exit_tracking(self):
         cfg = PathMemoryConfig(
             camera_to_axle_m=0.01,
             corner_confirm_frames=3,
@@ -83,17 +84,27 @@ class PathStrategyTests(unittest.TestCase):
         turning = gate.step(turn_fit(), features, 0.05, -0.04, 0.3, 0.1, 0.0)
         self.assertEqual(turning.status.reason, "committed_turn")
 
-        unaligned = replace(turn_fit(theta=0.4), e0=0.4)
+        unaligned = replace(turn_fit(theta=0.4), e0=0.9, disconnected=True)
         turning = gate.step(
             unaligned, features, 0.0, 0.0, 0.8, 0.0, -1.0,
         )
-        self.assertEqual(turning.status.reason, "corner_exit_captured")
-        self.assertAlmostEqual(turning.w, 0.0)
+        self.assertEqual(turning.status.reason, "committed_turn")
+        self.assertAlmostEqual(turning.w, -cfg.corner_replay_max_w)
         self.assertAlmostEqual(turning.status.target[0], 0.5)
 
-        reacquired = gate.step(unaligned, features, 0.03, -0.02, 1.3, 0.0, -1.0)
+        stable = replace(unaligned, e0=0.10, theta=0.08, disconnected=False)
+        entered = gate.step(
+            stable, features, 0.03, -0.02, 1.3, 0.0,
+            -cfg.corner_replay_max_w,
+        )
+        self.assertEqual(entered.status.reason, "corner_exit_tracking")
+        for index in range(cfg.corner_cruise_ready_frames):
+            reacquired = gate.step(
+                stable, features, 0.03, -0.02,
+                1.4 + index * 0.1, 0.0, entered.w,
+            )
         self.assertEqual(reacquired.status.reason, "corner_visual_takeover")
-        self.assertAlmostEqual(reacquired.v, 0.03)
+        self.assertEqual(gate.state, "cooldown")
 
     def test_cooldown_clears_when_exit_crosses_center_on_a_curve(self):
         cfg = PathMemoryConfig(corner_confirm_frames=3)
@@ -476,7 +487,7 @@ class PathStrategyTests(unittest.TestCase):
         self.assertEqual(output.status.reason, "geometry_circle_passthrough")
         self.assertAlmostEqual(output.w, -0.1)
 
-    def test_partial_capture_angle_does_not_shorten_blind_search_envelope(self):
+    def test_geometry_angle_does_not_shorten_150_degree_safety_envelope(self):
         cfg = PathMemoryConfig(
             camera_to_axle_m=0.0,
             corner_reacquire_angle_rad=0.20,
@@ -512,19 +523,25 @@ class PathStrategyTests(unittest.TestCase):
             angular=-1.0,
         )
         self.assertEqual(still_turning.status.reason, "committed_turn")
-        searching = gate.step(
+        still_turning = gate.step(
             missing, LineFeatures(found=False), 0.0, 0.0, 1.9, 0.0,
             angular=-1.0,
         )
-        self.assertEqual(searching.status.reason, "corner_reacquire_search")
+        self.assertEqual(still_turning.status.reason, "committed_turn")
+        nearly_limited = gate.step(
+            missing, LineFeatures(found=False), 0.0, 0.0, 3.0, 0.0,
+            angular=-1.0,
+        )
+        self.assertEqual(nearly_limited.status.reason, "committed_turn")
         stopped = gate.step(
-            missing, LineFeatures(found=False), 0.0, 0.0, 2.4, 0.0,
+            missing, LineFeatures(found=False), 0.0, 0.0, 3.2, 0.0,
             angular=-1.0,
         )
         self.assertEqual(stopped.status.reason, "corner_reacquire_failed")
         self.assertAlmostEqual(stopped.w, 0.0)
+        self.assertAlmostEqual(gate.turned_rad, cfg.corner_max_turn_angle_rad)
 
-    def test_first_exit_line_stops_turn_then_hands_directly_to_cruise(self):
+    def test_first_exit_identity_switches_to_slow_tracking(self):
         cfg = PathMemoryConfig(
             corner_reacquire_angle_rad=0.20,
             corner_reacquire_confirm_frames=2,
@@ -536,24 +553,138 @@ class PathStrategyTests(unittest.TestCase):
         gate.target_angle_rad = math.radians(45.0)
         gate.turned_rad = 0.70
         trackable = TrajectoryFit(
-            found=True, e0=0.40, theta=0.10, conf=0.9, n_bands=4,
+            found=True, e0=0.90, theta=0.10, conf=0.9, n_bands=4,
+            disconnected=True,
         )
         output = gate.step(
             trackable, LineFeatures(found=True), 0.04, 0.03,
             0.0, 0.0, 0.0,
         )
-        self.assertEqual(output.status.reason, "corner_exit_captured")
+        self.assertEqual(output.status.reason, "committed_turn")
         self.assertAlmostEqual(output.v, 0.0)
-        self.assertAlmostEqual(output.w, 0.0)
-        takeover = gate.step(
-            trackable, LineFeatures(found=True), 0.04, 0.03,
-            0.1, 0.0, 0.0,
+        self.assertAlmostEqual(output.w, -cfg.corner_replay_max_w)
+        stable = replace(trackable, e0=0.10, theta=0.08, disconnected=False)
+        entered = gate.step(
+            stable, LineFeatures(found=True), 0.04, 0.03,
+            0.1, 0.0, -cfg.corner_replay_max_w,
         )
+        self.assertEqual(entered.status.reason, "corner_exit_tracking")
+        self.assertEqual(entered.v, cfg.corner_align_v)
+        self.assertLessEqual(abs(entered.w), cfg.corner_replay_max_w)
+        for index in range(cfg.corner_cruise_ready_frames):
+            takeover = gate.step(
+                stable, LineFeatures(found=True), 0.04, 0.03,
+                0.2 + index * 0.1, 0.0, entered.w,
+            )
         self.assertEqual(takeover.status.reason, "corner_visual_takeover")
-        self.assertAlmostEqual(takeover.w, 0.03)
         self.assertEqual(gate.state, "cooldown")
 
-    def test_161732_exit_hands_off_despite_large_heading(self):
+    def test_weak_far_exit_locks_identity_without_stopping_turn(self):
+        cfg = PathMemoryConfig(
+            corner_exit_confirm_frames=3,
+            corner_reacquire_angle_rad=0.20,
+        )
+        gate = CornerCommandDelay(cfg)
+        gate.state = "turning"
+        gate.candidate_dir = 1
+        gate.turned_rad = 0.70
+        weak_exit = TrajectoryFit(
+            found=True, e0=0.75, theta=0.0, conf=0.20, n_bands=1,
+        )
+        features = LineFeatures(found=True)
+
+        first = gate.step(weak_exit, features, 0.0, 0.0, 0.0, 0.0, 0.0)
+        second = gate.step(weak_exit, features, 0.0, 0.0, 0.1, 0.0, 0.0)
+        third = gate.step(weak_exit, features, 0.0, 0.0, 0.2, 0.0, 0.0)
+
+        self.assertEqual(first.status.reason, "committed_turn")
+        self.assertEqual(second.status.reason, "committed_turn")
+        self.assertAlmostEqual(first.w, -cfg.corner_replay_max_w)
+        self.assertEqual(third.status.reason, "committed_turn")
+        self.assertAlmostEqual(third.w, -cfg.corner_replay_max_w)
+        self.assertTrue(gate.exit_latch.latched)
+
+    def test_corner_completes_only_after_stable_cruise_confirmation(self):
+        cfg = PathMemoryConfig(
+            corner_cruise_ready_frames=3,
+        )
+        gate = CornerCommandDelay(cfg)
+        gate.state = "turning"
+        gate.candidate_dir = 1
+        gate.turned_rad = 0.80
+        gate.exit_latch.latched = True
+        gate.last_now = 0.0
+        aligned = TrajectoryFit(
+            found=True, e0=0.12, theta=0.08, conf=0.90,
+            n_bands=5, disconnected=False,
+        )
+        features = LineFeatures(found=True)
+
+        first = gate.step(aligned, features, 0.0, 0.0, 0.1, 0.0, 0.0)
+        second = gate.step(aligned, features, 0.0, 0.0, 0.2, 0.0, first.w)
+        third = gate.step(aligned, features, 0.0, 0.0, 0.3, 0.0, second.w)
+        ready = gate.step(aligned, features, 0.0, 0.0, 0.4, 0.0, third.w)
+
+        self.assertEqual(first.status.reason, "corner_exit_tracking")
+        self.assertEqual(second.status.reason, "corner_exit_tracking")
+        self.assertEqual(third.status.reason, "corner_exit_tracking")
+        self.assertLessEqual(abs(first.w), cfg.corner_replay_max_w)
+        self.assertEqual(ready.status.reason, "corner_visual_takeover")
+        self.assertEqual(gate.state, "cooldown")
+
+    def test_corner_hands_off_inside_real_cruise_corridor_before_center_crossing(self):
+        cfg = PathMemoryConfig(corner_cruise_ready_frames=4)
+        gate = CornerCommandDelay(cfg)
+        gate.state = "exit_tracking"
+        gate.candidate_dir = 1
+        gate.exit_latch.latched = True
+        gate.exit_last_seen_now = 0.0
+        features = LineFeatures(found=True)
+        # Four consecutive reliable poses from the current failure window.
+        # They are valid moving FOLLOW poses even though theta is above 0.30.
+        poses = (
+            (0.4629, 0.3384),
+            (0.3652, 0.3371),
+            (0.2984, 0.3382),
+            (0.1986, 0.3315),
+        )
+
+        outputs = []
+        for index, (e0, theta) in enumerate(poses, start=1):
+            fit = TrajectoryFit(
+                found=True, e0=e0, e_look=e0, theta=theta,
+                conf=0.70, n_bands=5, disconnected=False,
+            )
+            outputs.append(gate.step(
+                fit, features, 0.0, 0.0, index * 0.1, 0.0, 0.0,
+            ))
+
+        self.assertEqual(outputs[-2].status.reason, "corner_exit_tracking")
+        self.assertEqual(outputs[-1].status.reason, "corner_visual_takeover")
+        self.assertEqual(gate.state, "cooldown")
+
+    def test_corner_and_cruise_steer_same_way_at_handoff(self):
+        race_cfg = RaceConfig()
+        gate = CornerCommandDelay(
+            race_cfg.path_memory,
+            handoff_conf_min=race_cfg.tracker.conf_predict,
+            tracker_cfg=race_cfg.tracker,
+        )
+        sm = RaceStateMachine(race_cfg)
+        features = LineFeatures(found=True)
+        for e0, theta in ((0.30, 0.20), (-0.30, -0.20)):
+            with self.subTest(e0=e0, theta=theta):
+                fit = TrajectoryFit(
+                    found=True, e0=e0, e_look=e0, theta=theta,
+                    conf=0.90, n_bands=5, disconnected=False,
+                )
+                corner_w = gate._tracked_exit_w(fit, invert_turn=False)
+                cruise = sm.reacquire_from(fit, now=0.0)
+                self.assertEqual(cruise.mode, TrackMode.FOLLOW)
+                self.assertGreater(corner_w * cruise.w, 0.0)
+                self.assertAlmostEqual(corner_w, cruise.w)
+
+    def test_large_heading_exit_enters_bounded_tracking_not_cruise(self):
         gate = CornerCommandDelay(PathMemoryConfig(corner_reacquire_angle_rad=0.35))
         gate.state = "turning"
         gate.candidate_dir = 1
@@ -569,11 +700,13 @@ class PathStrategyTests(unittest.TestCase):
         captured = gate.step(first_entry, features, 0.0, 0.0, 22.28, 0.0, -0.2)
         takeover = gate.step(same_exit, features, 0.0, 0.0, 22.37, 0.0, 0.0)
 
-        self.assertEqual(captured.status.reason, "corner_exit_captured")
-        self.assertEqual(takeover.status.reason, "corner_visual_takeover")
-        self.assertEqual(gate.state, "cooldown")
+        self.assertEqual(captured.status.reason, "corner_exit_tracking")
+        self.assertEqual(takeover.status.reason, "corner_exit_tracking")
+        self.assertLessEqual(abs(captured.w), 0.20)
+        self.assertLessEqual(abs(takeover.w), 0.20)
+        self.assertEqual(gate.state, "exit_tracking")
 
-    def test_run_regression_first_entry_prevents_visual_alignment_drift(self):
+    def test_edge_exit_is_tracked_instead_of_replaced_by_later_line(self):
         cfg = PathMemoryConfig(
             corner_reacquire_angle_rad=0.35,
             corner_reacquire_confirm_frames=2,
@@ -587,8 +720,6 @@ class PathStrategyTests(unittest.TestCase):
         gate.turned_rad = 0.80
         features = LineFeatures(found=True)
 
-        # Representative reliable frames from 20260713-143944_final.  The old
-        # controller ignored all of them and kept v=0.0257,w=-0.2.
         entering = TrajectoryFit(
             found=True, e0=0.7256, theta=0.9217, kappa=-1.0,
             conf=0.6596, n_bands=5,
@@ -596,15 +727,74 @@ class PathStrategyTests(unittest.TestCase):
         first = gate.step(
             entering, features, 0.02, -0.2, 0.0, 0.0, 0.0,
         )
-        self.assertEqual(first.status.reason, "corner_exit_captured")
-        self.assertEqual(first.v, 0.0)
-        self.assertEqual(first.w, 0.0)
+        self.assertEqual(first.status.reason, "corner_exit_tracking")
+        self.assertEqual(first.v, cfg.corner_align_v)
+        self.assertLessEqual(abs(first.w), cfg.corner_replay_max_w)
 
         takeover = gate.step(
             entering, features, 0.02, -0.2, 0.05, 0.0, 0.0,
         )
-        self.assertEqual(takeover.status.reason, "corner_visual_takeover")
-        self.assertEqual(gate.state, "cooldown")
+        self.assertEqual(takeover.status.reason, "corner_exit_tracking")
+        self.assertLessEqual(abs(takeover.w), cfg.corner_replay_max_w)
+        self.assertEqual(gate.state, "exit_tracking")
+
+    def test_lost_selected_exit_cannot_be_replaced_by_second_line(self):
+        cfg = PathMemoryConfig(corner_exit_predict_sec=0.25)
+        gate = CornerCommandDelay(cfg)
+        gate.state = "exit_tracking"
+        gate.candidate_dir = 1
+        gate.exit_latch.latched = True
+        gate.exit_last_seen_now = 0.0
+        gate.exit_track_w = -0.12
+        missing = TrajectoryFit(found=False)
+        features = LineFeatures(found=False)
+
+        for index in range(4):
+            output = gate.step(
+                missing, features, 0.0, 0.0, index * 0.1, 0.0, 0.0,
+            )
+        self.assertEqual(output.status.reason, "corner_exit_lost")
+        self.assertEqual(gate.state, "failed_locked")
+
+        second_line = TrajectoryFit(
+            found=True, e0=0.0, theta=0.0, conf=0.95,
+            n_bands=6, disconnected=False,
+        )
+        for index in range(5):
+            output = gate.step(
+                second_line, LineFeatures(found=True), 0.0, 0.0,
+                1.0 + index * 0.1, 0.0, 0.0,
+            )
+        self.assertEqual(output.status.reason, "corner_exit_lost")
+        self.assertEqual(gate.state, "failed_locked")
+
+    def test_dashed_exit_gap_keeps_last_committed_path_command(self):
+        cfg = PathMemoryConfig(
+            corner_exit_predict_sec=1.0,
+            corner_exit_predict_v_ratio=0.60,
+        )
+        gate = CornerCommandDelay(cfg)
+        gate.state = "exit_tracking"
+        gate.candidate_dir = 1
+        gate.exit_latch.latched = True
+        gate.exit_last_seen_now = 0.0
+        gate.exit_track_w = -0.14
+        weak_dash = TrajectoryFit(
+            found=True, e0=0.6, theta=0.0, conf=0.23,
+            n_bands=1, disconnected=False,
+        )
+
+        for index in range(1, 7):
+            output = gate.step(
+                weak_dash, LineFeatures(found=True), 0.0, 0.0,
+                index * 0.1, 0.0, -0.14,
+            )
+            self.assertEqual(output.status.reason, "corner_exit_tracking")
+            self.assertAlmostEqual(output.w, -0.14)
+            self.assertAlmostEqual(
+                output.v,
+                cfg.corner_align_v * cfg.corner_exit_predict_v_ratio,
+            )
 
     def test_failed_turn_hands_complete_offcentre_line_to_cruise(self):
         gate = CornerCommandDelay(
@@ -698,7 +888,7 @@ class PathStrategyTests(unittest.TestCase):
             0.3, 0.0, 0.0,
         )
         self.assertEqual(captured.status.reason, "corner_exit_captured")
-        self.assertEqual(takeover.status.reason, "corner_visual_takeover")
+        self.assertEqual(takeover.status.reason, "corner_exit_aligning")
 
     def test_disconnected_exit_cannot_seed_cruise_handoff(self):
         gate = CornerCommandDelay(PathMemoryConfig())
@@ -714,14 +904,15 @@ class PathStrategyTests(unittest.TestCase):
 
         captured = gate.step(fragment, features, 0.0, 0.0, 0.0, 0.0, 0.0)
         held = gate.step(fragment, features, 0.0, 0.0, 0.1, 0.0, 0.0)
-        self.assertEqual(captured.status.reason, "corner_exit_captured")
-        self.assertEqual(held.status.reason, "corner_exit_captured")
-        self.assertEqual(gate.state, "captured")
+        self.assertEqual(captured.status.reason, "committed_turn")
+        self.assertEqual(held.status.reason, "committed_turn")
+        self.assertLess(captured.w, 0.0)
+        self.assertEqual(gate.state, "turning")
 
         complete = replace(fragment, disconnected=False)
         takeover = gate.step(complete, features, 0.04, -0.02, 0.2, 0.0, 0.0)
-        self.assertEqual(takeover.status.reason, "corner_visual_takeover")
-        self.assertEqual(gate.state, "cooldown")
+        self.assertEqual(takeover.status.reason, "corner_exit_tracking")
+        self.assertEqual(gate.state, "exit_tracking")
 
     def test_capture_coast_past_safety_envelope_fails_without_extra_turn(self):
         cfg = PathMemoryConfig(corner_align_missing_frames=0)
@@ -729,7 +920,7 @@ class PathStrategyTests(unittest.TestCase):
         gate.state = "captured"
         gate.candidate_dir = 1
         gate.target_angle_rad = 1.57
-        gate.turned_rad = 1.96
+        gate.turned_rad = math.radians(149.0)
         gate.exit_latch.latched = True
         gate.last_now = 0.0
 
@@ -740,13 +931,14 @@ class PathStrategyTests(unittest.TestCase):
         self.assertEqual(output.status.reason, "corner_reacquire_failed")
         self.assertEqual(gate.state, "failed")
         self.assertAlmostEqual(output.w, 0.0)
+        self.assertAlmostEqual(gate.turned_rad, cfg.corner_max_turn_angle_rad)
 
     def test_seeking_checks_hard_limit_before_latching_same_side_line(self):
         gate = CornerCommandDelay(PathMemoryConfig())
         gate.state = "seeking"
         gate.candidate_dir = 1
         gate.target_angle_rad = 1.57
-        gate.turned_rad = 1.90
+        gate.turned_rad = math.radians(149.0)
         gate.last_now = 0.0
         late_line = TrajectoryFit(
             found=True, e0=0.50, theta=0.30, conf=0.90, n_bands=5,

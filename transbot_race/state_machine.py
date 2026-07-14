@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 import math
 
-from .config import RaceConfig
+from .config import RaceConfig, TrackerConfig
 from .vision import TrajectoryFit
 
 
@@ -56,12 +56,56 @@ def command_summary(command: MotionCommand, fit: TrajectoryFit) -> dict:
     }
 
 
-class RaceStateMachine:
-    """Single continuous controller: TRACK / LOST / STOPPED.
+def moving_follow_handoff_ready(
+    fit: TrajectoryFit,
+    tracker: TrackerConfig,
+) -> bool:
+    """Whether reseeding normal cruise from ``fit`` starts in moving FOLLOW.
 
-    All curve, corner (any angle), dashed-line and roundabout behavior emerges
-    from one control law over the trajectory fit plus a confidence filter. There
-    are no per-case states or timed open-loop maneuvers.
+    This is the producer/consumer contract at a session boundary. Session
+    executors must use it instead of inventing narrower e/theta thresholds.
+    """
+    reliable = bool(
+        fit.found
+        and fit.conf >= tracker.conf_predict
+        and fit.n_bands >= 3
+        and not fit.disconnected
+    )
+    if not reliable:
+        return False
+    # Handoff is deliberately stricter than "the generic tracker would not
+    # stop". A session ends only after the complete line is actually inside
+    # its stable near-field/heading corridor. The old e*theta<0 exception let
+    # a 44-degree pose terminate the corner and caused immediate S-turning.
+    return bool(
+        abs(fit.e0 + tracker.e_bias)
+        <= tracker.e_pivot * (1.0 - tracker.pivot_hysteresis)
+        and abs(fit.theta) <= tracker.theta_pivot
+    )
+
+
+def moving_follow_command_w(
+    fit: TrajectoryFit,
+    tracker: TrackerConfig,
+    *,
+    invert_turn: bool | None = None,
+) -> float:
+    """Original near-field proportional steering shared at handoff."""
+    e0 = fit.e0 + tracker.e_bias
+    inverted = tracker.invert_turn if invert_turn is None else invert_turn
+    sign = 1.0 if inverted else -1.0
+    return max(
+        -tracker.max_w,
+        min(tracker.max_w, sign * tracker.k_e * e0),
+    )
+
+
+class RaceStateMachine:
+    """Near-field cruise controller: TRACK / LOST / STOPPED.
+
+    Cruise only centres the currently accepted line. Fixed-session executors
+    own corners, roundabouts and forks; their geometry never leaks into this
+    proportional controller.
     """
 
     def __init__(self, cfg: RaceConfig | None = None) -> None:
@@ -78,7 +122,8 @@ class RaceStateMachine:
         self.observed_theta = 0.0
         self.observation_reliable = False
         self.d_e0 = 0.0
-        self.in_pivot = False
+        self.follow_w = 0.0
+        self.follow_now: float | None = None
         self.use_path_lookahead = False
         self.ever_acquired = False
         self.plan_dir = 0
@@ -95,12 +140,17 @@ class RaceStateMachine:
     def reset(self) -> None:
         self.__init__(self.cfg)
 
+    def can_take_moving_handoff(self, fit: TrajectoryFit) -> bool:
+        """True iff ``reacquire_from`` would give this line moving control."""
+        return moving_follow_handoff_ready(fit, self.cfg.tracker)
+
     def reacquire_from(self, fit: TrajectoryFit, now: float) -> MotionCommand:
         """Restart normal tracking from the current line without stale turn history."""
         self.state = RaceState.TRACK
         self.state_started_at = now
         self._seed_filter(fit)
-        self.in_pivot = False
+        self.follow_w = moving_follow_command_w(fit, self.cfg.tracker)
+        self.follow_now = now
         self.ever_acquired = True
         self._clear_plan()
         self.stopped_reacquire_frames = 0
@@ -305,102 +355,35 @@ class RaceStateMachine:
         t = self.cfg.tracker
         predicting = self.f_conf < t.conf_predict
 
-        e0 = self.f_e0 + t.e_bias
-        theta = self.f_theta
-        kappa = self.f_kappa
-
-        # Lateral term: pure-pursuit toward the lookahead point when enabled,
-        # else reactive error at the bottom of the crop. Same feedback shape.
-        if t.lookahead_frac > 0.0 or self.use_path_lookahead:
-            lateral = t.k_pursuit * (self.f_e_look + t.e_bias)
+        desired_w = moving_follow_command_w(
+            TrajectoryFit(
+                found=True,
+                e0=self.f_e0,
+                e_look=self.f_e_look,
+                theta=self.f_theta,
+                kappa=self.f_kappa,
+                conf=self.f_conf,
+                n_bands=3,
+            ),
+            t,
+        )
+        if self.follow_now is None:
+            self.follow_w = desired_w
         else:
-            lateral = t.k_e * e0
+            dt = max(0.0, min(0.5, now - self.follow_now))
+            max_delta = t.max_w_slew_rate * dt
+            delta = max(-max_delta, min(max_delta, desired_w - self.follow_w))
+            self.follow_w += delta
+        self.follow_now = now
+        w = self.follow_w
 
-        sign = 1.0 if t.invert_turn else -1.0
-        heading_curve = t.k_theta * theta + t.k_ff * kappa
-        steering = lateral + heading_curve
-
-        # After a sharp turn the line commonly crosses the bottom of the image
-        # before the chassis is parallel to it.  Then lateral and heading terms
-        # have opposite signs.  Letting heading/curvature cancel a substantial
-        # lateral error produced an almost-zero (and sometimes wrong-way)
-        # command throughout the first-corner recovery in run 173927.  Outside
-        # the inner half of the pivot band, keep at least the lateral correction
-        # itself; heading still shapes the command once the chassis is close.
-        exit_thr_e = t.e_pivot * (1.0 - t.pivot_hysteresis)
-        if (
-            abs(e0) > 0.5 * exit_thr_e
-            and lateral * heading_curve < 0.0
-            and (
-                steering * lateral <= 0.0
-                or abs(steering) < abs(lateral)
-            )
-        ):
-            steering = lateral
-        w = sign * steering
-
-        # Pivot assist: saturation branch for sharp bends / corners of any angle.
-        # Pivot is the stationary, saturated part of tracking.  Its old exit
-        # threshold was 0.572 rad (32.8 deg) with the live configuration, so a
-        # visibly diagonal line was declared ready for moving follow.  Rotation
-        # cannot remove lateral offset, therefore exit on heading alignment and
-        # leave the remaining lateral convergence to moving follow.  Half the
-        # existing entry threshold is an inner saturation boundary, not a new
-        # tuned parameter.
-        # If lateral and heading have opposite signs, the exposed line has
-        # already crossed the chassis centre.  More stationary rotation would
-        # chase past it; translation is now required to remove the offset.
-        crossing_e = self.observed_e0 if self.observation_reliable else e0
-        crossing_theta = self.observed_theta if self.observation_reliable else theta
-        line_crossed_centre = crossing_e * crossing_theta < -1e-4
-        # A complete line inside the inner lateral corridor is already a safe
-        # moving-follow target even if its fitted heading is still diagonal.
-        # Continuing stationary rotation discarded the textbook centre entry
-        # visible at 27.86 s in run 190809. The protected moving controller now
-        # owns the remaining angular convergence.
-        line_in_control_corridor = bool(
-            abs(crossing_e) <= exit_thr_e
-            and abs(crossing_theta) <= t.theta_pivot
-        )
-        # Entry and stay must use the same geometric eligibility.  Otherwise a
-        # line that has just crossed centre exits pivot for one frame, then the
-        # still-large |e|/|theta| immediately enters it again on the next
-        # frame.  That pivot/follow oscillation is stationary over-rotation,
-        # not convergence; translation owns the pose after centre crossing.
-        pivot_threshold_exceeded = (
-            abs(e0) > t.e_pivot or abs(theta) > t.theta_pivot
-        )
-        enter = bool(
-            pivot_threshold_exceeded
-            and not line_crossed_centre
-            and not line_in_control_corridor
-        )
-        # Use one geometric release rule while pivot is active.  Previously an
-        # almost-parallel line with large lateral error exited on heading alone,
-        # then immediately re-entered on |e| (193907: pivot/follow/pivot).  Keep
-        # rotating until the line reaches the inner corridor or crosses centre;
-        # moving follow owns the remaining alignment from that point.
-        stay = not line_crossed_centre and not line_in_control_corridor
-        self.in_pivot = enter if not self.in_pivot else stay
-
-        if self.in_pivot:
-            # Use the protected unified steering sign.  Before centre crossing
-            # this reduces the exposed line's heading; at/after crossing pivot
-            # exits instead of reversing into another stationary chase.
-            pivot_reference = w
-            pivot_sign = -1.0 if pivot_reference < 0 else 1.0
-            w = pivot_sign * t.w_pivot
-            v = t.v_max * t.v_pivot_ratio
-            mode = TrackMode.PIVOT
+        slowdown = t.slow_gain * min(1.0, abs(w) / max(t.max_w, 1e-6))
+        v = t.v_max * max(t.v_min_ratio, 1.0 - slowdown)
+        if predicting:
+            v *= t.predict_speed_factor
+            mode = TrackMode.PREDICT
         else:
-            w = max(-t.max_w, min(t.max_w, w))
-            slowdown = t.slow_gain * min(1.0, abs(w) / max(t.max_w, 1e-6))
-            v = t.v_max * max(t.v_min_ratio, 1.0 - slowdown)
-            if predicting:
-                v *= t.predict_speed_factor
-                mode = TrackMode.PREDICT
-            else:
-                mode = TrackMode.FOLLOW
+            mode = TrackMode.FOLLOW
 
         return MotionCommand(v, w, f"track_{mode.value}", self.state, mode)
 
@@ -428,5 +411,4 @@ class RaceStateMachine:
         self.stopped_reacquire_e = None
         self.stopped_reacquire_theta = None
         if state != RaceState.TRACK:
-            self.in_pivot = False
             self._clear_plan()

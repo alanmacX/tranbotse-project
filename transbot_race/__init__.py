@@ -8,6 +8,13 @@ from .state_machine import (
     TrackMode,
     command_summary,
 )
+from .mission import (
+    CourseSession,
+    DetectorKind,
+    ExecutorKind,
+    FixedSessionMission,
+    SessionSpec,
+)
 from .vision import (
     LineFeatures,
     TrajectoryFit,
@@ -23,6 +30,11 @@ __all__ = [
     "RaceState",
     "RaceStateMachine",
     "TrackMode",
+    "CourseSession",
+    "FixedSessionMission",
+    "DetectorKind",
+    "ExecutorKind",
+    "SessionSpec",
     "TrajectoryFit",
     "command_summary",
     "fit_line_trajectory",

@@ -152,7 +152,8 @@ function showStrategyFields() {
 
 async function loadStrategy() {
   const cfg = await (await fetch("/api/config")).json();
-  strategyMode.value = cfg.path_memory.mode;
+  strategyMode.value = cfg.path_memory.mode || "fixed_sessions";
+  if (!strategyMode.value) strategyMode.value = "fixed_sessions";
   el("obstacleEnabled").checked = !!cfg.obstacle.enabled;
   el("strategyMargin").value = cfg.path_memory.camera_to_axle_m;
   el("cornerConfirm").value = cfg.path_memory.corner_confirm_frames;
@@ -169,10 +170,11 @@ async function loadStrategy() {
 
 strategyMode.addEventListener("change", showStrategyFields);
 el("strategySaveBtn").addEventListener("click", () => guard("STRATEGY", async () => {
+  const selectedMode = strategyMode.value || "fixed_sessions";
   await post("/api/defaults/save", {
     path_memory: {
       enabled: true,
-      mode: strategyMode.value,
+      mode: selectedMode,
       camera_to_axle_m: Number(el("strategyMargin").value),
       corner_confirm_frames: Number(el("cornerConfirm").value),
       corner_turn_angle_rad: Number(el("cornerTurnAngle").value),
@@ -186,7 +188,7 @@ el("strategySaveBtn").addEventListener("click", () => guard("STRATEGY", async ()
     },
     obstacle: { enabled: el("obstacleEnabled").checked },
   });
-  return { message: "selected " + strategyMode.value };
+  return { message: "selected " + selectedMode };
 }));
 
 loadStrategy();

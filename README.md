@@ -58,6 +58,36 @@ For import/config smoke tests without touching motors:
 python3 apps/race_runner.py --dry-run --max-sec 1
 ```
 
+The default race config now uses the fixed course order (`obstacle -> corner ->
+ring_entry -> ring_exit -> fork -> return`). Obstacle handling is deferred, so
+the current default starts at `corner`. Ring entry defaults right and the fork
+defaults to the rightmost path; both are route choices for the same tracker.
+Only the current session's event detector may take control. The
+legacy global detector remains available by setting `path_memory.mode` to
+`corner_event`.
+
+## Recorded Manual Fallback
+
+Run this directly on the robot when the automatic runner needs to be bypassed:
+
+```bash
+python3 apps/manual_drive_app.py --host 0.0.0.0 --port 8780
+```
+
+Open `http://<robot-ip>:8780`. Each click performs exactly one bounded forward,
+backward, left-angle, or right-angle step and stops. Raw camera frames, before
+and after snapshots, requested commands, measured/fallback motion samples and
+action results are saved under `artifacts/manual_runs/`.
+
+For a no-motor smoke test:
+
+```bash
+python3 apps/manual_drive_app.py --dry-run --port 8780
+```
+
+Dry-run mode does not open the host computer's camera. Pass
+`--allow-local-camera` only when a local camera test is explicitly desired.
+
 ## Known Status
 
 - Straight-line navigation is the most reliable component.

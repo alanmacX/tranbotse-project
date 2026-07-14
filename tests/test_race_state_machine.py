@@ -56,12 +56,66 @@ def replay(sm, mask, cfg, start=0.0, n=6, dt=0.1):
 
 class UnifiedTrackerTests(unittest.TestCase):
     def test_all_active_corner_phases_have_one_motor_owner(self):
-        for state in ("approach", "waiting", "turning", "captured", "seeking", "failed"):
+        for state in (
+            "approach", "waiting", "turning", "captured", "aligning",
+            "exit_tracking", "seeking", "failed", "failed_locked",
+        ):
             with self.subTest(state=state):
                 self.assertTrue(_corner_has_motor_ownership(state))
         self.assertFalse(_corner_has_motor_ownership("armed"))
         self.assertFalse(_corner_has_motor_ownership("cooldown"))
         self.assertTrue(_corner_has_motor_ownership("armed", pending_takeover=True))
+
+    def test_corner_handoff_uses_the_same_moving_follow_boundary(self):
+        sm = RaceStateMachine(RaceConfig())
+        fit = TrajectoryFit(
+            found=True, e0=0.463, e_look=0.463, theta=0.338,
+            conf=0.90, n_bands=5, disconnected=False,
+        )
+
+        self.assertTrue(sm.can_take_moving_handoff(fit))
+        command = sm.reacquire_from(fit, now=0.0)
+        self.assertEqual(command.mode, TrackMode.FOLLOW)
+        self.assertGreater(command.v, 0.0)
+
+    def test_corner_handoff_rejects_crossed_but_large_heading_pose(self):
+        sm = RaceStateMachine(RaceConfig())
+        fit = TrajectoryFit(
+            found=True, e0=-0.1823, e_look=-0.1823, theta=0.7693,
+            conf=0.88, n_bands=6, disconnected=False,
+        )
+        self.assertLess(fit.e0 * fit.theta, 0.0)
+        self.assertFalse(sm.can_take_moving_handoff(fit))
+
+    def test_follow_slew_limit_prevents_single_frame_direction_reversal(self):
+        cfg = RaceConfig()
+        sm = RaceStateMachine(cfg)
+        first = TrajectoryFit(
+            found=True, e0=-1.0, e_look=-1.0, theta=0.0,
+            conf=0.90, n_bands=6,
+        )
+        opposite = TrajectoryFit(
+            found=True, e0=1.0, e_look=1.0, theta=0.0,
+            conf=0.90, n_bands=6,
+        )
+        initial = sm.reacquire_from(first, now=0.0)
+        next_command = sm.step(opposite, now=0.1)
+
+        self.assertGreater(initial.w, 0.0)
+        self.assertGreater(next_command.w, 0.0)
+        self.assertLessEqual(
+            abs(next_command.w - initial.w),
+            cfg.tracker.max_w_slew_rate * 0.1 + 1e-9,
+        )
+
+    def test_corner_handoff_rejects_pose_outside_stable_corridor(self):
+        sm = RaceStateMachine(RaceConfig())
+        fit = TrajectoryFit(
+            found=True, e0=0.70, e_look=0.70, theta=0.80,
+            conf=0.90, n_bands=5, disconnected=False,
+        )
+
+        self.assertFalse(sm.can_take_moving_handoff(fit))
 
     def test_blank_start_waits_without_search_rotation(self):
         sm = RaceStateMachine(RaceConfig())
@@ -126,6 +180,26 @@ class UnifiedTrackerTests(unittest.TestCase):
         # Line to the right of center -> steer right (w < 0 with invert_turn off).
         self.assertLess(cmd.w, 0.0)
 
+    def test_image_curvature_does_not_steer_ordinary_straight_cruise(self):
+        cfg = RaceConfig()
+        sm = RaceStateMachine(cfg)
+        perspective_curve = TrajectoryFit(
+            found=True, e0=0.0, e_look=0.0, theta=0.0, kappa=0.28,
+            conf=0.95, n_bands=6, path_memory=False,
+        )
+        command = sm.step(perspective_curve, now=0.0)
+        self.assertAlmostEqual(command.w, 0.0)
+
+    def test_generic_cruise_never_uses_session_curvature_feedforward(self):
+        cfg = RaceConfig()
+        sm = RaceStateMachine(cfg)
+        route_curve = TrajectoryFit(
+            found=True, e0=0.0, e_look=0.0, theta=0.0, kappa=0.28,
+            conf=0.95, n_bands=6, path_memory=True,
+        )
+        command = sm.step(route_curve, now=0.0)
+        self.assertAlmostEqual(command.w, 0.0)
+
     def test_corner_reacquire_reseeds_filter_from_current_line(self):
         cfg = RaceConfig()
         sm = RaceStateMachine(cfg)
@@ -142,7 +216,7 @@ class UnifiedTrackerTests(unittest.TestCase):
         self.assertAlmostEqual(sm.f_e0, fit.e0)
         self.assertAlmostEqual(sm.f_theta, fit.theta)
         self.assertAlmostEqual(sm.d_e0, 0.0)
-        expected_w = -(cfg.tracker.k_e * fit.e0 + cfg.tracker.k_theta * fit.theta)
+        expected_w = -(cfg.tracker.k_e * fit.e0)
         self.assertAlmostEqual(command.w, expected_w)
 
     def test_crossed_line_uses_moving_lateral_recovery_not_pivot(self):
@@ -157,7 +231,7 @@ class UnifiedTrackerTests(unittest.TestCase):
         self.assertGreater(command.v, 0.0)
         self.assertGreater(command.w, 0.0)
 
-    def test_pivot_releases_complete_line_inside_lateral_control_corridor(self):
+    def test_offcentre_line_remains_moving_proportional_follow(self):
         cfg = RaceConfig()
         sm = RaceStateMachine(cfg)
         command = sm.reacquire_from(
@@ -167,11 +241,9 @@ class UnifiedTrackerTests(unittest.TestCase):
             ),
             now=1.0,
         )
-        self.assertEqual(command.mode, TrackMode.PIVOT)
+        self.assertEqual(command.mode, TrackMode.FOLLOW)
+        self.assertGreater(command.v, 0.0)
 
-        # Once a complete reliable line is within the inner lateral corridor,
-        # moving follow can converge the remaining heading without rotating
-        # past the standard centre entry seen in run 190809.
         command = sm.step(
             TrajectoryFit(
                 found=True, e0=0.376, e_look=0.376, theta=0.510,
@@ -183,7 +255,7 @@ class UnifiedTrackerTests(unittest.TestCase):
         self.assertGreater(command.v, 0.0)
         self.assertLess(command.w, 0.0)
 
-    def test_pivot_keeps_rotating_while_complete_line_remains_outside_corridor(self):
+    def test_large_offset_does_not_invoke_generic_pivot(self):
         cfg = RaceConfig()
         sm = RaceStateMachine(cfg)
         sm.reacquire_from(
@@ -200,10 +272,10 @@ class UnifiedTrackerTests(unittest.TestCase):
             ),
             now=1.1,
         )
-        self.assertEqual(command.mode, TrackMode.PIVOT)
-        self.assertEqual(command.v, 0.0)
+        self.assertEqual(command.mode, TrackMode.FOLLOW)
+        self.assertGreater(command.v, 0.0)
 
-    def test_pivot_does_not_exit_then_reenter_on_aligned_large_offset(self):
+    def test_large_offset_stays_in_one_follow_mode(self):
         cfg = RaceConfig()
         sm = RaceStateMachine(cfg)
         sm.reacquire_from(
@@ -221,7 +293,8 @@ class UnifiedTrackerTests(unittest.TestCase):
                 ),
                 now=now,
             )
-            self.assertEqual(command.mode, TrackMode.PIVOT)
+            self.assertEqual(command.mode, TrackMode.FOLLOW)
+            self.assertGreater(command.v, 0.0)
 
     def test_single_band_false_line_cannot_flip_filtered_side(self):
         cfg = RaceConfig()
@@ -291,18 +364,17 @@ class UnifiedTrackerTests(unittest.TestCase):
         self.assertEqual(command.mode, TrackMode.FOLLOW)
         self.assertGreater(command.v, 0.0)
 
-    def test_right_angle_enters_pivot_not_a_state(self):
+    def test_right_angle_cannot_invoke_generic_pivot(self):
         cfg = poly_config()
         cfg.tracker.e_pivot = 0.55
         cfg.tracker.theta_pivot = 0.65
         sm = RaceStateMachine(cfg)
         replay(sm, straight(), cfg, start=-0.4, n=4)
         cmd = replay(sm, right_angle(), cfg, n=8)
-        # Still the single TRACK state, but pivot sub-mode with near-zero speed.
+        # Fixed-session geometry owns corners; generic cruise has no pivot.
         self.assertEqual(sm.state, RaceState.TRACK)
-        self.assertEqual(cmd.mode, TrackMode.PIVOT)
-        self.assertAlmostEqual(cmd.v, cfg.tracker.v_max * cfg.tracker.v_pivot_ratio, places=4)
-        self.assertGreater(abs(cmd.w), 0.0)
+        self.assertNotEqual(cmd.mode, TrackMode.PIVOT)
+        self.assertGreater(cmd.v, 0.0)
 
     def test_dashed_gap_keeps_moving_via_predict(self):
         cfg = RaceConfig()

@@ -28,6 +28,11 @@ class DebugConfigTests(unittest.TestCase):
         _deep_update_cfg(cfg, {"ground_projection": {"homography": values}})
         self.assertEqual(cfg.ground_projection.homography, tuple(values))
 
+    def test_mission_route_is_applied(self):
+        cfg = RaceConfig()
+        _deep_update_cfg(cfg, {"mission": {"ring_entry_direction": -1}})
+        self.assertEqual(cfg.mission.ring_entry_direction, -1)
+
     def test_nested_occlusion_rects_stay_nested(self):
         cfg = RaceConfig()
         _deep_update_cfg(cfg, {"occlusion": {"rects": [[1, 2, 3, 4]]}})

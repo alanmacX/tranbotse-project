@@ -17,6 +17,8 @@ sys.path.insert(0, str(ROOT))
 from transbot_race.config import RaceConfig  # noqa: E402
 from transbot_race.capture_geometry import (  # noqa: E402
     CaptureGeometryFilter,
+    CornerGeometryFilter,
+    RingEntryGeometryFilter,
     analyze_capture_geometry,
     draw_capture_geometry,
 )
@@ -30,6 +32,13 @@ from transbot_race.obstacle import (  # noqa: E402
     ObstacleMonitor,
     draw_obstacle_overlay,
 )
+from transbot_race.mission import (  # noqa: E402
+    CourseSession,
+    DetectorKind,
+    ExecutorKind,
+    FixedSessionMission,
+)
+from transbot_race.ring_entry import RingEntryExecutor, selected_path_fit  # noqa: E402
 from transbot_race.state_machine import (  # noqa: E402
     MotionCommand,
     RaceState,
@@ -102,16 +111,32 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError("vision component thickness cannot be negative")
     if cfg.path_memory.camera_to_axle_m < 0.0:
         raise ValueError("camera-to-axle distance cannot be negative")
-    if cfg.path_memory.mode not in ("none", "corner_event"):
+    if cfg.path_memory.mode not in ("none", "corner_event", "fixed_sessions"):
         raise ValueError(f"unsupported path-memory mode: {cfg.path_memory.mode}")
+    if cfg.mission.ring_entry_direction not in (-1, 1):
+        raise ValueError("mission ring-entry direction must be -1 (left) or +1 (right)")
+    if cfg.mission.ring_exit_direction not in (-1, 1):
+        raise ValueError("mission ring-exit direction must be -1 (left) or +1 (right)")
+    if cfg.mission.fork_branch not in {"left", "middle", "right"}:
+        raise ValueError("mission.fork_branch must be left, middle, or right")
+    if cfg.path_memory.mode == "fixed_sessions":
+        # One route-direction source of truth in the new mode. The legacy
+        # geometry extractor reads this older field internally.
+        cfg.path_memory.roundabout_direction = cfg.mission.ring_entry_direction
     if cfg.path_memory.corner_confirm_frames <= 0:
         raise ValueError("corner confirmation frame count must be positive")
     if cfg.path_memory.corner_replay_max_w <= 0.0 or cfg.path_memory.corner_turn_angle_rad <= 0.0:
         raise ValueError("corner turn angle and angular speed must be positive")
+    if not 0.0 < cfg.path_memory.corner_max_turn_angle_rad <= 3.141592653589793:
+        raise ValueError("corner maximum turn angle must be within (0, pi]")
+    if cfg.path_memory.corner_max_turn_angle_rad < cfg.path_memory.corner_reacquire_angle_rad:
+        raise ValueError("corner maximum turn angle must exceed reacquire angle")
     if cfg.path_memory.roundabout_direction not in (-1, 1):
         raise ValueError("roundabout_direction must be -1 (left) or +1 (right)")
     if cfg.path_memory.roundabout_replay_max_w <= 0.0:
         raise ValueError("roundabout angular speed must be positive")
+    if cfg.tracker.max_w <= 0.0 or cfg.tracker.max_w_slew_rate <= 0.0:
+        raise ValueError("tracker angular limits must be positive")
     if not 0.0 <= cfg.path_memory.corner_reacquire_angle_rad <= cfg.path_memory.corner_turn_angle_rad:
         raise ValueError("corner reacquire angle must be within [0, turn angle]")
     if cfg.path_memory.corner_command_yaw_scale <= 0.0:
@@ -134,6 +159,18 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError("corner approach missing-frame tolerance cannot be negative")
     if cfg.path_memory.corner_align_missing_frames < 0:
         raise ValueError("corner alignment missing-frame tolerance cannot be negative")
+    if cfg.path_memory.corner_exit_confirm_frames <= 0:
+        raise ValueError("corner exit confirmation must be positive")
+    if cfg.path_memory.corner_exit_predict_sec <= 0.0:
+        raise ValueError("corner exit prediction duration must be positive")
+    if not 0.0 < cfg.path_memory.corner_exit_predict_v_ratio <= 1.0:
+        raise ValueError("corner exit prediction speed ratio must be within (0, 1]")
+    if cfg.path_memory.corner_align_v <= 0.0 or cfg.path_memory.corner_align_max_w <= 0.0:
+        raise ValueError("corner alignment motion must be positive")
+    if cfg.path_memory.corner_cruise_ready_frames <= 0:
+        raise ValueError("corner cruise-ready confirmation must be positive")
+    if cfg.path_memory.corner_cruise_ready_distance_m < 0.0:
+        raise ValueError("corner cruise-ready distance cannot be negative")
     if cfg.path_memory.geometry_roi_top_offset_px < 0 or cfg.path_memory.geometry_chassis_trim_px <= 0:
         raise ValueError("capture geometry ROI values are invalid")
 
@@ -148,7 +185,7 @@ def _corner_control_allowed(
         and state_machine.last_event == "obstacle"
     )
     return bool(
-        strategy_mode == "corner_event"
+        strategy_mode in {"corner_event", "fixed_sessions"}
         and not obstacle_stop_required
         and not obstacle_stop_latched
     )
@@ -291,7 +328,11 @@ class DebugRecorder:
             cv.imwrite(str(self.obstacles_dir / f"{stem}.jpg"), obstacle_overlay, params)
         if geometry_observation is not None and geometry_debug is not None:
             geometry_overlay = draw_capture_geometry(
-                geometry_debug, geometry_observation, cfg.path_memory.corner_gate_y_frac,
+                geometry_debug,
+                geometry_observation,
+                cfg.path_memory.corner_gate_y_frac,
+                event_kind=summary.get("geometry_event"),
+                session=summary.get("course_session"),
             )
             cv.imwrite(str(self.geometry_dir / f"{stem}.jpg"), geometry_overlay, params)
 
@@ -332,8 +373,19 @@ def run(args: argparse.Namespace) -> int:
     corner_margin = CornerCommandDelay(
         cfg.path_memory,
         handoff_conf_min=cfg.tracker.conf_predict,
+        tracker_cfg=cfg.tracker,
     )
-    geometry_filter = CaptureGeometryFilter(cfg.path_memory.corner_confirm_frames)
+    mission = FixedSessionMission(cfg.mission) if cfg.path_memory.mode == "fixed_sessions" else None
+    ring_entry = RingEntryExecutor(
+        cfg.mission.ring_entry_direction,
+        margin_distance_m=cfg.path_memory.camera_to_axle_m,
+        tracker_cfg=cfg.tracker,
+    )
+    legacy_geometry_filter = CaptureGeometryFilter(cfg.path_memory.corner_confirm_frames)
+    session_geometry_filters = {
+        DetectorKind.CORNER: CornerGeometryFilter(cfg.path_memory.corner_confirm_frames),
+        DetectorKind.RING_ENTRY: RingEntryGeometryFilter(cfg.path_memory.corner_confirm_frames),
+    }
     obstacle_monitor = ObstacleMonitor(cfg.obstacle)
     cap = cv.VideoCapture(args.camera)
     cap.set(cv.CAP_PROP_FRAME_WIDTH, cfg.camera.frame_width)
@@ -399,14 +451,25 @@ def run(args: argparse.Namespace) -> int:
             geometry_observation = None
             geometry_decision = None
             geometry_debug = None
+            if mission is not None:
+                cfg.path_memory.roundabout_direction = (
+                    cfg.mission.ring_exit_direction
+                    if mission.session == CourseSession.RING_EXIT
+                    else cfg.mission.ring_entry_direction
+                )
             geometry_active = corner_margin.state in {"armed", "approach"}
             if (
-                strategy_mode == "corner_event"
+                strategy_mode in {"corner_event", "fixed_sessions"}
                 and cfg.path_memory.capture_geometry_enabled
                 and geometry_active
+                and (mission is None or mission.detector_enabled)
             ):
                 geometry_observation, geometry_debug = analyze_capture_geometry(frame, cfg)
-                geometry_decision = geometry_filter.update(geometry_observation)
+                active_geometry_filter = (
+                    session_geometry_filters[mission.detector_kind]
+                    if mission is not None else legacy_geometry_filter
+                )
+                geometry_decision = active_geometry_filter.update(geometry_observation)
 
             fit = visual_fit
             memory_status = PathStrategyStatus(False, strategy_mode, "disabled")
@@ -415,24 +478,143 @@ def run(args: argparse.Namespace) -> int:
                     memory_status = PathStrategyStatus(False, "none", "passthrough")
                 elif strategy_mode == "corner_event":
                     memory_status = PathStrategyStatus(True, "corner_event", corner_margin.state)
+                elif strategy_mode == "fixed_sessions" and mission is not None:
+                    memory_status = PathStrategyStatus(
+                        mission.detector_enabled,
+                        "fixed_sessions",
+                        mission.session.value,
+                    )
             fork_straight_phase = bool(
                 corner_margin.event_shape == "fork"
                 and corner_margin.state in {"approach", "waiting"}
             )
+            ring_session = bool(
+                mission is not None
+                and mission.executor_kind == ExecutorKind.RING_ENTRY
+            )
+            route_fit = selected_path_fit(
+                geometry_debug,
+                geometry_observation,
+                frame_center_x=x0 + track_center,
+                control_width=crop_w,
+            ) if ring_session else None
             effective_geometry_decision = geometry_decision
-            if corner_margin.state == "armed" and sm.state == RaceState.STOPPED:
+            if mission is not None:
+                effective_geometry_decision = mission.gate(
+                    effective_geometry_decision,
+                    geometry_observation,
+                    visual_fit,
+                    incoming_ready=sm.can_take_moving_handoff(visual_fit),
+                )
+            mission_geometry_decision = effective_geometry_decision
+            ring_result = None
+            ring_travelled_for_log = None
+            ring_clear_for_log = None
+            if ring_session:
+                ring_entry.set_direction(cfg.path_memory.roundabout_direction)
+                ring_result = ring_entry.step(
+                    geometry_observation,
+                    route_fit,
+                    now=now,
+                    linear=motion.linear,
+                    accepted_entry=effective_geometry_decision is not None,
+                    # A raw far-field candidate is observation only. Motor
+                    # ownership begins exclusively after the mission gate.
+                    confirmed_entry=False,
+                    cruise_fit=visual_fit,
+                    incoming_v=last_cmd_v,
+                    incoming_w=last_cmd_w,
+                )
+                ring_travelled_for_log = ring_entry.travelled_m
+                ring_clear_for_log = ring_entry.clear_frames
+
+            if not ring_session and corner_margin.state == "armed" and sm.state == RaceState.STOPPED:
                 # A stopped cruise controller may observe geometry, but must
                 # first recover a trustworthy line before a new event can take
                 # motor ownership.
                 effective_geometry_decision = None
-            pending_corner_takeover = corner_margin.will_accept_geometry(
-                effective_geometry_decision
+            pending_corner_takeover = bool(
+                not ring_session
+                and corner_margin.will_accept_geometry(effective_geometry_decision)
             )
             corner_owns_chassis = _corner_has_motor_ownership(
                 corner_margin.state,
                 pending_corner_takeover,
-            )
-            if corner_owns_chassis and not obstacle_decision.stop_required:
+            ) if not ring_session else False
+            if ring_session and ring_result is not None:
+                fit = ring_result.fit or visual_fit
+                if obstacle_decision.stop_required:
+                    command = sm.step(fit, now=now, obstacle=True)
+                elif ring_result.fit is not None:
+                    ring_v, ring_w = ring_entry.control(
+                        ring_result.fit,
+                        now=now,
+                        v_max=cfg.tracker.v_max,
+                        k_pursuit=cfg.tracker.k_pursuit,
+                        k_theta=cfg.tracker.k_theta,
+                        max_w=cfg.path_memory.roundabout_replay_max_w,
+                        approach_max_w=cfg.path_memory.corner_approach_max_w,
+                        invert_turn=cfg.tracker.invert_turn,
+                    )
+                    command = MotionCommand(
+                        ring_v,
+                        ring_w,
+                        ring_result.reason,
+                        RaceState.TRACK,
+                        None,
+                    )
+                elif ring_entry.state == "waiting":
+                    command = sm.step(visual_fit, now=now, obstacle=False)
+                elif ring_entry.state == "margin":
+                    command = MotionCommand(
+                        ring_entry.margin_v,
+                        ring_entry.margin_w,
+                        ring_result.reason,
+                        RaceState.TRACK,
+                        None,
+                    )
+                else:
+                    # Once a route has been committed, silently switching back
+                    # to the generic near-line tracker may select the other
+                    # branch. Stop if the selected skeleton is lost too long.
+                    command = MotionCommand(
+                        0.0,
+                        0.0,
+                        ring_result.reason,
+                        RaceState.STOPPED,
+                        None,
+                    )
+                memory_status = PathStrategyStatus(
+                    True,
+                    "fixed_sessions",
+                    ring_result.reason,
+                    max(0.0, ring_entry.min_distance_m - ring_entry.travelled_m),
+                    cfg.mission.ring_entry_direction,
+                    ring_entry.clear_frames,
+                )
+                if ring_entry.state == "margin":
+                    memory_status = replace(
+                        memory_status,
+                        remaining_m=ring_entry.margin_remaining_m,
+                    )
+                if ring_result.completed and mission is not None:
+                    next_session = mission.advance()
+                    for session_filter in session_geometry_filters.values():
+                        session_filter.reset()
+                    legacy_geometry_filter.reset()
+                    if next_session == CourseSession.RING_EXIT:
+                        # Entry completion is only a topology phase boundary.
+                        # Keep the same filtered path and controller command
+                        # while circulating; generic cruise cannot own a ring.
+                        memory_status = replace(
+                            memory_status,
+                            reason="ring_inside_tracking",
+                        )
+                    else:
+                        if ring_result.fit is not None:
+                            command = sm.reacquire_from(ring_result.fit, now)
+                        ring_entry.reset()
+            elif corner_owns_chassis and not obstacle_decision.stop_required:
                 # Do not even advance the cruise TRACK/LOST/PIVOT state while
                 # a turn is active.  Its output used to be overwritten later,
                 # but its hidden state still timed out or flipped search/pivot
@@ -443,7 +625,12 @@ def run(args: argparse.Namespace) -> int:
                     fit, now=now,
                     obstacle=obstacle_decision.stop_required,
                 )
-            if _corner_control_allowed(strategy_mode, obstacle_decision.stop_required, sm):
+            if (
+                not ring_session
+                and
+                _corner_control_allowed(strategy_mode, obstacle_decision.stop_required, sm)
+                and (mission is None or mission.detector_enabled)
+            ):
                 corner_state_before = corner_margin.state
                 delayed = corner_margin.step(
                     visual_fit, features, command.v, command.w, now,
@@ -458,13 +645,50 @@ def run(args: argparse.Namespace) -> int:
                     ),
                 )
                 memory_status = delayed.status
+                if mission is not None:
+                    memory_status = replace(memory_status, mode="fixed_sessions")
+                    if (
+                        mission.executor_kind == ExecutorKind.CORNER
+                        and corner_state_before == "armed"
+                        and corner_margin.state == "armed"
+                    ):
+                        if mission_geometry_decision is not None:
+                            fixed_reason = (
+                                "corner_waiting_cruise_recovery"
+                                if sm.state == RaceState.STOPPED
+                                else "corner_waiting_control_prerequisite"
+                            )
+                        elif geometry_decision is not None:
+                            fixed_reason = mission.last_gate_reason
+                        elif (
+                            geometry_observation is not None
+                            and geometry_observation.kind != "straight_or_unknown"
+                        ):
+                            fixed_reason = f"corner_observing_{geometry_observation.kind}"
+                        else:
+                            fixed_reason = "corner_waiting_geometry"
+                        memory_status = replace(memory_status, reason=fixed_reason)
                 if (
                     memory_status.reason == "corner_visual_takeover"
                     or (corner_state_before != "armed" and corner_margin.state == "armed")
                 ):
-                    geometry_filter.reset()
+                    for session_filter in session_geometry_filters.values():
+                        session_filter.reset()
+                    legacy_geometry_filter.reset()
                 if memory_status.reason == "corner_visual_takeover":
                     command = sm.reacquire_from(visual_fit, now)
+                    if mission is not None:
+                        mission.advance()
+                        # Session progress itself prevents duplicate triggers.
+                        # Begin the next detector fresh instead of cooldown.
+                        corner_margin = CornerCommandDelay(
+                            cfg.path_memory,
+                            handoff_conf_min=cfg.tracker.conf_predict,
+                            tracker_cfg=cfg.tracker,
+                        )
+                        for session_filter in session_geometry_filters.values():
+                            session_filter.reset()
+                        legacy_geometry_filter.reset()
                 elif corner_state_before == "approach" and corner_margin.state == "armed":
                     # Approach rejection is an ownership hand-back, not a
                     # continuation of the cruise filter that was frozen before
@@ -498,6 +722,13 @@ def run(args: argparse.Namespace) -> int:
             summary["motion_w"] = round(motion.angular, 4)
             summary["motion_source"] = motion.source
             summary["path_strategy"] = memory_status.mode
+            summary["course_session"] = None if mission is None else mission.session.value
+            summary["session_detector"] = (
+                None if mission is None else mission.detector_kind.value
+            )
+            summary["session_executor"] = (
+                None if mission is None else mission.executor_kind.value
+            )
             summary["path_strategy_active"] = memory_status.active
             summary["path_strategy_reason"] = memory_status.reason
             summary["path_strategy_remaining_m"] = round(memory_status.remaining_m, 4)
@@ -511,7 +742,12 @@ def run(args: argparse.Namespace) -> int:
             )
             summary["camera_to_axle_m"] = round(cfg.path_memory.camera_to_axle_m, 4)
             summary["turn_entry_delay_m"] = round(cfg.path_memory.camera_to_axle_m, 4)
-            summary["geometry_kind"] = None if geometry_observation is None else geometry_observation.kind
+            summary["geometry_raw_kind"] = (
+                None if geometry_observation is None else geometry_observation.kind
+            )
+            summary["geometry_kind"] = (
+                None if geometry_decision is None else geometry_decision.kind
+            )
             summary["geometry_direction"] = None if geometry_observation is None else geometry_observation.direction
             summary["geometry_is_fork"] = None if geometry_observation is None else geometry_observation.is_fork
             summary["geometry_angle_deg"] = None if geometry_observation is None else round(
@@ -530,7 +766,36 @@ def run(args: argparse.Namespace) -> int:
                 None if geometry_observation is None
                 else round(geometry_observation.incoming_theta, 4)
             )
-            summary["geometry_decision"] = None if geometry_decision is None else geometry_decision.kind
+            summary["geometry_decision"] = summary["geometry_kind"]
+            summary["geometry_event"] = summary["geometry_kind"]
+            summary["geometry_gate_accepted"] = mission_geometry_decision is not None
+            summary["geometry_controller_eligible"] = bool(
+                pending_corner_takeover
+                or (ring_result is not None and ring_result.fit is not None)
+            )
+            summary["geometry_gate_reason"] = (
+                None if mission is None else mission.last_gate_reason
+            )
+            summary["geometry_candidate_directions"] = (
+                [] if geometry_debug is None else list(geometry_debug.candidate_directions)
+            )
+            summary["ring_entry_state"] = (
+                None
+                if ring_result is None
+                else "completed" if ring_result.completed else ring_entry.state
+            )
+            summary["ring_entry_selected_e_look"] = (
+                None if route_fit is None else round(route_fit.e_look, 4)
+            )
+            summary["ring_entry_selected_theta"] = (
+                None if route_fit is None else round(route_fit.theta, 4)
+            )
+            summary["ring_entry_travelled_m"] = (
+                None if ring_travelled_for_log is None else round(ring_travelled_for_log, 4)
+            )
+            summary["ring_entry_clear_frames"] = (
+                ring_clear_for_log
+            )
             summary["fork_straight_phase"] = fork_straight_phase
             summary["roundabout_direction"] = cfg.path_memory.roundabout_direction
             summary["roundabout_margin_enabled"] = cfg.path_memory.roundabout_margin_enabled

@@ -33,7 +33,7 @@ class PathMemoryConfig:
     """Selectable camera-to-axle experiment strategy."""
 
     enabled: bool = True
-    mode: str = "none"  # none, corner_event
+    mode: str = "none"  # none, corner_event (legacy), fixed_sessions
     # Odometric distance from the near-field curvature-onset gate to the axle
     # turn point.  This is a gate-to-axle longitudinal extrinsic compensation,
     # not an image-processing margin and not a delay from first detection.
@@ -44,6 +44,13 @@ class PathMemoryConfig:
     corner_approach_max_w: float = 0.08
     corner_approach_missing_frames: int = 4
     corner_align_missing_frames: int = 4
+    corner_exit_confirm_frames: int = 3
+    corner_exit_predict_sec: float = 1.0
+    corner_exit_predict_v_ratio: float = 0.60
+    corner_align_v: float = 0.025
+    corner_align_max_w: float = 0.08
+    corner_cruise_ready_frames: int = 4
+    corner_cruise_ready_distance_m: float = 0.03
     geometry_roi_top_offset_px: int = 80
     geometry_chassis_trim_px: int = 45
     corner_confirm_frames: int = 3
@@ -59,6 +66,7 @@ class PathMemoryConfig:
     roundabout_margin_enabled: bool = True
     roundabout_replay_max_w: float = 0.20
     corner_turn_angle_rad: float = 1.57
+    corner_max_turn_angle_rad: float = 2.6179938779914944
     corner_command_yaw_scale: float = 1.00
     # Minimum accumulated yaw before the first same-side exit line is eligible.
     corner_reacquire_angle_rad: float = 0.35
@@ -81,6 +89,16 @@ class GroundProjectionConfig:
     bird_width_px: int = 200
     bird_height_px: int = 260
     pixels_per_meter: float = 500.0
+
+
+@dataclass(slots=True)
+class MissionConfig:
+    """Fixed course order; only the current session may emit an event."""
+
+    initial_session: str = "corner"
+    ring_entry_direction: int = 1
+    ring_exit_direction: int = 1
+    fork_branch: str = "right"
 
 @dataclass(slots=True)
 class ObstacleConfig:
@@ -145,23 +163,20 @@ class VisionConfig:
 
 @dataclass(slots=True)
 class TrackerConfig:
-    """Unified continuous line tracker.
-
-    Corners (any angle), dashed lines and roundabouts are handled by one control
-    law over the trajectory fit (e0, theta, kappa) plus a confidence filter,
-    rather than by per-case states.
-    """
+    """Near-field cruise plus shared session handoff thresholds."""
 
     # Base motion.
     v_max: float = 0.06
     v_min_ratio: float = 0.35        # floor on v as a fraction of v_max
     invert_turn: bool = False
 
-    # Control law: w = k_e*e0 + k_theta*theta + k_ff*kappa.
+    # Ordinary cruise restores the original near-field proportional follower:
+    # w = k_e * e0. Session executors own corners and roundabout geometry.
     k_e: float = 0.24
-    k_theta: float = 0.30
-    k_ff: float = 0.20
-    max_w: float = 0.30
+    k_theta: float = 0.30  # session path controllers only
+    k_ff: float = 0.20     # retained for session-specific path control
+    max_w: float = 0.24
+    max_w_slew_rate: float = 0.45  # rad/s^2; bounds single-frame reversals
     slow_gain: float = 0.55          # how much |w| cuts speed (0..1)
 
     # Confidence filter: below conf_predict the controller runs on prediction
@@ -173,8 +188,7 @@ class TrackerConfig:
     conf_lost: float = 0.12          # predicted conf that trips LOST
     predict_speed_factor: float = 0.7
 
-    # Pivot assist: a saturation branch of the same controller, entered when the
-    # line is far off / sharply angled (covers corners of any angle).
+    # Stable session-to-cruise handoff corridor. Generic cruise has no pivot.
     e_pivot: float = 0.55
     theta_pivot: float = 0.65        # radians
     pivot_hysteresis: float = 0.12   # fractional widening to exit pivot
@@ -215,5 +229,6 @@ class RaceConfig:
     occlusion: OcclusionConfig = field(default_factory=OcclusionConfig)
     path_memory: PathMemoryConfig = field(default_factory=PathMemoryConfig)
     ground_projection: GroundProjectionConfig = field(default_factory=GroundProjectionConfig)
+    mission: MissionConfig = field(default_factory=MissionConfig)
     obstacle: ObstacleConfig = field(default_factory=ObstacleConfig)
     tracker: TrackerConfig = field(default_factory=TrackerConfig)

@@ -45,6 +45,8 @@ class CaptureGeometryDebug:
     component: np.ndarray
     skeleton: np.ndarray
     path: tuple[tuple[int, int], ...]
+    candidate_paths: tuple[tuple[tuple[int, int], ...], ...]
+    candidate_directions: tuple[int, ...]
     endpoints: tuple[tuple[int, int], ...]
     roi_y0: int
 
@@ -428,6 +430,8 @@ def analyze_capture_geometry(
         component=component,
         skeleton=skeleton,
         path=tuple(path),
+        candidate_paths=tuple(tuple(candidate) for _direction, candidate in candidate_directions),
+        candidate_directions=tuple(direction for direction, _candidate in candidate_directions),
         endpoints=tuple(endpoints),
         roi_y0=roi_y0,
     )
@@ -442,7 +446,10 @@ class CaptureGeometryFilter:
     def reset(self) -> None:
         self.window.clear()
 
-    def update(self, observation: CaptureGeometryObservation) -> CaptureGeometryDecision | None:
+    def update(
+        self,
+        observation: CaptureGeometryObservation,
+    ) -> CaptureGeometryDecision | None:
         self.window.append(observation)
         if len(self.window) < self.confirm_frames:
             return None
@@ -478,6 +485,33 @@ class CaptureGeometryFilter:
             return None
         return self._decision("turn", turns, direction=observation.direction)
 
+    def _session_decision(
+        self,
+        observation: CaptureGeometryObservation,
+        *,
+        event_kind: str,
+        allowed_shapes: set[str],
+        require_fork: bool | None,
+    ) -> CaptureGeometryDecision | None:
+        if observation.kind not in allowed_shapes or observation.direction == 0:
+            return None
+        if require_fork is not None and observation.is_fork != require_fork:
+            return None
+        candidates = [
+            item for item in self.window
+            if item.kind in allowed_shapes
+            and item.direction == observation.direction
+            and (require_fork is None or item.is_fork == require_fork)
+            and item.is_fork == observation.is_fork
+            and item.confidence >= 0.55
+            and abs(item.angle_rad) >= math.radians(20.0)
+            and item.vertex_y_frac is not None
+        ]
+        required = max(2, self.confirm_frames - 1)
+        if len(candidates) < required:
+            return None
+        return self._decision(event_kind, candidates, direction=observation.direction)
+
     @staticmethod
     def _decision(
         kind: str, observations: list[CaptureGeometryObservation], direction: int,
@@ -495,8 +529,48 @@ class CaptureGeometryFilter:
         )
 
 
+class CornerGeometryFilter(CaptureGeometryFilter):
+    """Only emits the event understood by the corner executor."""
+
+    def update(
+        self,
+        observation: CaptureGeometryObservation,
+    ) -> CaptureGeometryDecision | None:
+        self.window.append(observation)
+        if len(self.window) < self.confirm_frames:
+            return None
+        return self._session_decision(
+            observation,
+            event_kind="corner",
+            allowed_shapes={"corner", "curve"},
+            require_fork=False,
+        )
+
+
+class RingEntryGeometryFilter(CaptureGeometryFilter):
+    """Only emits the event understood by the ring-entry executor."""
+
+    def update(
+        self,
+        observation: CaptureGeometryObservation,
+    ) -> CaptureGeometryDecision | None:
+        self.window.append(observation)
+        if len(self.window) < self.confirm_frames:
+            return None
+        return self._session_decision(
+            observation,
+            event_kind="ring_entry",
+            allowed_shapes={"curve", "circle"},
+            require_fork=None,
+        )
+
+
 def draw_capture_geometry(
-    debug: CaptureGeometryDebug, observation: CaptureGeometryObservation, gate_y_frac: float,
+    debug: CaptureGeometryDebug,
+    observation: CaptureGeometryObservation,
+    gate_y_frac: float,
+    event_kind: str | None = None,
+    session: str | None = None,
 ) -> np.ndarray:
     overlay = debug.roi.copy()
     overlay[debug.component > 0] = (
@@ -505,14 +579,22 @@ def draw_capture_geometry(
     overlay[debug.skeleton > 0] = (255, 80, 30)
     for point in debug.endpoints:
         cv.circle(overlay, point, 4, (0, 255, 0), -1)
+    for direction, candidate in zip(debug.candidate_directions, debug.candidate_paths):
+        color = (255, 220, 0) if direction < 0 else (0, 220, 255)
+        for p0, p1 in zip(candidate, candidate[1:]):
+            cv.line(overlay, p0, p1, color, 1)
     for p0, p1 in zip(debug.path, debug.path[1:]):
-        cv.line(overlay, p0, p1, (0, 0, 255), 1)
+        cv.line(overlay, p0, p1, (0, 0, 255), 2)
     if observation.vertex is not None:
         cv.circle(overlay, tuple(int(round(value)) for value in observation.vertex), 7, (255, 0, 255), 2)
     gate_y = int(round(overlay.shape[0] * gate_y_frac))
     cv.line(overlay, (0, gate_y), (overlay.shape[1] - 1, gate_y), (0, 255, 255), 2)
     angle_deg = math.degrees(observation.angle_rad)
-    label = f"{observation.kind} dir={observation.direction:+d} angle={angle_deg:+.1f} ep={observation.endpoints}"
+    label = (
+        f"session={session or '-'} raw_shape={observation.kind} "
+        f"event={event_kind or '-'} fork={int(observation.is_fork)} "
+        f"selected={observation.direction:+d} angle={angle_deg:+.1f} ep={observation.endpoints}"
+    )
     cv.rectangle(overlay, (0, 0), (overlay.shape[1], 26), (0, 0, 0), -1)
     cv.putText(overlay, label, (7, 18), cv.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv.LINE_AA)
     return overlay

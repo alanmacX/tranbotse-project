@@ -1,0 +1,7 @@
+{
+  "ended_at": "2026-07-14T09:02:48+0800",
+  "duration_sec": 35.545,
+  "actions": "actions.jsonl",
+  "motion": "motion.jsonl",
+  "frames": "frames/"
+}

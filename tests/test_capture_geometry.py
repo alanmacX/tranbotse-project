@@ -7,6 +7,7 @@ import numpy as np
 from transbot_race.capture_geometry import (
     CaptureGeometryFilter,
     CaptureGeometryObservation,
+    CornerGeometryFilter,
     analyze_capture_geometry,
 )
 from transbot_race.config import RaceConfig
@@ -65,6 +66,24 @@ class CaptureGeometryFilterTests(unittest.TestCase):
         self.assertEqual(decision.kind, "turn")
         self.assertEqual(decision.direction, 1)
         self.assertEqual(decision.votes, 2)
+
+    def test_corner_session_emits_corner_not_curve_or_turn(self):
+        geometry_filter = CornerGeometryFilter(confirm_frames=3)
+        geometry_filter.update(observation("curve", 1, math.radians(28)))
+        geometry_filter.update(observation("curve", 1, math.radians(34)))
+        decision = geometry_filter.update(observation("curve", 1, math.radians(40)))
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.kind, "corner")
+
+    def test_corner_session_never_emits_ring_entry_event(self):
+        geometry_filter = CornerGeometryFilter(confirm_frames=3)
+        fork = CaptureGeometryObservation(
+            kind="curve", direction=1, angle_rad=math.radians(45),
+            confidence=0.9, vertex_y_frac=0.55, is_fork=True,
+        )
+        for _ in range(4):
+            decision = geometry_filter.update(fork)
+            self.assertIsNone(decision)
 
     def test_short_curve_observations_without_vertex_never_vote_as_turn(self):
         geometry_filter = CaptureGeometryFilter(confirm_frames=3)

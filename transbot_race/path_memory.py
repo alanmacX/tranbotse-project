@@ -6,7 +6,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from .config import PathMemoryConfig
+from .config import PathMemoryConfig, TrackerConfig
+from .state_machine import moving_follow_command_w, moving_follow_handoff_ready
 from .vision import LineFeatures, TrajectoryFit
 
 if TYPE_CHECKING:
@@ -49,28 +50,48 @@ class FirstEntryLineLatch:
     accepted.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, confirm_frames: int = 3) -> None:
+        self.confirm_frames = max(2, int(confirm_frames))
         self.latched = False
         self.last_e = 0.0
         self.last_theta = 0.0
+        self.candidate_frames = 0
+        self.candidate_e: float | None = None
 
     def reset(self) -> None:
-        self.__init__()
+        self.__init__(self.confirm_frames)
 
     def try_latch(self, fit: TrajectoryFit, direction: int) -> bool:
         if self.latched or direction == 0:
             return False
-        coherent = bool(
+        strong = bool(
             fit.found
             and fit.conf >= 0.30
-            and fit.n_bands >= 4
+            and fit.n_bands >= 3
             and abs(fit.theta) <= 0.95
         )
-        if not coherent:
-            return False
         side = direction * fit.e0
-        if side <= 0.0:
+        weak_first_entry = bool(
+            fit.found
+            and fit.conf >= 0.15
+            and fit.n_bands >= 1
+            and abs(fit.e0) >= 0.45
+        )
+        if side <= 0.0 or not (strong or weak_first_entry):
+            self.candidate_frames = 0
+            self.candidate_e = None
             return False
+        if strong:
+            self.candidate_frames = max(1, self.candidate_frames)
+        else:
+            continuous = bool(
+                self.candidate_e is None
+                or abs(fit.e0 - self.candidate_e) <= 0.50
+            )
+            self.candidate_frames = self.candidate_frames + 1 if continuous else 1
+            self.candidate_e = fit.e0
+            if self.candidate_frames < self.confirm_frames:
+                return False
         # The first coherent line on the commanded turn side is the exit.
         # Waiting for it to move inward discarded the actual first entry in
         # 173358 and allowed a much later line to become eligible instead.
@@ -155,9 +176,15 @@ def _intent_direction(features: LineFeatures, fit: TrajectoryFit, cfg: PathMemor
 
 
 class CornerCommandDelay:
-    def __init__(self, cfg: PathMemoryConfig, handoff_conf_min: float = 0.35) -> None:
+    def __init__(
+        self,
+        cfg: PathMemoryConfig,
+        handoff_conf_min: float = 0.35,
+        tracker_cfg: TrackerConfig | None = None,
+    ) -> None:
         self.cfg = cfg
         self.handoff_conf_min = max(0.0, float(handoff_conf_min))
+        self.tracker_cfg = tracker_cfg or TrackerConfig()
         self.state = "armed"
         self.candidate_dir = 0
         self.confirm = 0
@@ -171,15 +198,18 @@ class CornerCommandDelay:
         self.turned_rad = 0.0
         self.reacquire_frames = 0
         self.align_missing_frames = 0
+        self.align_travelled_m = 0.0
         self.clear_frames = 0
         self.gate_frames = 0
         self.approach_missing_frames = 0
         self.approach_travelled_m = 0.0
         self.capture_votes = 0
         self.event_shape = "corner"
-        self.exit_latch = FirstEntryLineLatch()
+        self.exit_latch = FirstEntryLineLatch(cfg.corner_exit_confirm_frames)
         self.recovery_last_e: float | None = None
         self.recovery_last_theta: float | None = None
+        self.exit_last_seen_now: float | None = None
+        self.exit_track_w = 0.0
         self.last_now: float | None = None
 
     def will_accept_geometry(
@@ -391,16 +421,35 @@ class CornerCommandDelay:
             ready = self.turned_rad >= self.cfg.corner_reacquire_angle_rad
             if self._turn_limit_reached():
                 self._enter_failed()
-            elif ready and self.exit_latch.try_latch(fit, self.candidate_dir):
-                # First sight of the exit is a hard edge: cancel the coarse
-                # pivot immediately.  The next cycle begins low-speed path
-                # following; never carry -corner_replay_max_w through capture.
-                self.state = "captured"
-                self.align_missing_frames = 0
-                self.reacquire_frames = 0
-            elif self.turned_rad >= self.target_angle_rad:
-                self.state = "seeking"
-                self.reacquire_frames = 0
+            elif self.event_shape != "fork":
+                if ready and not self.exit_latch.latched:
+                    self.exit_latch.try_latch(fit, self.candidate_dir)
+                if self.exit_latch.latched and self._latched_exit_trackable(fit):
+                    # The first exit is now both identified and close enough
+                    # to control. From this point onward its continuous visual
+                    # track owns the maneuver. Never keep blind-pivoting until
+                    # another complete line (often the incoming road) happens
+                    # to satisfy a generic cruise predicate.
+                    self.state = "exit_tracking"
+                    self.reacquire_frames = 0
+                    self.align_missing_frames = 0
+                    self.exit_last_seen_now = now
+                    self.exit_track_w = self._tracked_exit_w(fit, invert_turn)
+            elif ready:
+                exit_latched = self.exit_latch.try_latch(fit, self.candidate_dir)
+                if exit_latched:
+                    # First confirmed sight of the exit is a hard edge: cancel
+                    # coarse pivot immediately.
+                    self.state = "captured"
+                    self.align_missing_frames = 0
+                    self.reacquire_frames = 0
+                elif self.exit_latch.candidate_frames > 0:
+                    # Hold still while a weak far-field entry accumulates its
+                    # temporal votes; do not cross into blind seeking.
+                    pass
+                elif self.turned_rad >= self.target_angle_rad:
+                    self.state = "seeking"
+                    self.reacquire_frames = 0
         elif self.state == "captured":
             # Account for physical coasting after the stop command.  If this
             # provisional candidate disappears and search resumes, the angular
@@ -409,14 +458,13 @@ class CornerCommandDelay:
             if self._turn_limit_reached():
                 self._enter_failed()
             elif self.exit_latch.observe_latched(fit, self.handoff_conf_min):
-                # Two consecutive observations of the first entry line are
-                # enough.  Tracking and centring belong to RaceStateMachine;
-                # running another controller here caused reacquire failures.
-                self.state = "cooldown"
-                self.clear_frames = 0
+                # Exit identity is established, but an edge-of-frame line is
+                # not a safe cruise handoff. Keep ownership for bounded moving
+                # alignment until normal cruise would remain in FOLLOW.
+                self.state = "aligning"
                 self.align_missing_frames = 0
-                self.reacquire_frames = 1
-                visual_takeover = True
+                self.reacquire_frames = 0
+                self.align_travelled_m = 0.0
             else:
                 self.align_missing_frames += 1
                 if self.align_missing_frames > self.cfg.corner_align_missing_frames:
@@ -437,6 +485,55 @@ class CornerCommandDelay:
                     # turn cycle would reproduce the observed over-rotation at
                     # slow/night frame rates.
                     self.state = "seeking"
+        elif self.state == "aligning":
+            self.align_travelled_m += travelled
+            complete_line = bool(
+                fit.found
+                and fit.conf >= self.handoff_conf_min
+                and fit.n_bands >= 3
+                and not fit.disconnected
+                and features.branch_left is None
+                and features.branch_right is None
+            )
+            self.align_missing_frames = 0 if complete_line else self.align_missing_frames + 1
+            cruise_ready = bool(
+                complete_line
+                and moving_follow_handoff_ready(fit, self.tracker_cfg)
+            )
+            self.reacquire_frames = self.reacquire_frames + 1 if cruise_ready else 0
+            if (
+                self.reacquire_frames >= self.cfg.corner_cruise_ready_frames
+                and self.align_travelled_m >= self.cfg.corner_cruise_ready_distance_m
+            ):
+                self.state = "cooldown"
+                self.clear_frames = 0
+                visual_takeover = True
+        elif self.state == "exit_tracking":
+            # Residual yaw still spends the same 150-degree safety budget.
+            self._advance_turn(yaw_delta, invert_turn)
+            if self._turn_limit_reached():
+                self._enter_failed()
+            else:
+                trackable_exit = self._latched_exit_trackable(fit)
+                if trackable_exit:
+                    self.exit_last_seen_now = now
+                    self.exit_track_w = self._tracked_exit_w(fit, invert_turn)
+                    cruise_ready = self._corner_cruise_ready(fit, features)
+                    self.reacquire_frames = (
+                        self.reacquire_frames + 1 if cruise_ready else 0
+                    )
+                if self.reacquire_frames >= self.cfg.corner_cruise_ready_frames:
+                    self.state = "cooldown"
+                    self.clear_frames = 0
+                    visual_takeover = True
+                elif (
+                    self.exit_last_seen_now is None
+                    or now - self.exit_last_seen_now > self.cfg.corner_exit_predict_sec
+                ):
+                    # The committed path is retained across dashed gaps, as a
+                    # local planner retains and prunes its path. Only expiry of
+                    # the bounded prediction horizon is a real path loss.
+                    self._enter_failed(lock_identity=True)
         elif self.state == "seeking":
             self._advance_turn(yaw_delta, invert_turn)
             # The angular envelope is a hard safety boundary.  Check it before
@@ -523,11 +620,34 @@ class CornerCommandDelay:
         if self.state == "turning":
             turn_w = self._turn_command_w(invert_turn)
             status = PathStrategyStatus(
-                True, "corner_event", "committed_turn", 0.0,
-                self.candidate_dir, 0,
-                (self.turned_rad, self.target_angle_rad),
+                True, "corner_event",
+                (
+                    "corner_cruise_confirming"
+                    if self.reacquire_frames > 0 else "committed_turn"
+                ),
+                0.0, self.candidate_dir, self.reacquire_frames,
+                (self.turned_rad, self.cfg.corner_max_turn_angle_rad),
             )
             return CornerCommandResult(0.0, turn_w, status)
+        if self.state == "exit_tracking":
+            if self._latched_exit_trackable(fit):
+                track_w = self.exit_track_w
+                track_v = self.cfg.corner_align_v
+            else:
+                # A dash gap is prediction, not STOP. Preserve the last
+                # committed curvature and reduce translation until the next
+                # observed segment updates the path.
+                track_v = (
+                    self.cfg.corner_align_v
+                    * self.cfg.corner_exit_predict_v_ratio
+                )
+                track_w = self.exit_track_w
+            status = PathStrategyStatus(
+                True, "corner_event", "corner_exit_tracking", 0.0,
+                self.candidate_dir, self.reacquire_frames,
+                (self.turned_rad, self.cfg.corner_max_turn_angle_rad),
+            )
+            return CornerCommandResult(track_v, track_w, status)
         if self.state == "captured":
             status = PathStrategyStatus(
                 True, "corner_event", "corner_exit_captured", 0.0,
@@ -535,23 +655,57 @@ class CornerCommandDelay:
                 (self.turned_rad, self.target_angle_rad),
             )
             return CornerCommandResult(0.0, 0.0, status)
+        if self.state == "aligning":
+            if fit.found and fit.n_bands >= 2 and not fit.disconnected:
+                cruise_w = moving_follow_command_w(
+                    fit,
+                    self.tracker_cfg,
+                    invert_turn=invert_turn,
+                )
+                align_w = max(
+                    -self.cfg.corner_align_max_w,
+                    min(self.cfg.corner_align_max_w, cruise_w),
+                )
+                align_v = self.cfg.corner_align_v
+            else:
+                align_v = 0.0
+                align_w = 0.0
+            status = PathStrategyStatus(
+                True,
+                "corner_event",
+                "corner_exit_aligning",
+                max(
+                    0.0,
+                    self.cfg.corner_cruise_ready_distance_m - self.align_travelled_m,
+                ),
+                self.candidate_dir,
+                self.reacquire_frames,
+                (fit.e0 if fit.found else 0.0, fit.theta if fit.found else 0.0),
+            )
+            return CornerCommandResult(align_v, align_w, status)
         if self.state == "seeking":
             # With no visual evidence, only the latched maneuver direction is
             # safe.  A last-frame reverse correction may have been an outlier
             # and must never become a blind search direction.
-            turn_w = self._turn_command_w(invert_turn)
+            confirming_exit = self.exit_latch.candidate_frames > 0
+            turn_w = 0.0 if confirming_exit else self._turn_command_w(invert_turn)
             status = PathStrategyStatus(
-                True, "corner_event", "corner_reacquire_search", 0.0,
-                self.candidate_dir, 0,
+                True, "corner_event",
+                "corner_exit_confirming" if confirming_exit else "corner_reacquire_search",
+                0.0, self.candidate_dir, self.exit_latch.candidate_frames,
                 (self.turned_rad, self.target_angle_rad),
             )
             return CornerCommandResult(0.0, turn_w, status)
-        if self.state == "failed":
+        if self.state in {"failed", "failed_locked"}:
             status = PathStrategyStatus(
                 True, "corner_event",
                 (
-                    "corner_failed_recovery_confirm"
-                    if self.reacquire_frames > 0 else "corner_reacquire_failed"
+                    "corner_exit_lost"
+                    if self.state == "failed_locked"
+                    else (
+                        "corner_failed_recovery_confirm"
+                        if self.reacquire_frames > 0 else "corner_reacquire_failed"
+                    )
                 ),
                 0.0,
                 self.candidate_dir, self.reacquire_frames,
@@ -583,6 +737,7 @@ class CornerCommandDelay:
         self.turned_rad = 0.0
         self.reacquire_frames = 0
         self.align_missing_frames = 0
+        self.align_travelled_m = 0.0
 
     def _reset_armed(self) -> None:
         self.state, self.candidate_dir, self.confirm = "armed", 0, 0
@@ -597,6 +752,7 @@ class CornerCommandDelay:
         self.stable_w = 0.0
         self.reacquire_frames = 0
         self.align_missing_frames = 0
+        self.align_travelled_m = 0.0
         self.gate_frames = 0
         self.approach_missing_frames = 0
         self.approach_travelled_m = 0.0
@@ -605,15 +761,21 @@ class CornerCommandDelay:
         self.exit_latch.reset()
         self.recovery_last_e = None
         self.recovery_last_theta = None
+        self.exit_last_seen_now = None
+        self.exit_track_w = 0.0
 
     def _turn_limit_reached(self) -> bool:
-        return bool(
-            self.turned_rad
-            >= self.target_angle_rad + self.cfg.corner_search_extra_rad
+        return self.turned_rad >= self._turn_limit_rad()
+
+    def _turn_limit_rad(self) -> float:
+        return (
+            self.target_angle_rad + self.cfg.corner_search_extra_rad
+            if self.event_shape == "fork"
+            else self.cfg.corner_max_turn_angle_rad
         )
 
-    def _enter_failed(self) -> None:
-        self.state = "failed"
+    def _enter_failed(self, lock_identity: bool = False) -> None:
+        self.state = "failed_locked" if lock_identity else "failed"
         self.reacquire_frames = 0
         self.align_missing_frames = 0
         self.exit_latch.reset()
@@ -650,6 +812,36 @@ class CornerCommandDelay:
             and features.branch_left is None
             and features.branch_right is None
         )
+
+    def _corner_cruise_ready(
+        self, fit: TrajectoryFit, features: LineFeatures,
+    ) -> bool:
+        """The latched exit satisfies normal cruise's own FOLLOW contract."""
+        return bool(
+            moving_follow_handoff_ready(fit, self.tracker_cfg)
+            and features.branch_left is None
+            and features.branch_right is None
+        )
+
+    def _latched_exit_trackable(self, fit: TrajectoryFit) -> bool:
+        """The already-selected first exit is close enough for slow control."""
+        return bool(
+            fit.found
+            and fit.conf >= self.handoff_conf_min
+            and fit.n_bands >= 3
+            and not fit.disconnected
+            and abs(fit.e0) <= 1.0
+            and abs(fit.theta) <= 1.10
+        )
+
+    def _tracked_exit_w(self, fit: TrajectoryFit, invert_turn: bool) -> float:
+        cruise_w = moving_follow_command_w(
+            fit,
+            self.tracker_cfg,
+            invert_turn=invert_turn,
+        )
+        limit = self.cfg.corner_replay_max_w
+        return max(-limit, min(limit, cruise_w))
 
     def _exit_cleared(self, fit: TrajectoryFit) -> bool:
         """End event suppression once its exit has reached image centre.
@@ -705,4 +897,9 @@ class CornerCommandDelay:
         direction_sign = -1.0 if self.candidate_dir > 0 else 1.0
         if invert_turn:
             direction_sign *= -1.0
-        self.turned_rad = max(0.0, self.turned_rad + direction_sign * yaw_delta)
+        # Keep the controller's safety budget strictly bounded even when the
+        # last camera/control interval crosses the threshold between samples.
+        self.turned_rad = min(
+            self._turn_limit_rad(),
+            max(0.0, self.turned_rad + direction_sign * yaw_delta),
+        )

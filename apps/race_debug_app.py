@@ -343,7 +343,7 @@ def _tuple_value(value: object, *, cast=int) -> tuple:
 def _deep_update_cfg(cfg: RaceConfig, data: dict) -> None:
     for section_name in (
         "camera", "vision", "occlusion",
-        "path_memory", "ground_projection", "obstacle", "tracker",
+        "path_memory", "ground_projection", "mission", "obstacle", "tracker",
     ):
         section = getattr(cfg, section_name)
         values = data.get(section_name)
@@ -977,6 +977,9 @@ class Handler(BaseHTTPRequestHandler):
         snapshot = _config_snapshot()
         try:
             effective_profile, profile_note = _apply_profile(profile)
+            # The normal/final race button always runs the fixed course. Legacy
+            # global-turn mode remains available only for explicit diagnostics.
+            CONFIG.path_memory.mode = "fixed_sessions"
             _write_live_config_file()
         finally:
             _config_restore(snapshot)

@@ -1,0 +1,10 @@
+{
+  "started_at": "2026-07-14T09:02:12+0800",
+  "camera": 0,
+  "dry_run": true,
+  "frame_width": 640,
+  "frame_height": 480,
+  "record_fps": 5.0,
+  "git_commit": "a580c0ab0acb64fb9b3c17cfcf88e58812fdd36d",
+  "git_dirty": true
+}
