@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from .config import PathMemoryConfig, TrackerConfig
+from .control import TransitionEvent
 from .state_machine import moving_follow_command_w, moving_follow_handoff_ready
 from .vision import LineFeatures, TrajectoryFit
 
@@ -30,6 +31,7 @@ class PathStrategyStatus:
     intent_dir: int = 0
     point_count: int = 0
     target: tuple[float, float] | None = None
+    transition_event: TransitionEvent = TransitionEvent.NONE
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,17 +83,18 @@ class FirstEntryLineLatch:
             self.candidate_frames = 0
             self.candidate_e = None
             return False
-        if strong:
-            self.candidate_frames = max(1, self.candidate_frames)
-        else:
-            continuous = bool(
-                self.candidate_e is None
-                or abs(fit.e0 - self.candidate_e) <= 0.50
-            )
-            self.candidate_frames = self.candidate_frames + 1 if continuous else 1
-            self.candidate_e = fit.e0
-            if self.candidate_frames < self.confirm_frames:
-                return False
+        continuous = bool(
+            self.candidate_e is None
+            or abs(fit.e0 - self.candidate_e) <= 0.50
+        )
+        self.candidate_frames = self.candidate_frames + 1 if continuous else 1
+        self.candidate_e = fit.e0
+        # Observation quality changes how long confirmation takes, but never
+        # bypasses temporal confirmation entirely. This prevents one noisy,
+        # high-confidence fragment from becoming an irreversible route ID.
+        required = 2 if strong else self.confirm_frames
+        if self.candidate_frames < required:
+            return False
         # The first coherent line on the commanded turn side is the exit.
         # Waiting for it to move inward discarded the actual first entry in
         # 173358 and allowed a much later line to become eligible instead.
@@ -615,9 +618,17 @@ class CornerCommandDelay:
                 True, "corner_event", "corner_visual_takeover", 0.0,
                 self.candidate_dir, self.reacquire_frames,
                 (self.turned_rad, self.target_angle_rad),
+                TransitionEvent.HANDOFF_READY,
             )
             return CornerCommandResult(command_v, command_w, status)
         if self.state == "turning":
+            if self.exit_latch.candidate_frames > 0 and not self.exit_latch.latched:
+                status = PathStrategyStatus(
+                    True, "corner_event", "corner_exit_confirming", 0.0,
+                    self.candidate_dir, self.exit_latch.candidate_frames,
+                    (self.turned_rad, self.target_angle_rad),
+                )
+                return CornerCommandResult(0.0, 0.0, status)
             turn_w = self._turn_command_w(invert_turn)
             status = PathStrategyStatus(
                 True, "corner_event",

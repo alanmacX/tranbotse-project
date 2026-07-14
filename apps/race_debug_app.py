@@ -22,7 +22,7 @@ import cv2 as cv
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from transbot_race.config import RaceConfig, TrackerConfig  # noqa: E402
+from transbot_race.config import RaceConfig, TrackerConfig, coerce_bool  # noqa: E402
 from transbot_race.state_machine import RaceStateMachine, command_summary  # noqa: E402
 from transbot_race.vision import (  # noqa: E402
     TrajectoryFit,
@@ -353,7 +353,7 @@ def _deep_update_cfg(cfg: RaceConfig, data: dict) -> None:
             if hasattr(section, key):
                 current = getattr(section, key)
                 if isinstance(current, bool):
-                    setattr(section, key, bool(value))
+                    setattr(section, key, coerce_bool(value))
                 elif isinstance(current, int):
                     setattr(section, key, int(value))
                 elif isinstance(current, float):

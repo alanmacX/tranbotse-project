@@ -14,7 +14,13 @@ import cv2 as cv
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from transbot_race.config import RaceConfig  # noqa: E402
+from transbot_race.config import RaceConfig, coerce_bool  # noqa: E402
+from transbot_race.control import (  # noqa: E402
+    CommandArbiter,
+    ControlOwner,
+    StopCause,
+    TransitionEvent,
+)
 from transbot_race.capture_geometry import (  # noqa: E402
     CaptureGeometryFilter,
     CornerGeometryFilter,
@@ -38,7 +44,13 @@ from transbot_race.mission import (  # noqa: E402
     ExecutorKind,
     FixedSessionMission,
 )
-from transbot_race.ring_entry import RingEntryExecutor, selected_path_fit  # noqa: E402
+from transbot_race.motor import MotorGateway  # noqa: E402
+from transbot_race.ring_entry import (  # noqa: E402
+    RingEntryExecutor,
+    RingEntryResult,
+    RingPhaseEvent,
+    selected_path_fit,
+)
 from transbot_race.state_machine import (  # noqa: E402
     MotionCommand,
     RaceState,
@@ -72,6 +84,8 @@ def update_dataclass(obj: object, values: dict) -> None:
         current = getattr(obj, key)
         if is_dataclass(current) and isinstance(value, dict):
             update_dataclass(current, value)
+        elif isinstance(current, bool):
+            setattr(obj, key, coerce_bool(value))
         elif isinstance(current, tuple):
             setattr(obj, key, coerce_tuple(value))
         elif current is None and isinstance(value, list):
@@ -368,7 +382,20 @@ class DebugRecorder:
 
 def run(args: argparse.Namespace) -> int:
     cfg = load_config(Path(args.config))
-    bot = make_bot(args.dry_run)
+    bot = MotorGateway(
+        make_bot(args.dry_run),
+        role="auto",
+        max_v=cfg.tracker.v_max,
+        max_w=max(
+            cfg.tracker.max_w,
+            cfg.tracker.w_search,
+            cfg.tracker.w_pivot,
+            cfg.tracker.preview_turn_w,
+            cfg.path_memory.corner_replay_max_w,
+            cfg.path_memory.corner_align_max_w,
+            cfg.path_memory.roundabout_replay_max_w,
+        ),
+    )
     sm = RaceStateMachine(cfg)
     corner_margin = CornerCommandDelay(
         cfg.path_memory,
@@ -387,6 +414,18 @@ def run(args: argparse.Namespace) -> int:
         DetectorKind.RING_ENTRY: RingEntryGeometryFilter(cfg.path_memory.corner_confirm_frames),
     }
     obstacle_monitor = ObstacleMonitor(cfg.obstacle)
+    arbiter = CommandArbiter(
+        max_v=cfg.tracker.v_max,
+        max_w=max(
+            cfg.tracker.max_w,
+            cfg.tracker.w_search,
+            cfg.tracker.w_pivot,
+            cfg.tracker.preview_turn_w,
+            cfg.path_memory.corner_replay_max_w,
+            cfg.path_memory.corner_align_max_w,
+            cfg.path_memory.roundabout_replay_max_w,
+        ),
+    )
     cap = cv.VideoCapture(args.camera)
     cap.set(cv.CAP_PROP_FRAME_WIDTH, cfg.camera.frame_width)
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, cfg.camera.frame_height)
@@ -512,19 +551,25 @@ def run(args: argparse.Namespace) -> int:
             ring_clear_for_log = None
             if ring_session:
                 ring_entry.set_direction(cfg.path_memory.roundabout_direction)
-                ring_result = ring_entry.step(
-                    geometry_observation,
-                    route_fit,
-                    now=now,
-                    linear=motion.linear,
-                    accepted_entry=effective_geometry_decision is not None,
-                    # A raw far-field candidate is observation only. Motor
-                    # ownership begins exclusively after the mission gate.
-                    confirmed_entry=False,
-                    cruise_fit=visual_fit,
-                    incoming_v=last_cmd_v,
-                    incoming_w=last_cmd_w,
-                )
+                if obstacle_decision.stop_required and ring_entry.state != "waiting":
+                    ring_result = RingEntryResult(
+                        ring_entry.last_fit,
+                        "ring_executor_held_by_obstacle",
+                    )
+                else:
+                    ring_result = ring_entry.step(
+                        geometry_observation,
+                        route_fit,
+                        now=now,
+                        linear=motion.linear,
+                        accepted_entry=effective_geometry_decision is not None,
+                        # A raw far-field candidate is observation only. Motor
+                        # ownership begins exclusively after the mission gate.
+                        confirmed_entry=False,
+                        cruise_fit=visual_fit,
+                        incoming_v=last_cmd_v,
+                        incoming_w=last_cmd_w,
+                    )
                 ring_travelled_for_log = ring_entry.travelled_m
                 ring_clear_for_log = ring_entry.clear_frames
 
@@ -543,8 +588,10 @@ def run(args: argparse.Namespace) -> int:
             ) if not ring_session else False
             if ring_session and ring_result is not None:
                 fit = ring_result.fit or visual_fit
-                if obstacle_decision.stop_required:
-                    command = sm.step(fit, now=now, obstacle=True)
+                if obstacle_decision.stop_required and ring_entry.state != "waiting":
+                    command = MotionCommand(
+                        last_cmd_v, last_cmd_w, ring_result.reason, RaceState.TRACK, None,
+                    )
                 elif ring_result.fit is not None:
                     ring_v, ring_w = ring_entry.control(
                         ring_result.fit,
@@ -597,7 +644,11 @@ def run(args: argparse.Namespace) -> int:
                         memory_status,
                         remaining_m=ring_entry.margin_remaining_m,
                     )
-                if ring_result.completed and mission is not None:
+                if (
+                    ring_result.phase_event
+                    in {RingPhaseEvent.ENTRY_ESTABLISHED, RingPhaseEvent.EXECUTOR_COMPLETED}
+                    and mission is not None
+                ):
                     next_session = mission.advance()
                     for session_filter in session_geometry_filters.values():
                         session_filter.reset()
@@ -614,16 +665,21 @@ def run(args: argparse.Namespace) -> int:
                         if ring_result.fit is not None:
                             command = sm.reacquire_from(ring_result.fit, now)
                         ring_entry.reset()
-            elif corner_owns_chassis and not obstacle_decision.stop_required:
+            elif corner_owns_chassis:
                 # Do not even advance the cruise TRACK/LOST/PIVOT state while
                 # a turn is active.  Its output used to be overwritten later,
                 # but its hidden state still timed out or flipped search/pivot
                 # direction, then leaked back at handoff.
-                command = MotionCommand(0.0, 0.0, "corner_owned", sm.state, None)
+                command = MotionCommand(
+                    last_cmd_v if obstacle_decision.stop_required else 0.0,
+                    last_cmd_w if obstacle_decision.stop_required else 0.0,
+                    "corner_executor_held" if obstacle_decision.stop_required else "corner_owned",
+                    sm.state,
+                    None,
+                )
             else:
                 command = sm.step(
-                    fit, now=now,
-                    obstacle=obstacle_decision.stop_required,
+                    fit, now=now, obstacle=False,
                 )
             if (
                 not ring_session
@@ -669,13 +725,13 @@ def run(args: argparse.Namespace) -> int:
                             fixed_reason = "corner_waiting_geometry"
                         memory_status = replace(memory_status, reason=fixed_reason)
                 if (
-                    memory_status.reason == "corner_visual_takeover"
+                    memory_status.transition_event == TransitionEvent.HANDOFF_READY
                     or (corner_state_before != "armed" and corner_margin.state == "armed")
                 ):
                     for session_filter in session_geometry_filters.values():
                         session_filter.reset()
                     legacy_geometry_filter.reset()
-                if memory_status.reason == "corner_visual_takeover":
+                if memory_status.transition_event == TransitionEvent.HANDOFF_READY:
                     command = sm.reacquire_from(visual_fit, now)
                     if mission is not None:
                         mission.advance()
@@ -706,12 +762,47 @@ def run(args: argparse.Namespace) -> int:
                         w=delayed.w,
                         reason=f"corner_{memory_status.reason}",
                     )
-            if obstacle_decision.slow_required and command.v > 0.0:
-                command = replace(
-                    command,
-                    v=min(command.v, cfg.tracker.v_max * cfg.obstacle.slow_speed_ratio),
-                    reason="obstacle_approach_slow",
-                )
+            if ring_session and ring_entry.state != "waiting":
+                control_owner = ControlOwner.RING_EXECUTOR
+            elif corner_owns_chassis:
+                control_owner = ControlOwner.CORNER_EXECUTOR
+            else:
+                control_owner = ControlOwner.CRUISE
+
+            stop_cause = None
+            transition_event = memory_status.transition_event
+            if mission is not None and mission.session == CourseSession.FINISHED:
+                stop_cause = StopCause.MISSION_FINISHED
+            elif obstacle_decision.stop_required:
+                stop_cause = StopCause.OBSTACLE
+                if control_owner != ControlOwner.CRUISE:
+                    transition_event = TransitionEvent.EXECUTOR_HELD
+            elif (
+                control_owner == ControlOwner.RING_EXECUTOR
+                and ring_entry.state in {"tracking", "inside", "exiting"}
+                and ring_result is not None
+                and ring_result.fit is None
+            ):
+                stop_cause = StopCause.ROUTE_LOST
+                transition_event = TransitionEvent.ROUTE_LOST
+            elif control_owner == ControlOwner.CORNER_EXECUTOR and corner_margin.state in {
+                "failed", "failed_locked",
+            }:
+                stop_cause = StopCause.EXECUTOR_FAILED
+            elif sm.state == RaceState.STOPPED and sm.last_event == "search_timeout":
+                stop_cause = StopCause.SEARCH_TIMEOUT
+
+            arbitration = arbiter.resolve(
+                command,
+                owner=control_owner,
+                stop_cause=stop_cause,
+                slow_v_limit=(
+                    cfg.tracker.v_max * cfg.obstacle.slow_speed_ratio
+                    if obstacle_decision.slow_required else None
+                ),
+                transition_event=transition_event,
+            )
+            command = arbitration.final
             cmd_v, cmd_w = command.v, command.w
             bot.set_car_motion(cmd_v, cmd_w)
             last_cmd_v, last_cmd_w = cmd_v, cmd_w
@@ -722,6 +813,32 @@ def run(args: argparse.Namespace) -> int:
             summary["motion_w"] = round(motion.angular, 4)
             summary["motion_source"] = motion.source
             summary["path_strategy"] = memory_status.mode
+            summary["mission_state"] = None if mission is None else mission.session.value
+            summary["control_owner"] = arbitration.owner.value
+            summary["owner_epoch"] = arbitration.owner_epoch
+            summary["executor_phase"] = (
+                ring_entry.state
+                if arbitration.owner == ControlOwner.RING_EXECUTOR
+                else corner_margin.state
+                if arbitration.owner == ControlOwner.CORNER_EXECUTOR
+                else sm.state.value
+            )
+            summary["safety_state"] = arbitration.safety_state.value
+            summary["stop_cause"] = (
+                None if arbitration.stop_cause is None else arbitration.stop_cause.value
+            )
+            summary["transition_event"] = arbitration.transition_event.value
+            summary["safety_override"] = arbitration.safety_override
+            summary["candidate_command"] = {
+                "v": round(arbitration.candidate.v, 4),
+                "w": round(arbitration.candidate.w, 4),
+                "reason": arbitration.candidate.reason,
+            }
+            summary["final_command"] = {
+                "v": round(arbitration.final.v, 4),
+                "w": round(arbitration.final.w, 4),
+                "reason": arbitration.final.reason,
+            }
             summary["course_session"] = None if mission is None else mission.session.value
             summary["session_detector"] = (
                 None if mission is None else mission.detector_kind.value
@@ -784,6 +901,9 @@ def run(args: argparse.Namespace) -> int:
                 if ring_result is None
                 else "completed" if ring_result.completed else ring_entry.state
             )
+            summary["ring_phase_event"] = (
+                None if ring_result is None else ring_result.phase_event.value
+            )
             summary["ring_entry_selected_e_look"] = (
                 None if route_fit is None else round(route_fit.e_look, 4)
             )
@@ -830,6 +950,7 @@ def run(args: argparse.Namespace) -> int:
         stop_chassis(bot)
         debug.close()
         cap.release()
+        bot.close(stop_count=1, stop_delay=0.0)
         if args.display:
             cv.destroyAllWindows()
     return 0

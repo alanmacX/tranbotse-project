@@ -3,6 +3,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
+def coerce_bool(value: object) -> bool:
+    """Parse config booleans without Python's truthy-string trap."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    raise ValueError(f"expected boolean value, got {value!r}")
+
+
 @dataclass(slots=True)
 class CameraConfig:
     """Camera crop used by the race runner."""

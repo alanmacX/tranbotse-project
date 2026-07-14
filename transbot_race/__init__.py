@@ -1,6 +1,13 @@
 """Core race logic for the Transbot SE course project."""
 
 from .config import RaceConfig
+from .control import (
+    CommandArbiter,
+    ControlOwner,
+    SafetyState,
+    StopCause,
+    TransitionEvent,
+)
 from .state_machine import (
     MotionCommand,
     RaceState,
@@ -15,6 +22,8 @@ from .mission import (
     FixedSessionMission,
     SessionSpec,
 )
+from .ring_entry import RingPhaseEvent
+from .motor import MotorGateway, MotorLeaseError
 from .vision import (
     LineFeatures,
     TrajectoryFit,
@@ -25,11 +34,19 @@ from .vision import (
 
 __all__ = [
     "LineFeatures",
+    "CommandArbiter",
+    "ControlOwner",
     "MotionCommand",
+    "MotorGateway",
+    "MotorLeaseError",
     "RaceConfig",
     "RaceState",
     "RaceStateMachine",
+    "RingPhaseEvent",
+    "SafetyState",
+    "StopCause",
     "TrackMode",
+    "TransitionEvent",
     "CourseSession",
     "FixedSessionMission",
     "DetectorKind",

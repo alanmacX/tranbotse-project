@@ -3,6 +3,7 @@ from dataclasses import replace
 import math
 
 from transbot_race.config import PathMemoryConfig, RaceConfig
+from transbot_race.control import TransitionEvent
 from transbot_race.capture_geometry import (
     CaptureGeometryDecision,
     CaptureGeometryObservation,
@@ -88,8 +89,8 @@ class PathStrategyTests(unittest.TestCase):
         turning = gate.step(
             unaligned, features, 0.0, 0.0, 0.8, 0.0, -1.0,
         )
-        self.assertEqual(turning.status.reason, "committed_turn")
-        self.assertAlmostEqual(turning.w, -cfg.corner_replay_max_w)
+        self.assertEqual(turning.status.reason, "corner_exit_confirming")
+        self.assertAlmostEqual(turning.w, 0.0)
         self.assertAlmostEqual(turning.status.target[0], 0.5)
 
         stable = replace(unaligned, e0=0.10, theta=0.08, disconnected=False)
@@ -97,13 +98,16 @@ class PathStrategyTests(unittest.TestCase):
             stable, features, 0.03, -0.02, 1.3, 0.0,
             -cfg.corner_replay_max_w,
         )
+        self.assertEqual(entered.status.reason, "corner_exit_confirming")
+        entered = gate.step(stable, features, 0.03, -0.02, 1.4, 0.0, 0.0)
         self.assertEqual(entered.status.reason, "corner_exit_tracking")
         for index in range(cfg.corner_cruise_ready_frames):
             reacquired = gate.step(
                 stable, features, 0.03, -0.02,
-                1.4 + index * 0.1, 0.0, entered.w,
+                1.5 + index * 0.1, 0.0, entered.w,
             )
         self.assertEqual(reacquired.status.reason, "corner_visual_takeover")
+        self.assertEqual(reacquired.status.transition_event, TransitionEvent.HANDOFF_READY)
         self.assertEqual(gate.state, "cooldown")
 
     def test_cooldown_clears_when_exit_crosses_center_on_a_curve(self):
@@ -296,6 +300,11 @@ class PathStrategyTests(unittest.TestCase):
         captured = gate.step(
             selected_right_path, LineFeatures(found=True),
             0.0, 0.0, 1.2, 0.0, angular=-0.35,
+        )
+        self.assertEqual(captured.status.reason, "corner_exit_confirming")
+        captured = gate.step(
+            selected_right_path, LineFeatures(found=True),
+            0.0, 0.0, 1.3, 0.0, angular=0.0,
         )
         self.assertEqual(captured.status.reason, "corner_exit_captured")
         self.assertAlmostEqual(captured.w, 0.0)
@@ -560,13 +569,18 @@ class PathStrategyTests(unittest.TestCase):
             trackable, LineFeatures(found=True), 0.04, 0.03,
             0.0, 0.0, 0.0,
         )
-        self.assertEqual(output.status.reason, "committed_turn")
+        self.assertEqual(output.status.reason, "corner_exit_confirming")
         self.assertAlmostEqual(output.v, 0.0)
-        self.assertAlmostEqual(output.w, -cfg.corner_replay_max_w)
+        self.assertAlmostEqual(output.w, 0.0)
         stable = replace(trackable, e0=0.10, theta=0.08, disconnected=False)
         entered = gate.step(
             stable, LineFeatures(found=True), 0.04, 0.03,
             0.1, 0.0, -cfg.corner_replay_max_w,
+        )
+        self.assertEqual(entered.status.reason, "corner_exit_confirming")
+        entered = gate.step(
+            stable, LineFeatures(found=True), 0.04, 0.03,
+            0.2, 0.0, 0.0,
         )
         self.assertEqual(entered.status.reason, "corner_exit_tracking")
         self.assertEqual(entered.v, cfg.corner_align_v)
@@ -574,12 +588,12 @@ class PathStrategyTests(unittest.TestCase):
         for index in range(cfg.corner_cruise_ready_frames):
             takeover = gate.step(
                 stable, LineFeatures(found=True), 0.04, 0.03,
-                0.2 + index * 0.1, 0.0, entered.w,
+                0.3 + index * 0.1, 0.0, entered.w,
             )
         self.assertEqual(takeover.status.reason, "corner_visual_takeover")
         self.assertEqual(gate.state, "cooldown")
 
-    def test_weak_far_exit_locks_identity_without_stopping_turn(self):
+    def test_weak_far_exit_locks_identity_after_bounded_confirmation_hold(self):
         cfg = PathMemoryConfig(
             corner_exit_confirm_frames=3,
             corner_reacquire_angle_rad=0.20,
@@ -597,9 +611,9 @@ class PathStrategyTests(unittest.TestCase):
         second = gate.step(weak_exit, features, 0.0, 0.0, 0.1, 0.0, 0.0)
         third = gate.step(weak_exit, features, 0.0, 0.0, 0.2, 0.0, 0.0)
 
-        self.assertEqual(first.status.reason, "committed_turn")
-        self.assertEqual(second.status.reason, "committed_turn")
-        self.assertAlmostEqual(first.w, -cfg.corner_replay_max_w)
+        self.assertEqual(first.status.reason, "corner_exit_confirming")
+        self.assertEqual(second.status.reason, "corner_exit_confirming")
+        self.assertAlmostEqual(first.w, 0.0)
         self.assertEqual(third.status.reason, "committed_turn")
         self.assertAlmostEqual(third.w, -cfg.corner_replay_max_w)
         self.assertTrue(gate.exit_latch.latched)
@@ -700,7 +714,7 @@ class PathStrategyTests(unittest.TestCase):
         captured = gate.step(first_entry, features, 0.0, 0.0, 22.28, 0.0, -0.2)
         takeover = gate.step(same_exit, features, 0.0, 0.0, 22.37, 0.0, 0.0)
 
-        self.assertEqual(captured.status.reason, "corner_exit_tracking")
+        self.assertEqual(captured.status.reason, "corner_exit_confirming")
         self.assertEqual(takeover.status.reason, "corner_exit_tracking")
         self.assertLessEqual(abs(captured.w), 0.20)
         self.assertLessEqual(abs(takeover.w), 0.20)
@@ -727,12 +741,16 @@ class PathStrategyTests(unittest.TestCase):
         first = gate.step(
             entering, features, 0.02, -0.2, 0.0, 0.0, 0.0,
         )
+        self.assertEqual(first.status.reason, "corner_exit_confirming")
+        first = gate.step(
+            entering, features, 0.02, -0.2, 0.05, 0.0, 0.0,
+        )
         self.assertEqual(first.status.reason, "corner_exit_tracking")
         self.assertEqual(first.v, cfg.corner_align_v)
         self.assertLessEqual(abs(first.w), cfg.corner_replay_max_w)
 
         takeover = gate.step(
-            entering, features, 0.02, -0.2, 0.05, 0.0, 0.0,
+            entering, features, 0.02, -0.2, 0.10, 0.0, 0.0,
         )
         self.assertEqual(takeover.status.reason, "corner_exit_tracking")
         self.assertLessEqual(abs(takeover.w), cfg.corner_replay_max_w)
@@ -883,11 +901,16 @@ class PathStrategyTests(unittest.TestCase):
             exit_fit, LineFeatures(found=True), 0.0, 0.0,
             0.2, 0.0, -0.10,
         )
+        self.assertEqual(captured.status.reason, "corner_exit_confirming")
         takeover = gate.step(
             exit_fit, LineFeatures(found=True), 0.04, 0.02,
             0.3, 0.0, 0.0,
         )
-        self.assertEqual(captured.status.reason, "corner_exit_captured")
+        self.assertEqual(takeover.status.reason, "corner_exit_captured")
+        takeover = gate.step(
+            exit_fit, LineFeatures(found=True), 0.04, 0.02,
+            0.4, 0.0, 0.0,
+        )
         self.assertEqual(takeover.status.reason, "corner_exit_aligning")
 
     def test_disconnected_exit_cannot_seed_cruise_handoff(self):
@@ -904,9 +927,9 @@ class PathStrategyTests(unittest.TestCase):
 
         captured = gate.step(fragment, features, 0.0, 0.0, 0.0, 0.0, 0.0)
         held = gate.step(fragment, features, 0.0, 0.0, 0.1, 0.0, 0.0)
-        self.assertEqual(captured.status.reason, "committed_turn")
+        self.assertEqual(captured.status.reason, "corner_exit_confirming")
         self.assertEqual(held.status.reason, "committed_turn")
-        self.assertLess(captured.w, 0.0)
+        self.assertEqual(captured.w, 0.0)
         self.assertEqual(gate.state, "turning")
 
         complete = replace(fragment, disconnected=False)
@@ -1027,8 +1050,8 @@ class PathStrategyTests(unittest.TestCase):
             TrajectoryFit(found=True, e0=0.897, theta=0.452, conf=0.349, n_bands=4, disconnected=True),
             TrajectoryFit(found=True, e0=0.801, theta=0.458, conf=0.351, n_bands=4, disconnected=True),
         )
-        self.assertTrue(latch.try_latch(samples[0], 1))
-        self.assertFalse(latch.try_latch(samples[1], 1))
+        self.assertFalse(latch.try_latch(samples[0], 1))
+        self.assertTrue(latch.try_latch(samples[1], 1))
         self.assertFalse(latch.try_latch(samples[2], 1))
         self.assertTrue(latch.latched)
 
@@ -1045,6 +1068,7 @@ class PathStrategyTests(unittest.TestCase):
             found=True, e0=0.55, theta=0.85, conf=0.90, n_bands=5,
         )
         replacement = replace(first, e0=0.50, theta=-0.85)
+        self.assertFalse(latch.try_latch(first, 1))
         self.assertTrue(latch.try_latch(first, 1))
         self.assertFalse(latch.observe_latched(replacement))
 
@@ -1056,6 +1080,8 @@ class PathStrategyTests(unittest.TestCase):
             disconnected=True,
         )
         left_fit = replace(right_fit, e0=-0.6, theta=-0.4)
+        self.assertFalse(right.try_latch(right_fit, 1))
+        self.assertFalse(left.try_latch(left_fit, -1))
         self.assertTrue(right.try_latch(right_fit, 1))
         self.assertTrue(left.try_latch(left_fit, -1))
 

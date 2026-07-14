@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from enum import Enum
 import math
 
 import numpy as np
@@ -11,12 +12,21 @@ from .state_machine import moving_follow_handoff_ready
 from .vision import TrajectoryFit
 
 
+class RingPhaseEvent(str, Enum):
+    NONE = "none"
+    ENTRY_ESTABLISHED = "ring_entry_established"
+    EXIT_SELECTED = "ring_exit_selected"
+    EXECUTOR_COMPLETED = "ring_executor_completed"
+    ROUTE_LOST = "ring_route_lost"
+
+
 @dataclass(frozen=True, slots=True)
 class RingEntryResult:
     fit: TrajectoryFit | None
     reason: str
     started: bool = False
     completed: bool = False
+    phase_event: RingPhaseEvent = RingPhaseEvent.NONE
 
 
 def selected_path_fit(
@@ -204,6 +214,7 @@ class RingEntryExecutor:
                 "ring_exit_cruise_established",
                 False,
                 True,
+                RingPhaseEvent.EXECUTOR_COMPLETED,
             )
         if self.state == "waiting":
             if route_fit is None or not accepted_entry:
@@ -259,6 +270,7 @@ class RingEntryExecutor:
                     "ring_entry_path_established",
                     started,
                     True,
+                    RingPhaseEvent.ENTRY_ESTABLISHED,
                 )
         elif self.state == "inside":
             self.inside_travelled_m += travelled
@@ -273,6 +285,7 @@ class RingEntryExecutor:
                     "ring_exit_tracking_selected_path",
                     True,
                     False,
+                    RingPhaseEvent.EXIT_SELECTED,
                 )
         elif self.state == "exiting":
             exit_ready = self._cruise_ready(cruise_fit) and fork_cleared
@@ -287,6 +300,7 @@ class RingEntryExecutor:
                     "ring_exit_cruise_established",
                     started,
                     True,
+                    RingPhaseEvent.EXECUTOR_COMPLETED,
                 )
         usable_fit = route_fit or (self.last_fit if self.missing_frames <= 5 else None)
         if self.state == "inside":
@@ -295,7 +309,13 @@ class RingEntryExecutor:
             reason = "ring_exit_tracking_selected_path" if usable_fit is not None else "ring_exit_selected_path_lost"
         else:
             reason = "ring_entry_tracking_selected_path" if usable_fit is not None else "ring_entry_selected_path_lost"
-        return RingEntryResult(usable_fit, reason, started, False)
+        return RingEntryResult(
+            usable_fit,
+            reason,
+            started,
+            False,
+            RingPhaseEvent.ROUTE_LOST if usable_fit is None else RingPhaseEvent.NONE,
+        )
 
     def control(
         self,

@@ -27,6 +27,7 @@ class DetectorKind(str, Enum):
 
 
 class ExecutorKind(str, Enum):
+    NONE = "none"
     CRUISE = "cruise"
     CORNER = "corner"
     RING_ENTRY = "ring_entry"
@@ -57,8 +58,8 @@ class FixedSessionMission:
         CourseSession.RING_EXIT: SessionSpec(DetectorKind.RING_ENTRY, ExecutorKind.RING_ENTRY),
         CourseSession.FORK: SessionSpec(DetectorKind.NONE, ExecutorKind.CRUISE),
         CourseSession.RETURN: SessionSpec(DetectorKind.NONE, ExecutorKind.CRUISE),
-        CourseSession.FINISHED: SessionSpec(DetectorKind.NONE, ExecutorKind.CRUISE),
-        CourseSession.STOPPED: SessionSpec(DetectorKind.NONE, ExecutorKind.CRUISE),
+        CourseSession.FINISHED: SessionSpec(DetectorKind.NONE, ExecutorKind.NONE),
+        CourseSession.STOPPED: SessionSpec(DetectorKind.NONE, ExecutorKind.NONE),
     }
 
     def __init__(self, cfg: MissionConfig) -> None:

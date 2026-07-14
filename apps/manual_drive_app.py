@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 
 from apps.race_runner import make_bot, stop_chassis  # noqa: E402
 from transbot_race.path_memory import read_motion_sample  # noqa: E402
+from transbot_race.motor import MotorGateway  # noqa: E402
 
 
 INDEX_HTML = r"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -164,6 +165,7 @@ class StepController:
         self.lock = threading.Lock(); self.stop_event = threading.Event()
         self.command_lock = threading.Lock()
         self.busy = False; self.last_result = None; self.counter = 0
+        self.generation = 0; self.action_thread: threading.Thread | None = None
 
     def parse(self, data: dict) -> StepAction:
         action = str(data.get("action", ""))
@@ -182,15 +184,26 @@ class StepController:
             if self.busy:
                 raise RuntimeError("another action is still running")
             self.busy = True; self.stop_event.clear(); self.counter += 1; action_id = self.counter
-        threading.Thread(target=self._execute, args=(action_id, action), daemon=True).start()
+            self.generation += 1; generation = self.generation
+            thread = threading.Thread(
+                target=self._execute, args=(action_id, generation, action), daemon=True,
+            )
+            self.action_thread = thread
+        thread.start()
         return action_id
 
     def stop(self) -> None:
+        with self.lock:
+            self.generation += 1
         with self.command_lock:
             self.stop_event.set(); stop_chassis(self.bot, count=4, delay=0.02)
         self.recorder.write_event({"event": "emergency_stop_requested"})
 
-    def _execute(self, action_id: int, action: StepAction) -> None:
+    def _generation_valid(self, generation: int) -> bool:
+        with self.lock:
+            return generation == self.generation
+
+    def _execute(self, action_id: int, generation: int, action: StepAction) -> None:
         sign = 1.0 if action.action in {"forward", "left"} else -1.0
         cmd_v = sign * action.v if action.action in {"forward", "backward"} else 0.0
         cmd_w = sign * action.w if action.action in {"left", "right"} else 0.0
@@ -202,7 +215,7 @@ class StepController:
         result = "target_reached"
         try:
             with self.command_lock:
-                if self.stop_event.is_set():
+                if self.stop_event.is_set() or not self._generation_valid(generation):
                     result = "stopped_by_user"
                 else:
                     self.bot.set_car_motion(cmd_v, cmd_w)
@@ -225,6 +238,15 @@ class StepController:
             with self.lock:
                 self.last_result=row; self.busy=False
 
+    def close(self) -> None:
+        self.stop()
+        with self.lock:
+            thread = self.action_thread
+        if thread is not None:
+            thread.join(timeout=25.0)
+            if thread.is_alive():
+                raise RuntimeError("manual action worker did not stop")
+
     def status(self) -> dict:
         with self.lock:
             return {"busy":self.busy,"last_result":self.last_result,"run_dir":str(self.recorder.root)}
@@ -232,12 +254,16 @@ class StepController:
 
 class App:
     def __init__(self, args: argparse.Namespace) -> None:
-        self.args=args; self.recorder=Recorder(Path(args.record_dir), args); self.bot=make_bot(args.dry_run)
+        self.args=args; self.recorder=Recorder(Path(args.record_dir), args)
+        self.bot=MotorGateway(
+            make_bot(args.dry_run), role="manual", max_v=0.08, max_w=0.40,
+        )
         self.camera=CameraThread(args,self.recorder); self.controller=StepController(self.bot,self.camera,self.recorder)
         stop_chassis(self.bot,count=4,delay=.02); self.camera.start()
 
     def close(self) -> None:
-        self.controller.stop(); self.camera.stop_event.set(); self.camera.join(timeout=2); self.recorder.close()
+        self.controller.close(); self.camera.stop_event.set(); self.camera.join(timeout=2)
+        self.bot.close(stop_count=1, stop_delay=0.0); self.recorder.close()
 
 
 APP: App

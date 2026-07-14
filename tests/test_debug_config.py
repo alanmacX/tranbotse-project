@@ -11,6 +11,16 @@ class DebugConfigTests(unittest.TestCase):
         self.assertEqual(cfg.path_memory.mode, "none")
         self.assertFalse(cfg.obstacle.enabled)
 
+    def test_string_false_remains_false(self):
+        cfg = RaceConfig()
+        _deep_update_cfg(cfg, {"obstacle": {"enabled": "false"}})
+        self.assertFalse(cfg.obstacle.enabled)
+
+    def test_invalid_boolean_string_is_rejected(self):
+        cfg = RaceConfig()
+        with self.assertRaises(ValueError):
+            _deep_update_cfg(cfg, {"obstacle": {"enabled": "maybe"}})
+
     def test_path_memory_values_are_applied(self):
         cfg = RaceConfig()
         _deep_update_cfg(cfg, {

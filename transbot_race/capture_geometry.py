@@ -468,22 +468,43 @@ class CaptureGeometryFilter:
         )
         if not observation_is_turn:
             return None
-        turns = [
-            item for item in self.window
-            if (
+        turns = self._trailing_candidates(
+            observation,
+            lambda item: (
                 item.kind in {"corner", "curve"}
                 or (item.is_fork and item.kind == "circle")
             )
-            and item.is_fork == observation.is_fork
-            and item.direction == observation.direction
-            and item.confidence >= 0.55
-            and abs(item.angle_rad) >= math.radians(20.0)
-            and item.vertex_y_frac is not None
-        ]
-        required = max(2, self.confirm_frames - 1)
-        if observation.direction == 0 or len(turns) < required:
+        )
+        if observation.direction == 0 or len(turns) < self.confirm_frames:
             return None
         return self._decision("turn", turns, direction=observation.direction)
+
+    def _trailing_candidates(
+        self,
+        observation: CaptureGeometryObservation,
+        shape_allowed,
+    ) -> list[CaptureGeometryObservation]:
+        """Return only the uninterrupted current event epoch.
+
+        A dropout, direction flip, fork flip, or invalid quality terminates the
+        epoch. Old votes can no longer leak across an unrelated frame.
+        """
+        candidates: list[CaptureGeometryObservation] = []
+        for item in reversed(self.window):
+            valid = bool(
+                shape_allowed(item)
+                and item.is_fork == observation.is_fork
+                and item.direction == observation.direction
+                and item.direction != 0
+                and item.confidence >= 0.55
+                and abs(item.angle_rad) >= math.radians(20.0)
+                and item.vertex_y_frac is not None
+            )
+            if not valid:
+                break
+            candidates.append(item)
+        candidates.reverse()
+        return candidates
 
     def _session_decision(
         self,
@@ -497,18 +518,14 @@ class CaptureGeometryFilter:
             return None
         if require_fork is not None and observation.is_fork != require_fork:
             return None
-        candidates = [
-            item for item in self.window
-            if item.kind in allowed_shapes
-            and item.direction == observation.direction
-            and (require_fork is None or item.is_fork == require_fork)
-            and item.is_fork == observation.is_fork
-            and item.confidence >= 0.55
-            and abs(item.angle_rad) >= math.radians(20.0)
-            and item.vertex_y_frac is not None
-        ]
-        required = max(2, self.confirm_frames - 1)
-        if len(candidates) < required:
+        candidates = self._trailing_candidates(
+            observation,
+            lambda item: (
+                item.kind in allowed_shapes
+                and (require_fork is None or item.is_fork == require_fork)
+            ),
+        )
+        if len(candidates) < self.confirm_frames:
             return None
         return self._decision(event_kind, candidates, direction=observation.direction)
 

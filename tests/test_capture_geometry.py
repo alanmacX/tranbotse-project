@@ -30,10 +30,12 @@ class CaptureGeometryFilterTests(unittest.TestCase):
         geometry_filter = CaptureGeometryFilter(confirm_frames=3)
         self.assertIsNone(geometry_filter.update(observation("corner", 1, math.pi / 2)))
         self.assertIsNone(geometry_filter.update(observation("corner", -1, -math.pi / 2)))
+        self.assertIsNone(geometry_filter.update(observation("corner", 1, math.pi / 2)))
+        self.assertIsNone(geometry_filter.update(observation("corner", 1, math.pi / 2)))
         decision = geometry_filter.update(observation("corner", 1, math.pi / 2))
         self.assertEqual(decision.kind, "turn")
         self.assertEqual(decision.direction, 1)
-        self.assertEqual(decision.votes, 2)
+        self.assertEqual(decision.votes, 3)
 
     def test_circle_requires_full_window(self):
         geometry_filter = CaptureGeometryFilter(confirm_frames=3)
@@ -60,12 +62,25 @@ class CaptureGeometryFilterTests(unittest.TestCase):
         self.assertIsNone(
             geometry_filter.update(observation("curve", 1, math.radians(35)))
         )
+        self.assertIsNone(geometry_filter.update(
+            observation("curve", 1, math.radians(45), vertex=0.56)
+        ))
         decision = geometry_filter.update(
             observation("curve", 1, math.radians(45), vertex=0.56)
         )
         self.assertEqual(decision.kind, "turn")
         self.assertEqual(decision.direction, 1)
-        self.assertEqual(decision.votes, 2)
+        self.assertEqual(decision.votes, 3)
+
+    def test_turn_votes_must_be_consecutive_across_dropout(self):
+        geometry_filter = CaptureGeometryFilter(confirm_frames=3)
+        turn = observation("corner", 1, math.pi / 2)
+        self.assertIsNone(geometry_filter.update(turn))
+        self.assertIsNone(geometry_filter.update(turn))
+        self.assertIsNone(geometry_filter.update(observation("straight_or_unknown")))
+        self.assertIsNone(geometry_filter.update(turn))
+        self.assertIsNone(geometry_filter.update(turn))
+        self.assertIsNotNone(geometry_filter.update(turn))
 
     def test_corner_session_emits_corner_not_curve_or_turn(self):
         geometry_filter = CornerGeometryFilter(confirm_frames=3)
