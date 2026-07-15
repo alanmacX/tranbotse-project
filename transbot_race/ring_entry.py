@@ -392,7 +392,6 @@ class RingEntryExecutor:
             and route_fit is not None
             and route_fit.control_valid
             and route_fit.conf >= 0.55
-            and abs(route_fit.e0) <= 0.85
             and abs(route_fit.theta) <= self.tangent_theta_tolerance
         )
         self.tangent_candidate_frames = (

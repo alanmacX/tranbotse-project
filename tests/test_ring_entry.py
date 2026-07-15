@@ -108,27 +108,31 @@ class RingEntryTests(unittest.TestCase):
         self.assertEqual(transitioned.reason, "ring_entry_tangent_aligning")
         self.assertIsNone(transitioned.fit)
 
-    def test_tangent_alignment_pivots_right_then_opens_forward_left_arc(self):
+    def test_tangent_alignment_accepts_vertical_path_at_either_image_edge(self):
         _cfg, fork, _debug = self._fork(direction=1)
-        executor = RingEntryExecutor(
-            1,
-            entry_search_w=0.08,
-            entry_capture_frames=2,
-            tangent_theta_tolerance=0.20,
-            radius_initial_w=0.08,
-        )
-        executor.state = "tangent_align"
-        executor.last_now = 0.0
-        self.assertEqual(executor.tangent_align_command(), (0.0, -0.08))
-        self.assertEqual(executor.fixed_arc_command(), (0.02, 0.08))
-        for now in (0.1, 0.2):
-            result = executor.step(
-                fork, self._fit(theta=0.10), now=now,
-                linear=0.0, angular=-0.08, accepted_entry=False,
+        for edge_e0 in (-1.0, 1.0):
+            executor = RingEntryExecutor(
+                1,
+                entry_search_w=0.08,
+                entry_capture_frames=3,
+                tangent_theta_tolerance=0.20,
+                radius_initial_w=0.08,
             )
-        self.assertEqual(executor.state, "radius_acquire")
-        self.assertEqual(result.reason, "ring_entry_radius_acquiring")
-        self.assertEqual(executor.arc_turned_rad, 0.0)
+            executor.state = "tangent_align"
+            executor.last_now = 0.0
+            self.assertEqual(executor.tangent_align_command(), (0.0, -0.08))
+            self.assertEqual(executor.fixed_arc_command(), (0.02, 0.08))
+            for index, theta in enumerate((0.15, 0.07, 0.01), start=1):
+                result = executor.step(
+                    fork, self._fit(e0=edge_e0, theta=theta),
+                    now=index * 0.1,
+                    linear=0.0,
+                    angular=-0.08,
+                    accepted_entry=False,
+                )
+            self.assertEqual(executor.state, "radius_acquire")
+            self.assertEqual(result.reason, "ring_entry_radius_acquiring")
+            self.assertEqual(executor.arc_turned_rad, 0.0)
 
     def test_tangent_alignment_has_its_own_angular_safety_boundary(self):
         executor = RingEntryExecutor(
