@@ -55,7 +55,7 @@ class RingEntryTests(unittest.TestCase):
             found=True, e_look=0.05, theta=0.08, conf=0.9,
             path_memory=True,
         )
-        if executor.state == "entry_commit":
+        if executor.state == "rotate_search":
             executor.step(
                 observation, aligned, now=now,
                 linear=0.0, accepted_entry=False,
@@ -179,9 +179,9 @@ class RingEntryTests(unittest.TestCase):
     def test_ring_margin_is_enabled_by_default(self):
         cfg = RaceConfig()
         self.assertTrue(cfg.path_memory.roundabout_margin_enabled)
-        self.assertAlmostEqual(cfg.path_memory.roundabout_margin_distance_m, 0.10)
+        self.assertAlmostEqual(cfg.path_memory.roundabout_margin_distance_m, 0.45)
 
-    def test_zero_margin_still_passes_through_entry_commit(self):
+    def test_zero_margin_still_passes_through_rotate_search(self):
         _cfg, fork, debug = self._fork(direction=1)
         route_fit = selected_path_fit(
             debug, fork, frame_center_x=365.0, control_width=290.0,
@@ -192,17 +192,17 @@ class RingEntryTests(unittest.TestCase):
             accepted_entry=True, incoming_v=0.05,
         )
         self.assertTrue(started.started)
-        self.assertEqual(executor.state, "entry_commit")
+        self.assertEqual(executor.state, "rotate_search")
         self.assertIsNone(started.fit)
-        self.assertEqual(started.reason, "ring_entry_committing_arc")
+        self.assertEqual(started.reason, "ring_entry_rotating_search")
         captured = executor.step(
             fork, route_fit, now=0.1, linear=0.02, accepted_entry=False,
         )
         self.assertEqual(executor.state, "aligning")
         self.assertIsNotNone(captured.fit)
-        self.assertEqual(captured.reason, "ring_entry_commit_path_captured")
+        self.assertEqual(captured.reason, "ring_entry_search_path_captured")
 
-    def test_entry_commit_requires_fresh_stable_same_direction_path(self):
+    def test_rotate_search_requires_fresh_stable_path(self):
         _cfg, fork, debug = self._fork(direction=1)
         route_fit = selected_path_fit(
             debug, fork, frame_center_x=365.0, control_width=290.0,
@@ -213,25 +213,28 @@ class RingEntryTests(unittest.TestCase):
         executor.step(
             fork, route_fit, now=0.0, linear=0.0, accepted_entry=True,
         )
-        self.assertEqual(executor.state, "entry_commit")
+        self.assertEqual(executor.state, "rotate_search")
 
         stale = executor.step(
             fork, route_fit, now=0.1, linear=0.02, accepted_entry=False,
             fresh_geometry=False,
         )
-        self.assertEqual(executor.state, "entry_commit")
-        self.assertEqual(stale.reason, "ring_entry_committing_arc")
+        self.assertEqual(executor.state, "rotate_search")
+        self.assertEqual(stale.reason, "ring_entry_rotating_search")
 
         executor.step(
             fork, route_fit, now=0.2, linear=0.02, accepted_entry=False,
         )
-        captured = executor.step(
+        executor.step(
             fork, route_fit, now=0.3, linear=0.02, accepted_entry=False,
         )
+        captured = executor.step(
+            fork, route_fit, now=0.4, linear=0.02, accepted_entry=False,
+        )
         self.assertEqual(executor.state, "aligning")
-        self.assertEqual(captured.reason, "ring_entry_commit_path_captured")
+        self.assertEqual(captured.reason, "ring_entry_search_path_captured")
 
-    def test_entry_commit_rejects_opposite_direction_and_times_out(self):
+    def test_rotate_search_accepts_continuous_path_after_local_direction_flips(self):
         _cfg, fork, debug = self._fork(direction=1)
         route_fit = selected_path_fit(
             debug, fork, frame_center_x=365.0, control_width=290.0,
@@ -239,8 +242,6 @@ class RingEntryTests(unittest.TestCase):
         executor = RingEntryExecutor(
             1,
             entry_capture_frames=3,
-            entry_commit_max_distance_m=0.02,
-            entry_commit_max_frames=10,
         )
         executor.step(
             fork, route_fit, now=0.0, linear=0.0, accepted_entry=True,
@@ -252,19 +253,47 @@ class RingEntryTests(unittest.TestCase):
             endpoints=fork.endpoints, component_area=fork.component_area,
             is_fork=fork.is_fork,
         )
+        for index in range(2):
+            searching = executor.step(
+                opposite, route_fit, now=0.1 + index * 0.1,
+                linear=0.0, angular=-0.2, accepted_entry=False,
+            )
+            self.assertEqual(executor.state, "rotate_search")
+            self.assertIsNone(searching.fit)
+        captured = executor.step(
+            opposite, route_fit, now=0.3, linear=0.0,
+            angular=-0.2, accepted_entry=False,
+        )
+        self.assertEqual(executor.state, "aligning")
+        self.assertIsNotNone(captured.fit)
+
+    def test_rotate_search_times_out_at_angular_safety_boundary(self):
+        _cfg, fork, debug = self._fork(direction=1)
+        route_fit = selected_path_fit(
+            debug, fork, frame_center_x=365.0, control_width=290.0,
+        )
+        executor = RingEntryExecutor(
+            1, entry_capture_frames=3,
+            entry_search_max_angle_rad=0.02,
+            entry_search_timeout_sec=10.0,
+        )
+        executor.step(
+            fork, route_fit, now=0.0, linear=0.0, accepted_entry=True,
+        )
         lost = executor.step(
-            opposite, route_fit, now=1.0, linear=0.03, accepted_entry=False,
+            None, None, now=1.0, linear=0.0,
+            angular=-0.03, accepted_entry=False,
         )
         self.assertEqual(executor.state, "failed")
         self.assertIsNone(lost.fit)
         self.assertEqual(lost.phase_event, RingPhaseEvent.ROUTE_LOST)
 
-    def test_entry_commit_arc_has_one_fixed_owner_and_direction(self):
-        right = RingEntryExecutor(1, entry_commit_v=0.02, entry_commit_w=0.08)
-        left = RingEntryExecutor(-1, entry_commit_v=0.02, entry_commit_w=0.08)
-        self.assertEqual(right.entry_commit_command(), (0.02, -0.08))
-        self.assertEqual(left.entry_commit_command(), (0.02, 0.08))
-        self.assertEqual(right.entry_commit_command(invert_turn=True), (0.02, 0.08))
+    def test_rotate_search_has_one_fixed_owner_and_zero_translation(self):
+        right = RingEntryExecutor(1, entry_search_w=0.2)
+        left = RingEntryExecutor(-1, entry_search_w=0.2)
+        self.assertEqual(right.entry_search_command(), (0.0, -0.2))
+        self.assertEqual(left.entry_search_command(), (0.0, 0.2))
+        self.assertEqual(right.entry_search_command(invert_turn=True), (0.0, 0.2))
 
     def test_alignment_requires_stable_selected_route_tangent(self):
         executor = RingEntryExecutor(
@@ -287,8 +316,8 @@ class RingEntryTests(unittest.TestCase):
         first = executor.step(
             observation, off_axis, now=0.0, linear=0.0, accepted_entry=True,
         )
-        self.assertEqual(executor.state, "entry_commit")
-        self.assertEqual(first.reason, "ring_entry_committing_arc")
+        self.assertEqual(executor.state, "rotate_search")
+        self.assertEqual(first.reason, "ring_entry_rotating_search")
         executor.step(
             observation, aligned, now=0.1, linear=0.0, accepted_entry=False,
         )
@@ -331,7 +360,7 @@ class RingEntryTests(unittest.TestCase):
         committing = executor.step(
             fork, route_fit, now=2.0, linear=0.05, accepted_entry=True,
         )
-        self.assertEqual(executor.state, "entry_commit")
+        self.assertEqual(executor.state, "rotate_search")
         self.assertIsNone(committing.fit)
         self.assertAlmostEqual(executor.command_w, 0.0)
         self.assertIsNone(executor.control_now)
@@ -380,6 +409,7 @@ class RingEntryTests(unittest.TestCase):
         )
         executor = RingEntryExecutor(1)
         executor.step(fork, route_fit, now=0.0, linear=0.0, accepted_entry=True)
+        executor.step(fork, route_fit, now=0.05, linear=0.0, accepted_entry=False)
         swapped = type(route_fit)(
             **{
                 field: getattr(route_fit, field)
@@ -401,6 +431,7 @@ class RingEntryTests(unittest.TestCase):
         )
         executor = RingEntryExecutor(1)
         executor.step(fork, route_fit, now=0.0, linear=0.0, accepted_entry=True)
+        executor.step(fork, route_fit, now=0.05, linear=0.0, accepted_entry=False)
         advanced = type(route_fit)(
             **{
                 field: getattr(route_fit, field)
@@ -430,6 +461,7 @@ class RingEntryTests(unittest.TestCase):
         )
         executor = RingEntryExecutor(1)
         executor.step(fork, route_fit, now=0.0, linear=0.0, accepted_entry=True)
+        executor.step(fork, route_fit, now=0.05, linear=0.0, accepted_entry=False)
         moved = type(route_fit)(
             **{
                 field: getattr(route_fit, field)

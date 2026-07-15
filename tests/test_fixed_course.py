@@ -6,10 +6,11 @@ from transbot_race.fixed_course import (
     ComponentStep,
     FixedCourseController,
     FixedCourseFrameContext,
+    _RingEntryStage,
 )
-from transbot_race.mission import CourseSession, DetectorKind
+from transbot_race.mission import CourseSession, DetectorKind, FixedSessionMission
 from transbot_race.path_memory import MotionSample, PathStrategyStatus
-from transbot_race.ring_entry import RingStageTransfer
+from transbot_race.ring_entry import RingEntryResult, RingStageTransfer
 from transbot_race.stage_runtime import CandidateProducer, TransitionBarrierState
 from transbot_race.state_machine import MotionCommand, RaceState
 from transbot_race.vision import LineFeatures, TrajectoryFit
@@ -147,6 +148,23 @@ def test_route_loss_clear_only_reaches_active_ring_executor():
 
     assert controller.clear_route_loss() is True
     assert executor.missing_frames == 0
+
+
+def test_ring_rotate_search_is_owned_in_place_rotation_only():
+    cfg = RaceConfig()
+    stage = _RingEntryStage(cfg, FixedSessionMission(cfg.mission))
+    stage.executor.state = "rotate_search"
+
+    command, producer = stage._command(
+        context(),
+        RingEntryResult(None, "ring_entry_rotating_search"),
+        MotionCommand(0.06, 0.15, "cruise", RaceState.TRACK),
+    )
+
+    assert producer == CandidateProducer.RING_EXECUTOR
+    assert command.v == 0.0
+    assert command.w == -cfg.path_memory.roundabout_entry_search_w
+    assert command.reason == "ring_entry_rotating_search"
 
 
 def test_finished_stage_is_stationary_and_terminal():

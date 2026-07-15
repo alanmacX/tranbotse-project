@@ -277,13 +277,14 @@ class _RingEntryStage(_Stage):
                 cfg.path_memory.roundabout_margin_distance_m,
                 cfg.path_memory.roundabout_margin_enabled,
             ),
-            entry_commit_v=cfg.path_memory.roundabout_entry_commit_v,
-            entry_commit_w=cfg.path_memory.roundabout_entry_commit_w,
+            entry_search_w=cfg.path_memory.roundabout_entry_search_w,
             entry_capture_frames=cfg.path_memory.roundabout_entry_capture_frames,
-            entry_commit_max_distance_m=(
-                cfg.path_memory.roundabout_entry_commit_max_distance_m
+            entry_search_max_angle_rad=(
+                cfg.path_memory.roundabout_entry_search_max_angle_rad
             ),
-            entry_commit_max_frames=cfg.path_memory.roundabout_entry_commit_max_frames,
+            entry_search_timeout_sec=(
+                cfg.path_memory.roundabout_entry_search_timeout_sec
+            ),
             tracker_cfg=cfg.tracker,
         )
         self.geometry_filter = RingEntryGeometryFilter(
@@ -336,6 +337,7 @@ class _RingEntryStage(_Stage):
             route_fit,
             now=context.now,
             linear=context.motion.linear,
+            angular=context.motion.angular,
             accepted_entry=accepted is not None,
             cruise_fit=context.visual_fit,
             incoming_v=context.last_command.v,
@@ -401,8 +403,8 @@ class _RingEntryStage(_Stage):
                 RaceState.TRACK,
                 None,
             ), CandidateProducer.RING_EXECUTOR
-        if self.executor.state == "entry_commit":
-            v, w = self.executor.entry_commit_command(
+        if self.executor.state == "rotate_search":
+            v, w = self.executor.entry_search_command(
                 invert_turn=self.cfg.tracker.invert_turn,
             )
             return MotionCommand(

@@ -111,11 +111,10 @@ class RingEntryExecutor:
         inside_arm_distance_m: float = 0.18,
         exit_distance_m: float = 0.08,
         margin_distance_m: float = 0.0,
-        entry_commit_v: float = 0.020,
-        entry_commit_w: float = 0.080,
+        entry_search_w: float = 0.20,
         entry_capture_frames: int = 1,
-        entry_commit_max_distance_m: float = 0.12,
-        entry_commit_max_frames: int = 30,
+        entry_search_max_angle_rad: float = 1.75,
+        entry_search_timeout_sec: float = 9.0,
         align_e_tolerance: float = 0.22,
         align_theta_tolerance: float = 0.28,
         align_confirm_frames: int = 3,
@@ -127,13 +126,14 @@ class RingEntryExecutor:
         self.inside_arm_distance_m = max(0.0, float(inside_arm_distance_m))
         self.exit_distance_m = max(0.0, float(exit_distance_m))
         self.margin_distance_m = max(0.0, float(margin_distance_m))
-        self.entry_commit_v = max(0.0, float(entry_commit_v))
-        self.entry_commit_w = abs(float(entry_commit_w))
+        self.entry_search_w = abs(float(entry_search_w))
         self.entry_capture_frames_required = max(1, int(entry_capture_frames))
-        self.entry_commit_max_distance_m = max(
-            0.0, float(entry_commit_max_distance_m),
+        self.entry_search_max_angle_rad = max(
+            0.0, float(entry_search_max_angle_rad),
         )
-        self.entry_commit_max_frames = max(1, int(entry_commit_max_frames))
+        self.entry_search_timeout_sec = max(
+            0.0, float(entry_search_timeout_sec),
+        )
         self.align_e_tolerance = max(0.0, float(align_e_tolerance))
         self.align_theta_tolerance = max(0.0, float(align_theta_tolerance))
         self.align_confirm_frames = max(1, int(align_confirm_frames))
@@ -156,8 +156,8 @@ class RingEntryExecutor:
         self.align_ready_frames = 0
         self.entry_candidate_fit: TrajectoryFit | None = None
         self.entry_candidate_frames = 0
-        self.entry_commit_travelled_m = 0.0
-        self.entry_commit_frames = 0
+        self.entry_search_yaw_rad = 0.0
+        self.entry_search_elapsed_sec = 0.0
 
     def reset(self) -> None:
         self.state = "waiting"
@@ -170,8 +170,8 @@ class RingEntryExecutor:
         self.align_ready_frames = 0
         self.entry_candidate_fit = None
         self.entry_candidate_frames = 0
-        self.entry_commit_travelled_m = 0.0
-        self.entry_commit_frames = 0
+        self.entry_search_yaw_rad = 0.0
+        self.entry_search_elapsed_sec = 0.0
         self.last_now = None
         self._reset_route_control()
 
@@ -294,9 +294,11 @@ class RingEntryExecutor:
         valid = bool(
             observation is not None
             and route_fit is not None
-            and getattr(observation, "direction", self.direction) == self.direction
             and getattr(observation, "confidence", 1.0) >= 0.55
             and route_fit.conf >= 0.55
+            and route_fit.control_valid
+            and abs(route_fit.e0) <= 0.85
+            and abs(route_fit.theta) <= 1.20
         )
         if not valid:
             self.entry_candidate_fit = None
@@ -310,13 +312,10 @@ class RingEntryExecutor:
         self.entry_candidate_frames = self.entry_candidate_frames + 1 if continuous else 1
         self.entry_candidate_fit = route_fit
 
-    def entry_commit_command(self, *, invert_turn: bool = False) -> tuple[float, float]:
-        """The sole command source while committing to the configured ring side."""
+    def entry_search_command(self, *, invert_turn: bool = False) -> tuple[float, float]:
+        """The sole command source while rotating in place to find the ring path."""
         image_to_motor_sign = 1.0 if invert_turn else -1.0
-        return (
-            self.entry_commit_v,
-            image_to_motor_sign * self.direction * self.entry_commit_w,
-        )
+        return 0.0, image_to_motor_sign * self.direction * self.entry_search_w
 
     def step(
         self,
@@ -326,6 +325,7 @@ class RingEntryExecutor:
         now: float,
         linear: float,
         accepted_entry: bool,
+        angular: float = 0.0,
         cruise_fit: TrajectoryFit | None = None,
         incoming_v: float = 0.0,
         fresh_geometry: bool = True,
@@ -333,6 +333,7 @@ class RingEntryExecutor:
         dt = 0.0 if self.last_now is None else max(0.0, min(1.0, now - self.last_now))
         self.last_now = now
         travelled = max(0.0, float(linear)) * dt
+        rotated = abs(float(angular)) * dt
         started = False
         margin_started = False
         if self.state == "completed":
@@ -345,7 +346,7 @@ class RingEntryExecutor:
             )
         if self.state == "failed":
             return RingEntryResult(
-                None, "ring_entry_commit_path_lost", started, False,
+                None, "ring_entry_search_path_lost", started, False,
                 RingPhaseEvent.ROUTE_LOST,
             )
         if self.state == "waiting":
@@ -360,14 +361,6 @@ class RingEntryExecutor:
             margin_started = True
             started = True
 
-        candidate_ready_before_sample = (
-            self.entry_candidate_frames >= self.entry_capture_frames_required
-        )
-        ready_candidate_before_sample = self.entry_candidate_fit
-        self._observe_entry_candidate(
-            observation, route_fit, fresh_geometry=fresh_geometry,
-        )
-
         if self.state == "margin":
             if not margin_started:
                 self.margin_remaining_m = max(0.0, self.margin_remaining_m - travelled)
@@ -375,29 +368,37 @@ class RingEntryExecutor:
                 return RingEntryResult(
                     None, "ring_entry_waiting_margin", started, False,
                 )
-            self.state = "entry_commit"
+            self.state = "rotate_search"
             self.travelled_m = 0.0
             self.clear_frames = 0
             self.align_ready_frames = 0
-            self.entry_commit_travelled_m = 0.0
-            self.entry_commit_frames = 0
+            self.entry_candidate_fit = None
+            self.entry_candidate_frames = 0
+            self.entry_search_yaw_rad = 0.0
+            self.entry_search_elapsed_sec = 0.0
             self._reset_route_control()
             return RingEntryResult(
-                None, "ring_entry_committing_arc", started, False,
+                None, "ring_entry_rotating_search", started, False,
             )
 
-        if self.state == "entry_commit":
-            self.entry_commit_travelled_m += travelled
-            self.entry_commit_frames += 1
-            if (
-                candidate_ready_before_sample
-                or self.entry_candidate_frames >= self.entry_capture_frames_required
-            ):
-                captured_fit = (
-                    ready_candidate_before_sample
-                    if candidate_ready_before_sample
-                    else self.entry_candidate_fit
+        if self.state == "rotate_search":
+            self.entry_search_yaw_rad += rotated
+            self.entry_search_elapsed_sec += dt
+            timed_out = bool(
+                self.entry_search_yaw_rad >= self.entry_search_max_angle_rad
+                or self.entry_search_elapsed_sec >= self.entry_search_timeout_sec
+            )
+            if timed_out:
+                self.state = "failed"
+                return RingEntryResult(
+                    None, "ring_entry_search_path_lost", started, False,
+                    RingPhaseEvent.ROUTE_LOST,
                 )
+            self._observe_entry_candidate(
+                observation, route_fit, fresh_geometry=fresh_geometry,
+            )
+            if self.entry_candidate_frames >= self.entry_capture_frames_required:
+                captured_fit = self.entry_candidate_fit
                 self.state = "aligning"
                 self.travelled_m = 0.0
                 self.clear_frames = 0
@@ -407,20 +408,10 @@ class RingEntryExecutor:
                 if route_fit is not None:
                     self.last_fit = route_fit
                 return RingEntryResult(
-                    route_fit, "ring_entry_commit_path_captured", started,
-                )
-            timed_out = bool(
-                self.entry_commit_travelled_m >= self.entry_commit_max_distance_m
-                or self.entry_commit_frames >= self.entry_commit_max_frames
-            )
-            if timed_out:
-                self.state = "failed"
-                return RingEntryResult(
-                    None, "ring_entry_commit_path_lost", started, False,
-                    RingPhaseEvent.ROUTE_LOST,
+                    route_fit, "ring_entry_search_path_captured", started,
                 )
             return RingEntryResult(
-                None, "ring_entry_committing_arc", started, False,
+                None, "ring_entry_rotating_search", started, False,
             )
 
         route_fit = self._continuous_fit(route_fit)
