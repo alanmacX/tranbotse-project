@@ -115,6 +115,16 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError("camera-to-axle distance cannot be negative")
     if cfg.path_memory.roundabout_margin_distance_m < 0.0:
         raise ValueError("roundabout margin distance cannot be negative")
+    if cfg.path_memory.roundabout_entry_commit_v < 0.0:
+        raise ValueError("roundabout entry commit speed cannot be negative")
+    if cfg.path_memory.roundabout_entry_commit_w < 0.0:
+        raise ValueError("roundabout entry commit turn rate cannot be negative")
+    if cfg.path_memory.roundabout_entry_capture_frames < 1:
+        raise ValueError("roundabout entry capture frames must be positive")
+    if cfg.path_memory.roundabout_entry_commit_max_distance_m < 0.0:
+        raise ValueError("roundabout entry commit distance cannot be negative")
+    if cfg.path_memory.roundabout_entry_commit_max_frames < 1:
+        raise ValueError("roundabout entry commit frame limit must be positive")
     if cfg.mission.ring_entry_direction not in (-1, 1):
         raise ValueError("mission ring-entry direction must be -1 (left) or +1 (right)")
     if cfg.mission.ring_exit_direction not in (-1, 1):

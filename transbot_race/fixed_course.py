@@ -277,6 +277,13 @@ class _RingEntryStage(_Stage):
                 cfg.path_memory.roundabout_margin_distance_m,
                 cfg.path_memory.roundabout_margin_enabled,
             ),
+            entry_commit_v=cfg.path_memory.roundabout_entry_commit_v,
+            entry_commit_w=cfg.path_memory.roundabout_entry_commit_w,
+            entry_capture_frames=cfg.path_memory.roundabout_entry_capture_frames,
+            entry_commit_max_distance_m=(
+                cfg.path_memory.roundabout_entry_commit_max_distance_m
+            ),
+            entry_commit_max_frames=cfg.path_memory.roundabout_entry_commit_max_frames,
             tracker_cfg=cfg.tracker,
         )
         self.geometry_filter = RingEntryGeometryFilter(
@@ -332,6 +339,7 @@ class _RingEntryStage(_Stage):
             accepted_entry=accepted is not None,
             cruise_fit=context.visual_fit,
             incoming_v=context.last_command.v,
+            fresh_geometry=fresh_geometry,
         )
         command, producer = self._command(context, result, cruise_command)
         status = PathStrategyStatus(
@@ -356,8 +364,7 @@ class _RingEntryStage(_Stage):
         stop_cause = (
             StopCause.ROUTE_LOST
             if producer == CandidateProducer.RING_EXECUTOR
-            and self.executor.state == "tracking"
-            and result.fit is None
+            and result.phase_event == RingPhaseEvent.ROUTE_LOST
             else None
         )
         return ComponentStep(
@@ -393,6 +400,13 @@ class _RingEntryStage(_Stage):
                 result.reason,
                 RaceState.TRACK,
                 None,
+            ), CandidateProducer.RING_EXECUTOR
+        if self.executor.state == "entry_commit":
+            v, w = self.executor.entry_commit_command(
+                invert_turn=self.cfg.tracker.invert_turn,
+            )
+            return MotionCommand(
+                v, w, result.reason, RaceState.TRACK, None,
             ), CandidateProducer.RING_EXECUTOR
         if result.fit is None:
             return zero_command(result.reason), CandidateProducer.RING_EXECUTOR

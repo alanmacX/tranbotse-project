@@ -80,6 +80,11 @@ class PathMemoryConfig:
     # detected from a different image-space landmark.
     roundabout_margin_enabled: bool = True
     roundabout_margin_distance_m: float = 0.10
+    roundabout_entry_commit_v: float = 0.020
+    roundabout_entry_commit_w: float = 0.080
+    roundabout_entry_capture_frames: int = 3
+    roundabout_entry_commit_max_distance_m: float = 0.12
+    roundabout_entry_commit_max_frames: int = 30
     roundabout_replay_max_w: float = 0.20
     corner_turn_angle_rad: float = 1.57
     corner_max_turn_angle_rad: float = 2.6179938779914944
