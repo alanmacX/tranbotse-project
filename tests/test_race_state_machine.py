@@ -3,7 +3,6 @@ import unittest
 import cv2 as cv
 import numpy as np
 
-from apps.race_runner import _corner_control_allowed, _corner_has_motor_ownership
 from transbot_race.config import RaceConfig
 from transbot_race.state_machine import RaceState, RaceStateMachine, TrackMode
 from transbot_race.vision import TrajectoryFit, fit_line_trajectory, scan_line_features
@@ -55,17 +54,6 @@ def replay(sm, mask, cfg, start=0.0, n=6, dt=0.1):
 
 
 class UnifiedTrackerTests(unittest.TestCase):
-    def test_all_active_corner_phases_have_one_motor_owner(self):
-        for state in (
-            "approach", "waiting", "turning", "captured", "aligning",
-            "exit_tracking", "seeking", "failed", "failed_locked",
-        ):
-            with self.subTest(state=state):
-                self.assertTrue(_corner_has_motor_ownership(state))
-        self.assertFalse(_corner_has_motor_ownership("armed"))
-        self.assertFalse(_corner_has_motor_ownership("cooldown"))
-        self.assertTrue(_corner_has_motor_ownership("armed", pending_takeover=True))
-
     def test_corner_handoff_uses_the_same_moving_follow_boundary(self):
         sm = RaceStateMachine(RaceConfig())
         fit = TrajectoryFit(
@@ -179,6 +167,21 @@ class UnifiedTrackerTests(unittest.TestCase):
         self.assertEqual(sm.state, RaceState.TRACK)
         # Line to the right of center -> steer right (w < 0 with invert_turn off).
         self.assertLess(cmd.w, 0.0)
+
+    def test_straight_cruise_ignores_noisy_heading_for_same_lateral_fit(self):
+        cfg = RaceConfig()
+        right_heading = TrajectoryFit(
+            found=True, e0=0.2, e_look=0.2, theta=0.3,
+            conf=0.9, n_bands=5,
+        )
+        left_heading = TrajectoryFit(
+            found=True, e0=0.2, e_look=0.2, theta=-0.3,
+            conf=0.9, n_bands=5,
+        )
+        right = RaceStateMachine(cfg).step(right_heading, now=0.0)
+        left = RaceStateMachine(cfg).step(left_heading, now=0.0)
+        self.assertLess(right.w, 0.0)
+        self.assertAlmostEqual(right.w, left.w)
 
     def test_image_curvature_does_not_steer_ordinary_straight_cruise(self):
         cfg = RaceConfig()
@@ -316,6 +319,49 @@ class UnifiedTrackerTests(unittest.TestCase):
         self.assertLess(sm.f_e0, 0.0)
         self.assertGreater(command.w, 0.0)
 
+    def test_far_only_fit_cannot_acquire_or_reacquire_tracker(self):
+        cfg = RaceConfig()
+        far = TrajectoryFit(
+            found=True, e0=-0.8, theta=0.9, conf=0.9, n_bands=5,
+            nearest_band_index=3,
+        )
+        sm = RaceStateMachine(cfg)
+        command = sm.step(far, now=0.0)
+        self.assertEqual(command.reason, "await_first_line")
+        self.assertFalse(sm.ever_acquired)
+
+        sm.state = RaceState.STOPPED
+        sm.last_event = "search_timeout"
+        for index in range(4):
+            command = sm.step(far, now=1.0 + index * 0.1)
+        self.assertEqual(command.state, RaceState.STOPPED)
+        self.assertEqual(sm.stopped_reacquire_frames, 0)
+
+    def test_far_only_fit_predicts_without_polluting_valid_history(self):
+        cfg = RaceConfig()
+        sm = RaceStateMachine(cfg)
+        sm.reacquire_from(
+            TrajectoryFit(
+                found=True, e0=0.25, e_look=0.25, theta=0.1,
+                conf=0.9, n_bands=5,
+            ),
+            now=0.0,
+        )
+        observed_e0 = sm.observed_e0
+        observed_theta = sm.observed_theta
+        command = sm.step(
+            TrajectoryFit(
+                found=True, e0=-0.9, e_look=-0.9, theta=1.0,
+                conf=0.9, n_bands=5, nearest_band_index=3,
+            ),
+            now=0.1,
+        )
+        self.assertEqual(sm.observed_e0, observed_e0)
+        self.assertEqual(sm.observed_theta, observed_theta)
+        self.assertGreater(sm.f_e0, 0.0)
+        self.assertLess(sm.f_conf, 0.9)
+        self.assertGreater(command.w, -0.2)
+
     def test_large_lateral_error_cannot_be_cancelled_by_heading_and_curvature(self):
         cfg = RaceConfig()
         sm = RaceStateMachine(cfg)
@@ -371,10 +417,14 @@ class UnifiedTrackerTests(unittest.TestCase):
         sm = RaceStateMachine(cfg)
         replay(sm, straight(), cfg, start=-0.4, n=4)
         cmd = replay(sm, right_angle(), cfg, n=8)
-        # Fixed-session geometry owns corners; generic cruise has no pivot.
-        self.assertEqual(sm.state, RaceState.TRACK)
+        # Fixed-session geometry owns corners; ordinary cruise must never
+        # manufacture a generic pivot. Without stage takeover this sample may
+        # safely enter route-loss handling because it is not a valid ordinary
+        # near-field line.
+        self.assertIn(sm.state, (RaceState.TRACK, RaceState.LOST))
         self.assertNotEqual(cmd.mode, TrackMode.PIVOT)
-        self.assertGreater(cmd.v, 0.0)
+        if sm.state == RaceState.TRACK:
+            self.assertGreater(cmd.v, 0.0)
 
     def test_dashed_gap_keeps_moving_via_predict(self):
         cfg = RaceConfig()
@@ -386,6 +436,149 @@ class UnifiedTrackerTests(unittest.TestCase):
         self.assertEqual(sm.state, RaceState.TRACK)
         self.assertIn(c2.mode, (TrackMode.PREDICT, TrackMode.FOLLOW))
         self.assertGreater(c2.v, 0.0)  # keeps rolling through the gap
+
+    def test_dashed_gap_applies_lateral_prediction_only_once(self):
+        cfg = RaceConfig()
+        cfg.tracker.conf_decay = 0.05
+        sm = RaceStateMachine(cfg)
+        sm.reacquire_from(
+            TrajectoryFit(
+                found=True, e0=0.10, e_look=0.10, theta=0.0,
+                conf=0.95, n_bands=6,
+            ),
+            now=0.0,
+        )
+        sm.step(
+            TrajectoryFit(
+                found=True, e0=0.30, e_look=0.30, theta=0.0,
+                conf=0.95, n_bands=6,
+            ),
+            now=0.1,
+        )
+        derivative = sm.d_e0
+        self.assertGreater(derivative, 0.0)
+
+        blank = TrajectoryFit(found=False)
+        sm.step(blank, now=0.2)
+        predicted_once = sm.f_e0
+        confidence_once = sm.f_conf
+        self.assertTrue(sm.gap_prediction_consumed)
+        self.assertEqual(sm.d_e0, 0.0)
+
+        sm.step(blank, now=0.3)
+        sm.step(blank, now=0.4)
+        self.assertAlmostEqual(sm.f_e0, predicted_once)
+        self.assertLess(sm.f_conf, confidence_once)
+
+    def test_new_dash_reopens_single_gap_prediction(self):
+        cfg = RaceConfig()
+        sm = RaceStateMachine(cfg)
+        first = TrajectoryFit(
+            found=True, e0=0.0, e_look=0.0, theta=0.0,
+            conf=0.95, n_bands=6,
+        )
+        moved = TrajectoryFit(
+            found=True, e0=0.20, e_look=0.20, theta=0.0,
+            conf=0.95, n_bands=6,
+        )
+        sm.reacquire_from(first, now=0.0)
+        sm.step(moved, now=0.1)
+        sm.step(TrajectoryFit(found=False), now=0.2)
+        self.assertTrue(sm.gap_prediction_consumed)
+
+        sm.step(moved, now=0.3)
+        self.assertFalse(sm.gap_prediction_consumed)
+        sm.step(TrajectoryFit(found=False), now=0.4)
+        self.assertTrue(sm.gap_prediction_consumed)
+
+    def test_alternating_dashes_update_one_route_without_steering_zigzag(self):
+        cfg = RaceConfig()
+        sm = RaceStateMachine(cfg)
+        first = TrajectoryFit(
+            found=True, e0=0.18, e_look=0.18, theta=0.04,
+            conf=0.95, n_bands=5,
+        )
+        sm.reacquire_from(first, now=0.0)
+        commands = []
+        for index, e0 in enumerate((0.30, 0.08, 0.28, 0.06), start=1):
+            sm.step(TrajectoryFit(found=False), now=index * 0.2 - 0.1)
+            commands.append(sm.step(
+                TrajectoryFit(
+                    found=True, e0=e0, e_look=e0, theta=0.04,
+                    conf=0.95, n_bands=5,
+                ),
+                now=index * 0.2,
+            ))
+
+        self.assertTrue(sm.line_identity_valid)
+        self.assertGreater(sm.line_identity_e0, 0.0)
+        self.assertTrue(all(command.w < 0.0 for command in commands))
+        self.assertLess(
+            max(abs(command.w) for command in commands)
+            - min(abs(command.w) for command in commands),
+            0.08,
+        )
+
+    def test_discontinuous_dash_cannot_replace_straight_route_identity(self):
+        sm = RaceStateMachine(RaceConfig())
+        first = TrajectoryFit(
+            found=True, e0=0.05, e_look=0.05, theta=0.02,
+            conf=0.95, n_bands=6,
+        )
+        sm.reacquire_from(first, now=0.0)
+        sm.step(TrajectoryFit(found=False), now=0.1)
+        before_e0 = sm.f_e0
+        before_theta = sm.f_theta
+        self.assertTrue(sm.gap_prediction_consumed)
+
+        swapped = TrajectoryFit(
+            found=True, e0=0.75, e_look=0.75, theta=0.70,
+            conf=0.95, n_bands=6,
+        )
+        sm.step(swapped, now=0.2)
+
+        self.assertAlmostEqual(sm.f_e0, before_e0)
+        self.assertAlmostEqual(sm.f_theta, before_theta)
+        self.assertTrue(sm.gap_prediction_consumed)
+        self.assertAlmostEqual(sm.line_identity_e0, first.e0)
+        self.assertAlmostEqual(sm.line_identity_theta, first.theta)
+        self.assertFalse(sm.observation_reliable)
+
+    def test_path_memory_and_far_only_cannot_refresh_ordinary_line_identity(self):
+        sm = RaceStateMachine(RaceConfig())
+        first = TrajectoryFit(
+            found=True, e0=0.0, e_look=0.0, theta=0.0,
+            conf=0.95, n_bands=6,
+        )
+        sm.reacquire_from(first, now=0.0)
+        for fit in (
+            TrajectoryFit(
+                found=True, e0=0.2, e_look=0.2, theta=0.1,
+                conf=0.95, n_bands=6, path_memory=True,
+            ),
+            TrajectoryFit(
+                found=True, e0=0.2, e_look=0.2, theta=0.1,
+                conf=0.95, n_bands=5, nearest_band_index=4,
+            ),
+        ):
+            sm.step(fit, now=0.1)
+            self.assertAlmostEqual(sm.line_identity_e0, first.e0)
+            self.assertAlmostEqual(sm.line_identity_theta, first.theta)
+
+    def test_lost_and_stopped_clear_straight_route_identity(self):
+        sm = RaceStateMachine(RaceConfig())
+        fit = TrajectoryFit(
+            found=True, e0=0.1, e_look=0.1, theta=0.0,
+            conf=0.95, n_bands=6,
+        )
+        sm.reacquire_from(fit, now=0.0)
+        self.assertTrue(sm.line_identity_valid)
+        sm._enter(RaceState.LOST, now=0.1, event="test")
+        self.assertFalse(sm.line_identity_valid)
+
+        sm.reacquire_from(fit, now=0.2)
+        sm._enter(RaceState.STOPPED, now=0.3, event="operator_stop")
+        self.assertFalse(sm.line_identity_valid)
 
     def test_long_gap_goes_lost_then_searches_then_stops(self):
         cfg = RaceConfig()
@@ -460,24 +653,6 @@ class UnifiedTrackerTests(unittest.TestCase):
         )
         command = sm.step(TrajectoryFit(found=False), now=0.2)
         self.assertNotEqual(command.mode, TrackMode.PLAN)
-
-    def test_obstacle_stops_immediately(self):
-        cfg = RaceConfig()
-        sm = RaceStateMachine(cfg)
-        cmd = sm.step(fit_of(straight(), cfg), now=0.0, obstacle=True)
-        self.assertEqual(sm.state, RaceState.STOPPED)
-        self.assertEqual(cmd.v, 0.0)
-        self.assertEqual(cmd.w, 0.0)
-
-    def test_latched_obstacle_stop_cannot_be_overridden_by_corner(self):
-        sm = RaceStateMachine(RaceConfig())
-        sm.step(fit_of(straight(), sm.cfg), now=0.0, obstacle=True)
-        self.assertFalse(_corner_control_allowed("corner_event", False, sm))
-
-        # A search timeout during an already-owned corner is different: the
-        # corner controller must still be allowed to reacquire the exit line.
-        sm.last_event = "search_timeout"
-        self.assertTrue(_corner_control_allowed("corner_event", False, sm))
 
     def test_lookahead_steers_toward_ahead_error(self):
         # With pure-pursuit enabled, an approaching bend (line offset ahead but

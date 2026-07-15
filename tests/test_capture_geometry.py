@@ -82,11 +82,25 @@ class CaptureGeometryFilterTests(unittest.TestCase):
         self.assertIsNone(geometry_filter.update(turn))
         self.assertIsNotNone(geometry_filter.update(turn))
 
-    def test_corner_session_emits_corner_not_curve_or_turn(self):
+    def test_corner_session_rejects_curve_observations(self):
         geometry_filter = CornerGeometryFilter(confirm_frames=3)
-        geometry_filter.update(observation("curve", 1, math.radians(28)))
-        geometry_filter.update(observation("curve", 1, math.radians(34)))
-        decision = geometry_filter.update(observation("curve", 1, math.radians(40)))
+        for angle in (28, 34, 40, 45):
+            decision = geometry_filter.update(
+                observation("curve", 1, math.radians(angle))
+            )
+            self.assertIsNone(decision)
+
+    def test_corner_session_emits_only_from_corner_observations(self):
+        geometry_filter = CornerGeometryFilter(confirm_frames=3)
+        self.assertIsNone(geometry_filter.update(
+            observation("corner", 1, math.radians(70))
+        ))
+        self.assertIsNone(geometry_filter.update(
+            observation("corner", 1, math.radians(80))
+        ))
+        decision = geometry_filter.update(
+            observation("corner", 1, math.radians(90))
+        )
         self.assertIsNotNone(decision)
         self.assertEqual(decision.kind, "corner")
 
@@ -193,7 +207,7 @@ class CaptureGeometryFilterTests(unittest.TestCase):
         for desired in (-1, 1):
             cfg = RaceConfig()
             cfg.camera.crop = (300, 265, 430, 442)
-            cfg.path_memory.roundabout_direction = desired
+            cfg.mission.ring_entry_direction = desired
             captured, debug = analyze_capture_geometry(frame, cfg)
             self.assertTrue(captured.is_fork)
             self.assertEqual(captured.direction, desired)

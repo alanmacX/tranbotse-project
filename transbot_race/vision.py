@@ -801,7 +801,18 @@ class TrajectoryFit:
     preview_e: float = 0.0
     preview_theta: float = 0.0
     preview_conf: float = 0.0
-    path_memory: bool = False  # preview steering was released by distance delay
+    path_memory: bool = False  # committed selected-path control, not scan-line pose
+    nearest_band_index: int = 0  # nearest scan band supporting this observation
+
+    @property
+    def has_near_support(self) -> bool:
+        """Whether ordinary vision reaches the crop's near control horizon."""
+        return bool(self.found and 0 <= self.nearest_band_index <= 2)
+
+    @property
+    def control_valid(self) -> bool:
+        """Whether this observation may update the active control trajectory."""
+        return bool(self.found and (self.path_memory or self.has_near_support))
 
 
 def _band_confidence(run: Run, band_height: float, line_width: float, cfg: VisionConfig) -> float:
@@ -843,7 +854,7 @@ def _fit_classic_contour_trajectory(
         samples.append((band.index, y_mid, band.best.cx, band.best))
 
     if not samples:
-        return TrajectoryFit(found=False)
+        return TrajectoryFit(found=False, nearest_band_index=-1)
 
     samples.sort(key=lambda item: item[0])
     near = samples[0]
@@ -876,6 +887,7 @@ def _fit_classic_contour_trajectory(
         n_bands=n,
         quadratic=False,
         disconnected=False,
+        nearest_band_index=near[0],
     )
 
 
@@ -935,6 +947,7 @@ def fit_line_trajectory(
             preview_e=preview_e,
             preview_theta=preview_theta,
             preview_conf=preview_conf,
+            nearest_band_index=-1,
         )
 
     samples.sort(key=lambda item: item[0])
@@ -968,6 +981,8 @@ def fit_line_trajectory(
     xs = [sample[2] for sample in fit_samples]
     ws = [sample[3] for sample in fit_samples]
     fit_n = len(fit_samples)
+    nearest_band_index = fit_samples[0][0]
+    has_near_support = nearest_band_index <= 2
 
     y_arr = np.asarray(ys, dtype=np.float64)
     x_arr = np.asarray(xs, dtype=np.float64)
@@ -993,50 +1008,62 @@ def fit_line_trajectory(
             preview_e=preview_e,
             preview_theta=preview_theta,
             preview_conf=preview_conf,
+            nearest_band_index=nearest_band_index,
         )
 
     # RANSAC-lite: with enough bands, drop the single worst residual once so a
     # roundabout entry/exit stub or a corner branch cannot drag the whole fit.
-    degree = 2 if fit_n >= 4 else 1
-    use_quadratic = degree == 2
-    coeffs = np.polyfit(y_arr, x_arr, degree, w=w_arr)
+    initial_degree = 2 if fit_n >= 4 else 1
+    initial_coeffs = np.polyfit(y_arr, x_arr, initial_degree, w=w_arr)
     if fit_n >= 5:
-        resid = np.abs(np.polyval(coeffs, y_arr) - x_arr)
+        resid = np.abs(np.polyval(initial_coeffs, y_arr) - x_arr)
         drop = int(np.argmax(resid))
         keep = np.ones(fit_n, dtype=bool)
         keep[drop] = False
         y_arr, x_arr, w_arr = y_arr[keep], x_arr[keep], w_arr[keep]
         fit_n = int(keep.sum())
-        degree = 2 if fit_n >= 4 else 1
-        use_quadratic = degree == 2
-        coeffs = np.polyfit(y_arr, x_arr, degree, w=w_arr)
 
-    y_bottom = float(y_arr.max())
-    cx_bottom = float(np.polyval(coeffs, y_bottom))
-    e0 = float(max(-1.0, min(1.0, (cx_bottom - crop_center) / half_width)))
+    # Pose is always a local straight-line estimate evaluated at one fixed image
+    # row. A dashed line can change which segment is nearest between frames; using
+    # the nearest visible sample as the reference made that visibility change look
+    # like lateral vehicle motion. The nearest four connected samples retain local
+    # heading without allowing a far arc or branch to move the steering reference.
+    pose_n = min(4, fit_n)
+    pose_coeffs = np.polyfit(
+        y_arr[:pose_n], x_arr[:pose_n], 1, w=w_arr[:pose_n],
+    )
+    pose_slope, _pose_intercept = pose_coeffs
+    fixed_reference = float(features.bands[0].y1) - 0.5
+    # A smooth component first seen beyond the near control horizon is still a
+    # useful observation, but it cannot establish where the line is at the axle.
+    # Evaluate it only where pixels exist; consumers will treat it as diagnostic.
+    y_reference = fixed_reference if has_near_support else float(y_arr[0])
+    cx_reference = float(np.polyval(pose_coeffs, y_reference))
+    e0 = float(max(-1.0, min(1.0, (cx_reference - crop_center) / half_width)))
 
-    if use_quadratic:
-        a2, a1, _a0 = coeffs
-        slope = 2.0 * a2 * y_bottom + a1        # dcx/dy at the bottom
-        curvature = 2.0 * a2
-    else:
-        a1, _a0 = coeffs
-        slope = a1
-        curvature = 0.0
+    # Curvature remains a separate whole-path estimate and is trusted only for a
+    # coherent trajectory that is anchored in the near control horizon.
+    use_quadratic = fit_n >= 4 and not disconnected and has_near_support
+    trajectory_degree = 2 if use_quadratic else 1
+    trajectory_coeffs = np.polyfit(
+        y_arr, x_arr, trajectory_degree, w=w_arr,
+    )
+    curvature = 2.0 * trajectory_coeffs[0] if use_quadratic else 0.0
 
-    # Car forward is "up" the image (decreasing y). Positive theta => line bends
-    # toward +x (right) as we look ahead. Sign chosen so theta and e0 agree.
-    theta = float(np.arctan2(-slope, 1.0))
+    # Car forward is "up" the image (decreasing y). Positive theta means the
+    # local straight trajectory heads toward +x (right) as we look ahead.
+    theta = float(np.arctan2(-pose_slope, 1.0))
     kappa = float(max(-1.0, min(1.0, curvature * half_width)))
 
-    # Lookahead sample: the fitted curve some distance ahead (toward smaller y).
-    if lookahead_frac > 0.0 and y_min < float("inf"):
-        y_look = y_bottom - lookahead_frac * (y_bottom - y_min)
-        cx_look = float(np.polyval(coeffs, y_look))
+    # Lookahead is evaluated from the fixed pose reference, not whichever dash is
+    # currently closest. Coherent curves retain their quadratic lookahead shape.
+    if has_near_support and lookahead_frac > 0.0 and y_min < float("inf"):
+        y_look = fixed_reference - lookahead_frac * (fixed_reference - y_min)
+        cx_look = float(np.polyval(trajectory_coeffs, y_look))
         e_look = float(max(-1.0, min(1.0, (cx_look - crop_center) / half_width)))
     else:
         e_look = e0
-    if preview_conf > 0.0 and (lookahead_frac > 0.0 or disconnected):
+    if has_near_support and preview_conf > 0.0 and lookahead_frac > 0.0:
         e_look = preview_e
 
     conf = float(min(1.0, w_arr.sum() / (visible_bands * 0.9)))
@@ -1062,6 +1089,7 @@ def fit_line_trajectory(
         preview_e=preview_e,
         preview_theta=preview_theta,
         preview_conf=preview_conf,
+        nearest_band_index=nearest_band_index,
     )
 
 

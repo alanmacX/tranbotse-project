@@ -24,7 +24,6 @@ class SafetyState(str, Enum):
 
 
 class StopCause(str, Enum):
-    OBSTACLE = "obstacle"
     SEARCH_TIMEOUT = "search_timeout"
     ROUTE_LOST = "route_lost"
     EXECUTOR_FAILED = "executor_failed"
@@ -74,7 +73,6 @@ class CommandArbiter:
         self._latched_cause: StopCause | None = None
 
     _AUTO_RECOVERABLE = frozenset({
-        StopCause.OBSTACLE,
         StopCause.SEARCH_TIMEOUT,
         StopCause.CAMERA_FAILURE,
     })
@@ -101,17 +99,17 @@ class CommandArbiter:
         slow_v_limit: float | None = None,
         transition_event: TransitionEvent = TransitionEvent.NONE,
     ) -> ArbitrationResult:
-        if owner != self.owner:
-            self.owner = owner
-            self.owner_epoch += 1
-            if transition_event == TransitionEvent.NONE:
-                transition_event = TransitionEvent.TAKEOVER_ACCEPTED
-
         invalid = not all(math.isfinite(value) for value in (candidate.v, candidate.w))
         invalid = invalid or abs(candidate.v) > self.max_v + 1e-9
         invalid = invalid or abs(candidate.w) > self.max_w + 1e-9
         if invalid:
             stop_cause = StopCause.INVALID_COMMAND
+            owner = self.owner
+        elif owner != self.owner:
+            self.owner = owner
+            self.owner_epoch += 1
+            if transition_event == TransitionEvent.NONE:
+                transition_event = TransitionEvent.TAKEOVER_ACCEPTED
 
         if stop_cause is not None:
             if (

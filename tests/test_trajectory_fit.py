@@ -43,11 +43,16 @@ def arc(line_w=18, amp=45):
     return mask
 
 
-def dashed(x=CENTER, line_w=18, dash=22, gap=18):
+def dashed(x=CENTER, line_w=18, dash=22, gap=18, phase=0, dx=0):
     mask = np.zeros((H, W), dtype=np.uint8)
-    y = 0
+    y = phase - (dash + gap)
     while y < H:
-        cv.rectangle(mask, (x - line_w // 2, y), (x + line_w // 2, min(H - 1, y + dash)), 255, -1)
+        y0 = max(0, y)
+        y1 = min(H - 1, y + dash)
+        if y0 <= y1:
+            x0 = int(x + dx * (y0 / H))
+            x1 = int(x + dx * (y1 / H))
+            cv.line(mask, (x0, y0), (x1, y1), 255, line_w)
         y += dash + gap
     return mask
 
@@ -127,6 +132,16 @@ class TrajectoryFitTests(unittest.TestCase):
         self.assertGreaterEqual(fit.n_bands, 2)
         self.assertLess(abs(fit.e0), 0.15)
 
+    def test_dashed_straight_pose_is_stable_across_segment_phases(self):
+        fits = [
+            _fit(dashed(x=CENTER + 22, phase=phase, dx=18), RaceConfig())
+            for phase in (0, 8, 16, 24, 32)
+        ]
+        self.assertTrue(all(fit.found for fit in fits))
+        self.assertTrue(all(fit.e0 > 0.0 for fit in fits))
+        self.assertLess(max(fit.e0 for fit in fits) - min(fit.e0 for fit in fits), 0.12)
+        self.assertLess(max(fit.theta for fit in fits) - min(fit.theta for fit in fits), 0.12)
+
     def test_intentional_sliding_window_gap_is_not_disconnected(self):
         mask = np.zeros((H, W), dtype=np.uint8)
         # Two collinear dashes separated by one complete scan band.  The
@@ -139,6 +154,29 @@ class TrajectoryFitTests(unittest.TestCase):
         self.assertFalse(fit.disconnected)
         self.assertGreaterEqual(fit.n_bands, 2)
         self.assertGreater(fit.conf, 0.30)
+
+    def test_far_only_component_is_visible_but_cannot_control(self):
+        mask = np.zeros((H, W), dtype=np.uint8)
+        cv.line(mask, (18, 105), (130, 0), 255, 18)
+        fit = _fit(mask, RaceConfig())
+
+        self.assertTrue(fit.found)
+        self.assertGreaterEqual(fit.nearest_band_index, 3)
+        self.assertFalse(fit.has_near_support)
+        self.assertFalse(fit.control_valid)
+        self.assertFalse(fit.quadratic)
+        # The diagnostic error is evaluated at the nearest observed row, not
+        # extrapolated to the unseen bottom reference where it would saturate.
+        self.assertGreater(fit.e0, -0.95)
+
+    def test_band_two_is_inside_near_control_horizon(self):
+        mask = np.zeros((H, W), dtype=np.uint8)
+        cv.line(mask, (CENTER + 12, 125), (CENTER + 30, 0), 255, 18)
+        fit = _fit(mask, RaceConfig())
+
+        self.assertEqual(fit.nearest_band_index, 2)
+        self.assertTrue(fit.has_near_support)
+        self.assertTrue(fit.control_valid)
 
     def test_right_angle_produces_strong_signal(self):
         # A right-angle corner should surface as large heading/curvature so the

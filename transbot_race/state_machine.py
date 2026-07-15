@@ -53,7 +53,30 @@ def command_summary(command: MotionCommand, fit: TrajectoryFit) -> dict:
         "preview_theta": round(fit.preview_theta, 4),
         "preview_conf": round(fit.preview_conf, 4),
         "path_memory": fit.path_memory,
+        "nearest_band_index": fit.nearest_band_index,
+        "near_support": fit.has_near_support,
+        "control_valid": fit.control_valid,
+        "fit_source": "selected_path" if fit.path_memory else "visual_scan",
+        "pose_reference": (
+            "selected_path" if fit.path_memory
+            else "fixed_bottom" if fit.has_near_support
+            else "nearest_observed" if fit.found
+            else "none"
+        ),
     }
+
+
+def ring_entry_takeover_ready(
+    fit: TrajectoryFit,
+    tracker: TrackerConfig,
+) -> bool:
+    """Whether a coherent incoming track can transfer control to the ring."""
+    return bool(
+        fit.control_valid
+        and fit.conf >= tracker.conf_predict
+        and fit.n_bands >= 3
+        and not fit.disconnected
+    )
 
 
 def moving_follow_handoff_ready(
@@ -66,7 +89,7 @@ def moving_follow_handoff_ready(
     executors must use it instead of inventing narrower e/theta thresholds.
     """
     reliable = bool(
-        fit.found
+        fit.control_valid
         and fit.conf >= tracker.conf_predict
         and fit.n_bands >= 3
         and not fit.disconnected
@@ -90,13 +113,14 @@ def moving_follow_command_w(
     *,
     invert_turn: bool | None = None,
 ) -> float:
-    """Original near-field proportional steering shared at handoff."""
+    """Fixed-reference lateral steering for ordinary straight cruise."""
     e0 = fit.e0 + tracker.e_bias
+    steering = tracker.k_e * e0
     inverted = tracker.invert_turn if invert_turn is None else invert_turn
     sign = 1.0 if inverted else -1.0
     return max(
         -tracker.max_w,
-        min(tracker.max_w, sign * tracker.k_e * e0),
+        min(tracker.max_w, sign * steering),
     )
 
 
@@ -122,6 +146,10 @@ class RaceStateMachine:
         self.observed_theta = 0.0
         self.observation_reliable = False
         self.d_e0 = 0.0
+        self.gap_prediction_consumed = False
+        self.line_identity_valid = False
+        self.line_identity_e0 = 0.0
+        self.line_identity_theta = 0.0
         self.follow_w = 0.0
         self.follow_now: float | None = None
         self.use_path_lookahead = False
@@ -140,6 +168,10 @@ class RaceStateMachine:
     def reset(self) -> None:
         self.__init__(self.cfg)
 
+    def can_take_ring_entry(self, fit: TrajectoryFit) -> bool:
+        """True when a confirmed ring route can safely take control."""
+        return ring_entry_takeover_ready(fit, self.cfg.tracker)
+
     def can_take_moving_handoff(self, fit: TrajectoryFit) -> bool:
         """True iff ``reacquire_from`` would give this line moving control."""
         return moving_follow_handoff_ready(fit, self.cfg.tracker)
@@ -152,7 +184,6 @@ class RaceStateMachine:
         self.follow_w = moving_follow_command_w(fit, self.cfg.tracker)
         self.follow_now = now
         self.ever_acquired = True
-        self._clear_plan()
         self.stopped_reacquire_frames = 0
         self.stopped_reacquire_e = None
         self.stopped_reacquire_theta = None
@@ -170,20 +201,51 @@ class RaceStateMachine:
         self.observed_theta = fit.theta
         self.observation_reliable = self._trackable_observation(fit)
         self.d_e0 = 0.0
+        self.gap_prediction_consumed = False
         self.use_path_lookahead = fit.path_memory
+        self._seed_line_identity(fit)
+
+    def _seed_line_identity(self, fit: TrajectoryFit) -> None:
+        ordinary_near = bool(
+            not fit.path_memory
+            and fit.has_near_support
+            and self._pose_observation_usable(fit)
+        )
+        self.line_identity_valid = ordinary_near
+        if ordinary_near:
+            self.line_identity_e0 = fit.e0
+            self.line_identity_theta = fit.theta
+
+    def _same_line_identity(self, fit: TrajectoryFit) -> bool:
+        if fit.path_memory or not fit.has_near_support:
+            return False
+        if not self.line_identity_valid:
+            return True
+        return bool(
+            abs(fit.e0 - self.line_identity_e0) <= 0.32
+            and abs(fit.theta - self.line_identity_theta) <= 0.45
+        )
+
+    def _update_line_identity(self, fit: TrajectoryFit) -> tuple[float, float]:
+        if not self.line_identity_valid:
+            self._seed_line_identity(fit)
+            return fit.e0, fit.theta
+        alpha = min(0.25, self.cfg.tracker.filter_alpha)
+        self.line_identity_e0 += alpha * (fit.e0 - self.line_identity_e0)
+        self.line_identity_theta += alpha * (fit.theta - self.line_identity_theta)
+        return self.line_identity_e0, self.line_identity_theta
+
+    def _clear_line_identity(self) -> None:
+        self.line_identity_valid = False
+        self.line_identity_e0 = 0.0
+        self.line_identity_theta = 0.0
 
     # -- public API -------------------------------------------------------
-    def step(self, fit: TrajectoryFit, now: float, obstacle: bool = False) -> MotionCommand:
-        if obstacle:
-            self._enter(RaceState.STOPPED, now, "obstacle")
-            return MotionCommand(0.0, 0.0, "obstacle", self.state, None)
-
+    def step(self, fit: TrajectoryFit, now: float) -> MotionCommand:
         if self.state == RaceState.STOPPED:
-            # Obstacle STOP is a hard safety latch.  Search timeout is only an
-            # exhausted motion search: keep the chassis still, but allow a
-            # complete line that remains visible for three frames to reseed the
-            # tracker.  In 193907 the line was good again at 26.63 s, yet the
-            # old terminal STOP ignored it forever.
+            # Search timeout is an exhausted motion search: keep the chassis
+            # still, but allow a complete line that remains visible for three
+            # frames to reseed the tracker.
             recoverable = bool(
                 self.last_event == "search_timeout"
                 and self._trackable_observation(fit)
@@ -246,7 +308,7 @@ class RaceStateMachine:
     # -- filtering --------------------------------------------------------
     def _trackable_observation(self, fit: TrajectoryFit) -> bool:
         return bool(
-            fit.found
+            fit.control_valid
             and fit.conf >= self.cfg.tracker.conf_predict
             and fit.n_bands >= 3
             and not fit.disconnected
@@ -255,7 +317,7 @@ class RaceStateMachine:
     def _pose_observation_usable(self, fit: TrajectoryFit) -> bool:
         """A weaker, still coherent dash may update pose but not mode gates."""
         return bool(
-            fit.found
+            fit.control_valid
             and fit.conf >= 0.60 * self.cfg.tracker.conf_predict
             and fit.n_bands >= 2
             and not fit.disconnected
@@ -263,19 +325,27 @@ class RaceStateMachine:
 
     def _update_filter(self, fit: TrajectoryFit) -> None:
         t = self.cfg.tracker
-        self.observation_reliable = self._trackable_observation(fit)
+        pose_observation_usable = bool(
+            self._pose_observation_usable(fit)
+            and self._same_line_identity(fit)
+        )
+        self.observation_reliable = bool(
+            self._trackable_observation(fit)
+            and self._same_line_identity(fit)
+        )
         if self.observation_reliable:
             self.observed_e0 = fit.e0
             self.observed_theta = fit.theta
-        pose_observation_usable = self._pose_observation_usable(fit)
         if pose_observation_usable:
+            route_e0, route_theta = self._update_line_identity(fit)
+            self.gap_prediction_consumed = False
             self.use_path_lookahead = fit.path_memory
             prev_e0 = self.f_e0
             a, b = t.filter_alpha, t.filter_beta
-            self.f_e0 = (1 - a) * (self.f_e0 + self.d_e0) + a * fit.e0
+            self.f_e0 = (1 - a) * (self.f_e0 + self.d_e0) + a * route_e0
             self.f_e0 = max(-1.0, min(1.0, self.f_e0))
             self.d_e0 = (1 - b) * self.d_e0 + b * (self.f_e0 - prev_e0)
-            self.f_theta = (1 - a) * self.f_theta + a * fit.theta
+            self.f_theta = (1 - a) * self.f_theta + a * route_theta
             self.f_kappa = (1 - a) * self.f_kappa + a * fit.kappa
             self.f_e_look = (1 - a) * self.f_e_look + a * fit.e_look
             self.f_e_look = max(-1.0, min(1.0, self.f_e_look))
@@ -285,9 +355,13 @@ class RaceStateMachine:
             else:
                 self.f_conf = (1 - a) * self.f_conf + a * fit.conf
         else:
-            # Predict: extrapolate position by its rate, decay confidence.
-            self.f_e0 = max(-1.0, min(1.0, self.f_e0 + self.d_e0))
-            self.f_e_look = max(-1.0, min(1.0, self.f_e_look + self.d_e0))
+            # Apply the last measured trend once per gap. Repeating the same
+            # derivative every blank frame drove dashed-line pose to saturation.
+            if not self.gap_prediction_consumed:
+                self.f_e0 = max(-1.0, min(1.0, self.f_e0 + self.d_e0))
+                self.f_e_look = max(-1.0, min(1.0, self.f_e_look + self.d_e0))
+                self.gap_prediction_consumed = True
+                self.d_e0 = 0.0
             self.f_conf = max(0.0, self.f_conf - t.conf_decay)
 
     # -- preview plan -------------------------------------------------------
@@ -321,12 +395,17 @@ class RaceStateMachine:
             self._clear_plan()
             return None
 
-        reliable_now = fit.found and fit.conf >= t.conf_predict and not fit.disconnected and fit.n_bands >= 3
+        reliable_now = (
+            fit.control_valid
+            and fit.conf >= t.conf_predict
+            and not fit.disconnected
+            and fit.n_bands >= 3
+        )
         if self.plan_active_since is not None and reliable_now and now - self.plan_active_since > 0.12:
             self._clear_plan()
             return None
 
-        weak_now = (not fit.found) or fit.conf < t.conf_predict
+        weak_now = (not fit.control_valid) or fit.conf < t.conf_predict
         blind_now = fit.disconnected and fit.n_bands <= 3
         if self.plan_active_since is None:
             if not (weak_now or blind_now):
@@ -412,3 +491,4 @@ class RaceStateMachine:
         self.stopped_reacquire_theta = None
         if state != RaceState.TRACK:
             self._clear_plan()
+            self._clear_line_identity()

@@ -10,12 +10,9 @@ from .vision import TrajectoryFit
 
 
 class CourseSession(str, Enum):
-    OBSTACLE = "obstacle"
     CORNER = "corner"
     RING_ENTRY = "ring_entry"
     RING_EXIT = "ring_exit"
-    FORK = "fork"
-    RETURN = "return"
     FINISHED = "finished"
     STOPPED = "stopped"
 
@@ -30,6 +27,7 @@ class DetectorKind(str, Enum):
     NONE = "none"
     CORNER = "corner"
     RING_ENTRY = "ring_entry"
+    RING_EXIT = "ring_exit"
 
 
 class ExecutorKind(str, Enum):
@@ -37,6 +35,7 @@ class ExecutorKind(str, Enum):
     CRUISE = "cruise"
     CORNER = "corner"
     RING_ENTRY = "ring_entry"
+    RING_EXIT = "ring_exit"
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,21 +48,15 @@ class FixedSessionMission:
     """Linear course progress and strict per-session detector gating."""
 
     ORDER = (
-        CourseSession.OBSTACLE,
         CourseSession.CORNER,
         CourseSession.RING_ENTRY,
         CourseSession.RING_EXIT,
-        CourseSession.FORK,
-        CourseSession.RETURN,
         CourseSession.FINISHED,
     )
     SESSION_MAP = {
-        CourseSession.OBSTACLE: SessionSpec(DetectorKind.NONE, ExecutorKind.CRUISE),
         CourseSession.CORNER: SessionSpec(DetectorKind.CORNER, ExecutorKind.CORNER),
         CourseSession.RING_ENTRY: SessionSpec(DetectorKind.RING_ENTRY, ExecutorKind.RING_ENTRY),
-        CourseSession.RING_EXIT: SessionSpec(DetectorKind.RING_ENTRY, ExecutorKind.RING_ENTRY),
-        CourseSession.FORK: SessionSpec(DetectorKind.NONE, ExecutorKind.CRUISE),
-        CourseSession.RETURN: SessionSpec(DetectorKind.NONE, ExecutorKind.CRUISE),
+        CourseSession.RING_EXIT: SessionSpec(DetectorKind.RING_EXIT, ExecutorKind.RING_EXIT),
         CourseSession.FINISHED: SessionSpec(DetectorKind.NONE, ExecutorKind.NONE),
         CourseSession.STOPPED: SessionSpec(DetectorKind.NONE, ExecutorKind.NONE),
     }
@@ -75,7 +68,7 @@ class FixedSessionMission:
         except ValueError as exc:
             raise ValueError(f"unsupported initial session: {cfg.initial_session}") from exc
         self.last_gate_reason = "not_evaluated"
-        self.ring_entry_alignment_frames = 0
+        self.ring_entry_takeover_frames = 0
         self.last_transition_event: MissionEvent | None = None
         self._initial_session = self.session
 
@@ -100,7 +93,8 @@ class FixedSessionMission:
         decision: CaptureGeometryDecision | None,
         observation: CaptureGeometryObservation | None = None,
         fit: TrajectoryFit | None = None,
-        incoming_ready: bool = True,
+        entry_takeover_ready: bool = True,
+        exit_selection_armed: bool = True,
     ) -> CaptureGeometryDecision | None:
         """Accept only the topology signature belonging to the current session.
 
@@ -109,11 +103,13 @@ class FixedSessionMission:
         reclassifies a generic event into another session.
         """
         if self.session == CourseSession.RING_ENTRY:
-            self.ring_entry_alignment_frames = (
-                self.ring_entry_alignment_frames + 1
-                if incoming_ready else 0
+            self.ring_entry_takeover_frames = (
+                self.ring_entry_takeover_frames + 1
+                if entry_takeover_ready else 0
             )
-        if decision is None or decision.kind not in {"turn", "corner", "ring_entry"}:
+        if decision is None or decision.kind not in {
+            "turn", "corner", "ring_entry", "ring_exit",
+        }:
             self.last_gate_reason = "no_turn_decision"
             return None
         if self.session == CourseSession.CORNER:
@@ -123,10 +119,7 @@ class FixedSessionMission:
             if decision.is_fork:
                 self.last_gate_reason = "corner_reject_fork"
                 return None
-            # The same physical bend changes from ``corner`` to ``curve`` as
-            # its rounded outer edge fills more of the image.  Shape labels
-            # are telemetry, not a stable mission boundary.
-            if observation is not None and observation.kind not in {"corner", "curve"}:
+            if observation is not None and observation.kind != "corner":
                 self.last_gate_reason = f"corner_reject_kind_{observation.kind}"
                 return None
             # Mirror the pre-existing CornerCommandDelay ownership check so
@@ -152,8 +145,8 @@ class FixedSessionMission:
             if decision.vertex_y_frac is None or not 0.35 <= decision.vertex_y_frac <= 0.76:
                 self.last_gate_reason = "ring_entry_reject_vertex"
                 return None
-            if self.ring_entry_alignment_frames < 3:
-                self.last_gate_reason = "ring_entry_reject_incoming_alignment"
+            if self.ring_entry_takeover_frames < 3:
+                self.last_gate_reason = "ring_entry_reject_takeover_readiness"
                 return None
             if fit is not None and (not fit.found or fit.n_bands < 3 or fit.conf < 0.30):
                 self.last_gate_reason = "ring_entry_reject_track_quality"
@@ -173,7 +166,10 @@ class FixedSessionMission:
             self.last_gate_reason = "ring_entry_single_path_accepted"
             return decision
         if self.session == CourseSession.RING_EXIT:
-            if decision.kind != "ring_entry":
+            if not exit_selection_armed:
+                self.last_gate_reason = "ring_exit_waiting_arm_distance"
+                return None
+            if decision.kind != "ring_exit":
                 self.last_gate_reason = "ring_exit_reject_wrong_detector"
                 return None
             if observation is None or not observation.is_fork:
@@ -190,12 +186,12 @@ class FixedSessionMission:
     def transition(self, event: MissionEvent) -> CourseSession:
         if event == MissionEvent.MISSION_RESET:
             self.session = self._initial_session
-            self.ring_entry_alignment_frames = 0
+            self.ring_entry_takeover_frames = 0
             self.last_transition_event = event
             return self.session
         if event == MissionEvent.MISSION_COMPLETED:
             self.session = CourseSession.FINISHED
-            self.ring_entry_alignment_frames = 0
+            self.ring_entry_takeover_frames = 0
             self.last_transition_event = event
             return self.session
         if event != MissionEvent.PHASE_COMPLETED:
@@ -206,7 +202,7 @@ class FixedSessionMission:
             return self.session
         if index + 1 < len(self.ORDER):
             self.session = self.ORDER[index + 1]
-        self.ring_entry_alignment_frames = 0
+        self.ring_entry_takeover_frames = 0
         self.last_transition_event = event
         return self.session
 

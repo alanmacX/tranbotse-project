@@ -20,6 +20,7 @@ class MotionSample:
     linear: float
     angular: float
     source: str
+    fresh: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,14 +68,14 @@ class FirstEntryLineLatch:
         if self.latched or direction == 0:
             return False
         strong = bool(
-            fit.found
+            fit.control_valid
             and fit.conf >= 0.30
             and fit.n_bands >= 3
             and abs(fit.theta) <= 0.95
         )
         side = direction * fit.e0
         weak_first_entry = bool(
-            fit.found
+            fit.control_valid
             and fit.conf >= 0.15
             and fit.n_bands >= 1
             and abs(fit.e0) >= 0.45
@@ -107,7 +108,7 @@ class FirstEntryLineLatch:
         if not self.latched:
             return False
         continuous = bool(
-            fit.found
+            fit.control_valid
             # Confirmation is also the cruise handoff frame, so it must meet
             # the same completeness contract as RaceStateMachine.  A weaker
             # or disconnected fragment may stop the coarse pivot provisionally
@@ -137,10 +138,19 @@ def read_motion_sample(bot: object, fallback_v: float, fallback_w: float) -> Mot
                 stale_linear = abs(fallback_v) > 0.01 and abs(linear) < 0.002
                 stale_angular = abs(fallback_w) > 0.03 and abs(angular) < 0.005
                 if valid and not (stale_linear or stale_angular):
-                    return MotionSample(linear, angular, "measured")
+                    # The installed Transbot API returns only (v, w), without a
+                    # timestamp or sequence. Such a sample may still be a
+                    # frozen old value, so it cannot certify physical stop.
+                    fresh = bool(len(value) >= 3 and value[2] is True)
+                    return MotionSample(
+                        linear,
+                        angular,
+                        "measured" if fresh else "measured_unverified",
+                        fresh,
+                    )
         except Exception:
             pass
-    return MotionSample(float(fallback_v), float(fallback_w), "command_fallback")
+    return MotionSample(float(fallback_v), float(fallback_w), "command_fallback", False)
 
 
 def _corner_observation(
@@ -296,9 +306,7 @@ class CornerCommandDelay:
                     self.state = "approach"
                     self.candidate_dir = geometry_decision.direction
                     self.event_shape = (
-                        "fork"
-                        if geometry_decision.is_fork
-                        else geometry.kind if geometry is not None else "corner"
+                        "fork" if geometry_decision.is_fork else "corner"
                     )
                     self.capture_votes = geometry_decision.votes
                     self.hold_v = self.stable_v if self.stable_v > 0.01 else max(0.0, command_v)
@@ -795,7 +803,7 @@ class CornerCommandDelay:
 
     def _reacquire_valid(self, fit: TrajectoryFit) -> bool:
         return bool(
-            fit.found
+            fit.control_valid
             and fit.conf >= 0.65
             and fit.n_bands >= 3
             and not fit.disconnected
@@ -814,7 +822,7 @@ class CornerCommandDelay:
         RaceStateMachine owns the actual alignment after handoff.
         """
         return bool(
-            fit.found
+            fit.control_valid
             and fit.conf >= self.handoff_conf_min
             and fit.n_bands >= 3
             and not fit.disconnected
@@ -837,7 +845,7 @@ class CornerCommandDelay:
     def _latched_exit_trackable(self, fit: TrajectoryFit) -> bool:
         """The already-selected first exit is close enough for slow control."""
         return bool(
-            fit.found
+            fit.control_valid
             and fit.conf >= self.handoff_conf_min
             and fit.n_bands >= 3
             and not fit.disconnected
@@ -863,7 +871,7 @@ class CornerCommandDelay:
         """
         return bool(
             self.candidate_dir != 0
-            and fit.found
+            and fit.control_valid
             and fit.conf >= 0.55
             and fit.n_bands >= 4
             and not fit.disconnected
@@ -889,6 +897,10 @@ class CornerCommandDelay:
         dt = max(0.0, min(self.cfg.max_motion_dt_sec, now - self.last_now))
         self.last_now = now
         return max(0.0, linear) * dt, angular * dt * max(0.0, angular_scale)
+
+    def pause(self, now: float) -> None:
+        """Advance the clock without integrating a safety-hold interval."""
+        self.last_now = float(now)
 
     def _turn_command_w(self, invert_turn: bool) -> float:
         sign = -self.candidate_dir

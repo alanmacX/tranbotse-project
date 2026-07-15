@@ -16,13 +16,13 @@ def command(v=0.06, w=0.1):
 def test_safety_stop_preserves_owner_and_candidate():
     arbiter = CommandArbiter(max_v=0.1, max_w=0.3)
     result = arbiter.resolve(
-        command(), owner=ControlOwner.RING_EXECUTOR, stop_cause=StopCause.OBSTACLE,
+        command(), owner=ControlOwner.RING_EXECUTOR, stop_cause=StopCause.ROUTE_LOST,
     )
     assert result.owner == ControlOwner.RING_EXECUTOR
     assert result.candidate.v == 0.06
     assert result.final.v == result.final.w == 0.0
     assert result.safety_state == SafetyState.STOP_LATCHED
-    assert result.stop_cause == StopCause.OBSTACLE
+    assert result.stop_cause == StopCause.ROUTE_LOST
 
 
 def test_slow_override_does_not_destroy_candidate_reason():
@@ -45,13 +45,15 @@ def test_owner_epoch_changes_only_when_owner_changes():
     assert third.owner_epoch == second.owner_epoch + 1
 
 
-def test_invalid_command_is_stopped():
+def test_invalid_command_is_stopped_without_accepting_owner():
     arbiter = CommandArbiter(max_v=0.1, max_w=0.3)
     result = arbiter.resolve(
         command(v=math.nan), owner=ControlOwner.CRUISE,
     )
     assert result.stop_cause == StopCause.INVALID_COMMAND
     assert result.final.v == result.final.w == 0.0
+    assert result.owner == ControlOwner.NONE
+    assert result.owner_epoch == 0
 
 
 def test_out_of_bounds_command_is_stopped():
@@ -71,13 +73,4 @@ def test_hard_stop_stays_latched_until_explicit_clear():
     assert still_stopped.final.v == 0.0
     arbiter.clear_stop(StopCause.ROUTE_LOST)
     clear = arbiter.resolve(command(), owner=ControlOwner.RING_EXECUTOR)
-    assert clear.safety_state == SafetyState.CLEAR
-
-
-def test_obstacle_stop_auto_clears_when_debounced_request_clears():
-    arbiter = CommandArbiter(max_v=0.1, max_w=0.3)
-    arbiter.resolve(
-        command(), owner=ControlOwner.CRUISE, stop_cause=StopCause.OBSTACLE,
-    )
-    clear = arbiter.resolve(command(), owner=ControlOwner.CRUISE)
     assert clear.safety_state == SafetyState.CLEAR

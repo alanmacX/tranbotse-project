@@ -10,6 +10,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tarfile
 import time
 from collections import deque
 from dataclasses import asdict
@@ -49,9 +50,7 @@ UI_STATE = {
     "live_max_sec": 60,
 }
 RUN_PROCS: set[subprocess.Popen] = set()
-VIDEO_PROCS: set[subprocess.Popen] = set()
 RUN_LOCK = threading.Lock()
-VIDEO_LOCK = threading.Lock()
 RUN_LOGS: deque[str] = deque(maxlen=240)
 LOG_LOCK = threading.Lock()
 DEBUG_LOG_LOCK = threading.Lock()
@@ -67,6 +66,30 @@ TELEMETRY_SUBSCRIBERS: set[queue.Queue] = set()
 MOCK_LOCK = threading.Lock()
 MOCK_THREAD: threading.Thread | None = None
 MOCK_STOP = threading.Event()
+LIVE_FRAME_LOCK = threading.Condition()
+LIVE_FRAME_JPEG: bytes | None = None
+LIVE_FRAME_TIMESTAMP = 0.0
+LIVE_FRAME_RECEIVED_AT = 0.0
+CURRENT_RUN_LOCK = threading.Lock()
+CURRENT_RUN_REL: str | None = None
+
+
+def _publish_live_frame(jpeg: bytes, timestamp: float) -> None:
+    global LIVE_FRAME_JPEG, LIVE_FRAME_TIMESTAMP, LIVE_FRAME_RECEIVED_AT
+    with LIVE_FRAME_LOCK:
+        LIVE_FRAME_JPEG = jpeg
+        LIVE_FRAME_TIMESTAMP = timestamp
+        LIVE_FRAME_RECEIVED_AT = time.monotonic()
+        LIVE_FRAME_LOCK.notify_all()
+
+
+def _clear_live_frame() -> None:
+    global LIVE_FRAME_JPEG, LIVE_FRAME_TIMESTAMP, LIVE_FRAME_RECEIVED_AT
+    with LIVE_FRAME_LOCK:
+        LIVE_FRAME_JPEG = None
+        LIVE_FRAME_TIMESTAMP = 0.0
+        LIVE_FRAME_RECEIVED_AT = 0.0
+        LIVE_FRAME_LOCK.notify_all()
 
 
 def _publish_telemetry(sample: dict) -> None:
@@ -343,7 +366,7 @@ def _tuple_value(value: object, *, cast=int) -> tuple:
 def _deep_update_cfg(cfg: RaceConfig, data: dict) -> None:
     for section_name in (
         "camera", "vision", "occlusion",
-        "path_memory", "ground_projection", "mission", "obstacle", "tracker",
+        "path_memory", "ground_projection", "mission", "tracker",
     ):
         section = getattr(cfg, section_name)
         values = data.get(section_name)
@@ -487,17 +510,24 @@ def _append_debug_log(path: Path | None, message: str) -> None:
             f.write(f"[{stamp}] {message}\n")
 
 
-def _pull_remote_debug(ssh_target: str, remote_rel: str | None, debug_log_path: Path | None = None) -> None:
+def _pull_remote_debug(
+    ssh_target: str,
+    remote_rel: str | None,
+    debug_log_path: Path | None = None,
+) -> Path | None:
     if not remote_rel:
-        return
+        return None
     remote_path = f"{REMOTE_ROOT}/{remote_rel}"
     local_path = ROOT / remote_rel
     local_path.parent.mkdir(parents=True, exist_ok=True)
     _append_debug_log(debug_log_path, f"debug pull start: {ssh_target}:{remote_path}")
 
     try:
+        # OpenSSH joins trailing argv into one remote command. Passing
+        # ``sh -lc`` as separate argv made the test expression become the
+        # login shell's argv[0], so every existing run was reported missing.
         check = subprocess.run(
-            ["ssh", ssh_target, "sh", "-lc", f"test -d {shlex.quote(remote_path)}"],
+            ["ssh", ssh_target, f"test -d {shlex.quote(remote_path)}"],
             cwd=ROOT,
             text=True,
             stdout=subprocess.PIPE,
@@ -505,17 +535,20 @@ def _pull_remote_debug(ssh_target: str, remote_rel: str | None, debug_log_path: 
             timeout=10,
         )
         if check.returncode != 0:
-            message = f"DEBUG PULL SKIPPED: remote dir missing {remote_path}"
+            detail = (check.stderr or check.stdout).strip()
+            message = (
+                f"DEBUG PULL FAILED: remote check returned {check.returncode} for "
+                f"{remote_path}"
+                + (f": {detail}" if detail else "")
+            )
             _log_event(message)
             _append_debug_log(debug_log_path, message)
-            return
+            return None
 
         pack = subprocess.run(
             [
                 "ssh",
                 ssh_target,
-                "sh",
-                "-lc",
                 f"cd {shlex.quote(REMOTE_ROOT)} && tar -czf - {shlex.quote(remote_rel)}",
             ],
             cwd=ROOT,
@@ -528,7 +561,7 @@ def _pull_remote_debug(ssh_target: str, remote_rel: str | None, debug_log_path: 
             message = f"DEBUG PULL FAILED: {detail}"
             _log_event(message)
             _append_debug_log(debug_log_path, message)
-            return
+            return None
 
         extract = subprocess.run(
             ["tar", "-xzf", "-", "-C", str(ROOT)],
@@ -541,14 +574,15 @@ def _pull_remote_debug(ssh_target: str, remote_rel: str | None, debug_log_path: 
             message = f"DEBUG EXTRACT FAILED: {extract.stderr.decode('utf-8', errors='replace').strip()}"
             _log_event(message)
             _append_debug_log(debug_log_path, message)
-            return
+            return None
     except Exception as exc:
         message = f"DEBUG PULL ERROR: {exc}"
         _log_event(message)
         _append_debug_log(debug_log_path, message)
-        return
+        return None
     _log_event(f"DEBUG SAVED: {local_path}")
     _append_debug_log(debug_log_path, f"debug saved: {local_path}")
+    return local_path
 
 
 def _watch_runner_exit(
@@ -560,6 +594,7 @@ def _watch_runner_exit(
     code = proc.wait()
     with RUN_LOCK:
         RUN_PROCS.discard(proc)
+    _clear_live_frame()
     _log_event(f"RUNNER EXITED: code={code}")
     _append_debug_log(debug_log_path, f"runner exited: code={code}")
     if debug_remote_rel:
@@ -578,6 +613,13 @@ def _read_process_stream(proc: subprocess.Popen, stream_name: str, debug_log_pat
         else:
             text = line.rstrip()
         if text:
+            if stream_name == "stdout" and text.startswith("LIVE_FRAME "):
+                try:
+                    _prefix, _remote_timestamp, payload = text.split(" ", 2)
+                    _publish_live_frame(base64.b64decode(payload, validate=True), time.time())
+                except (ValueError, TypeError):
+                    _log_event("stdout: invalid live frame payload")
+                continue
             _log_event(f"{stream_name}: {text}")
             _append_debug_log(debug_log_path, f"{stream_name}: {text}")
             if stream_name == "stdout" and text.startswith("{"):
@@ -639,7 +681,12 @@ def _check_remote_runner(ssh_target: str) -> None:
 
 def _sync_live_files(ssh_target: str) -> None:
     package = "transbot_race apps/race_runner.py configs/race_config.json " + LIVE_CONFIG_REL
-    cmd = f"tar -czf - {package} | ssh {ssh_target} 'mkdir -p {REMOTE_ROOT} && tar -xzf - -C {REMOTE_ROOT}'"
+    cmd = (
+        "COPYFILE_DISABLE=1 tar --no-xattrs --exclude='._*' "
+        "--exclude='.DS_Store' --exclude='__pycache__' "
+        f"-czf - {package} | ssh {ssh_target} "
+        f"'mkdir -p {REMOTE_ROOT} && tar -xzf - -C {REMOTE_ROOT}'"
+    )
     res = subprocess.run(cmd, cwd=ROOT, shell=True, text=True, capture_output=True, timeout=45)
     if res.returncode != 0:
         raise RuntimeError(res.stderr.strip() or res.stdout.strip() or "live code sync failed")
@@ -660,7 +707,8 @@ def _apply_profile(profile: str) -> tuple[str, str]:
 
 def _reset_legacy_single_state_defaults() -> None:
     UI_STATE.update({"cam1": 90, "cam2": 12, "j1": 55, "j2": 205, "j3": 45, "arm_ms": 1200, "live_max_sec": 60})
-    CONFIG.camera.crop = (300, 265, 430, 455)
+    CONFIG.camera.crop = (300, 265, 430, 442)
+    CONFIG.camera.control_bottom_trim_px = 22
     CONFIG.camera.expand_left_px = 20
     CONFIG.camera.expand_right_px = 140
     CONFIG.vision.percentile = 32
@@ -693,7 +741,7 @@ def _reset_legacy_single_state_defaults() -> None:
 
 
 def stop_live_processes(ssh_target: str) -> None:
-    release_video_processes()
+    _clear_live_frame()
     with RUN_LOCK:
         for proc in list(RUN_PROCS):
             if proc.poll() is None:
@@ -718,36 +766,82 @@ def stop_live_processes(ssh_target: str) -> None:
             capture_output=True,
             timeout=12,
         )
-        _log_event("STOP: remote runner/video killed, chassis zeroed 30x")
+        _log_event("STOP: remote runner killed, chassis zeroed 30x")
     except Exception:
         _log_event("STOP: local runner stopped; remote stop command failed")
 
 
-def release_video_processes(ssh_target: str | None = None) -> None:
-    with VIDEO_LOCK:
-        procs = list(VIDEO_PROCS)
-        VIDEO_PROCS.clear()
-    for proc in procs:
-        if proc.poll() is None:
-            proc.terminate()
+def _live_debug_root() -> Path:
+    return (ROOT / DEBUG_REMOTE_ROOT_REL).resolve()
+
+
+def _current_run_dir() -> Path | None:
+    with CURRENT_RUN_LOCK:
+        current = CURRENT_RUN_REL
+    if current is not None:
+        raw_candidate = ROOT / current
+        candidate = raw_candidate.resolve()
+        root = _live_debug_root()
+        if (
+            not raw_candidate.is_symlink()
+            and candidate != root
+            and root in candidate.parents
+            and candidate.is_dir()
+        ):
+            return candidate
+    root = _live_debug_root()
+    if not root.is_dir():
+        return None
+    candidates = [path for path in root.iterdir() if path.is_dir() and not path.is_symlink()]
+    # Run names begin with YYYYMMDD-HHMMSS. Pulling an older run updates local
+    # mtimes, so mtime can no longer identify the latest remote session.
+    return max(candidates, key=lambda path: path.name, default=None)
+
+
+def _archive_member_paths(run_dir: Path) -> list[Path]:
+    root = _live_debug_root()
+    resolved = run_dir.resolve()
+    if resolved == root or root not in resolved.parents or not resolved.is_dir():
+        raise ValueError("run directory is outside artifacts/live_debug")
+    members: list[Path] = []
+    for path in resolved.rglob("*"):
+        if path.is_symlink():
+            raise ValueError("run archive contains a symlink")
+        if path.is_file():
+            target = path.resolve()
+            if root not in target.parents:
+                raise ValueError("run archive member escapes artifacts/live_debug")
+            members.append(path)
+    return members
+
+
+def _run_summaries() -> list[dict]:
+    root = _live_debug_root()
+    if not root.is_dir():
+        return []
+    runs = []
+    for path in root.iterdir():
+        if path.is_symlink() or not path.is_dir():
+            continue
+        resolved = path.resolve()
+        if root not in resolved.parents:
+            continue
+        stat = path.stat()
+        manifest = path / "manifest.json"
+        frames_saved = None
+        if manifest.is_file() and not manifest.is_symlink():
             try:
-                proc.wait(timeout=0.8)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-    if ssh_target:
-        subprocess.run(
-            [
-                "ssh",
-                ssh_target,
-                "sh",
-                "-lc",
-                "ps -eo pid=,args= | awk '$0 ~ /python3 -u -/ {print $1}' | xargs -r kill",
-            ],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=4,
-        )
+                frames_saved = json.loads(manifest.read_text(encoding="utf-8")).get(
+                    "frames_saved",
+                )
+            except (OSError, ValueError, TypeError):
+                frames_saved = None
+        runs.append({
+            "name": path.name,
+            "modified_at": stat.st_mtime,
+            "frames_saved": frames_saved,
+        })
+    return sorted(runs, key=lambda item: item["modified_at"], reverse=True)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -755,34 +849,63 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def do_GET(self) -> None:
-        if self.path == "/":
-            raw = HTML.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(raw)))
+        from urllib.parse import urlparse
+
+        path = urlparse(self.path).path
+        if path == "/":
+            self.send_response(302)
+            self.send_header("Location", "/ui/")
+            self.send_header("Content-Length", "0")
             self.end_headers()
-            self.wfile.write(raw)
             return
-        if self.path == "/api/config":
+        if path == "/api/config":
             _json_response(self, 200, _config_payload())
             return
-        if self.path == "/api/live/logs":
+        if path == "/api/live/logs":
             with LOG_LOCK:
                 logs = list(RUN_LOGS)
             _json_response(self, 200, {"ok": True, "logs": logs})
             return
-        if self.path == "/api/telemetry/latest":
+        if path == "/api/run/current":
+            run_dir = _current_run_dir()
+            with RUN_LOCK:
+                running = any(proc.poll() is None for proc in RUN_PROCS)
+            with LIVE_FRAME_LOCK:
+                frame_age = (
+                    None
+                    if LIVE_FRAME_JPEG is None
+                    else max(0.0, time.monotonic() - LIVE_FRAME_RECEIVED_AT)
+                )
+            _json_response(self, 200, {
+                "ok": True,
+                "running": running,
+                "run": None if run_dir is None else run_dir.name,
+                "download_available": run_dir is not None,
+                "sync_available": run_dir is not None,
+                "frame_age_sec": None if frame_age is None else round(frame_age, 3),
+            })
+            return
+        if path == "/api/runs":
+            _json_response(self, 200, {"ok": True, "runs": _run_summaries()})
+            return
+        if path == "/api/frame/latest":
+            self.latest_frame()
+            return
+        if path == "/api/run/current/archive":
+            self.download_current_run()
+            return
+        if path == "/api/telemetry/latest":
             with TELEMETRY_LOCK:
                 latest = dict(TELEMETRY_LATEST)
             _json_response(self, 200, {"ok": True, "sample": latest})
             return
-        if self.path == "/api/telemetry":
+        if path == "/api/telemetry":
             self.stream_telemetry()
             return
-        if self.path == "/ui" or self.path.startswith("/ui/"):
-            self.serve_static()
+        if path == "/ui" or path.startswith("/ui/"):
+            self.serve_static(path)
             return
-        if self.path.startswith("/video"):
+        if path == "/video":
             self.stream_video()
             return
         self.send_error(404)
@@ -815,6 +938,12 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/live/stop":
                 _json_response(self, 200, self._stop_live(data))
                 return
+            if self.path == "/api/live/clear-route-loss":
+                _json_response(self, 200, self._clear_route_loss(data))
+                return
+            if self.path == "/api/run/current/sync":
+                _json_response(self, 200, self._sync_current_run(data))
+                return
             if self.path == "/api/calibration/capture":
                 _json_response(self, 200, self._calibration_capture(data))
                 return
@@ -845,6 +974,25 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             _log_event(f"ERROR: {exc}")
             _json_response(self, 500, {"ok": False, "error": str(exc)})
+
+    def _sync_current_run(self, data: dict) -> dict:
+        run_dir = _current_run_dir()
+        if run_dir is None:
+            raise RuntimeError("没有可同步的 Debug run")
+        ssh_target = _ssh_target(data)
+        remote_rel = f"{DEBUG_REMOTE_ROOT_REL}/{run_dir.name}"
+        local_path = _pull_remote_debug(
+            ssh_target,
+            remote_rel,
+            run_dir / "backend.log",
+        )
+        if local_path is None:
+            raise RuntimeError("Debug 同步失败，详情见 backend.log")
+        return {
+            "ok": True,
+            "message": f"Debug 已同步到 {local_path}",
+            "debug_path": str(local_path),
+        }
 
     def _analyze(self, data: dict) -> dict:
         path = Path(str(data.get("image_path", "artifacts/baseline/line_follow_demo_result.jpg")))
@@ -961,6 +1109,7 @@ class Handler(BaseHTTPRequestHandler):
         return {"ok": True, "message": f"deployed integrated race code to {ssh_target}:{REMOTE_ROOT}"}
 
     def _start_live(self, data: dict) -> dict:
+        global CURRENT_RUN_REL
         ssh_target = _ssh_target(data)
         max_sec = max(1.0, min(300.0, float(data.get("max_sec", 60))))
         profile = str(data.get("profile", "final"))
@@ -977,9 +1126,6 @@ class Handler(BaseHTTPRequestHandler):
         snapshot = _config_snapshot()
         try:
             effective_profile, profile_note = _apply_profile(profile)
-            # The normal/final race button always runs the fixed course. Legacy
-            # global-turn mode remains available only for explicit diagnostics.
-            CONFIG.path_memory.mode = "fixed_sessions"
             _write_live_config_file()
         finally:
             _config_restore(snapshot)
@@ -991,6 +1137,8 @@ class Handler(BaseHTTPRequestHandler):
             debug_local_path = ROOT / debug_remote_rel
             debug_local_path.mkdir(parents=True, exist_ok=True)
             debug_log_path = debug_local_path / "backend.log"
+            with CURRENT_RUN_LOCK:
+                CURRENT_RUN_REL = debug_remote_rel
             _append_debug_log(debug_log_path, f"debug capture start: profile={profile}, max_sec={max_sec:.1f}, target={ssh_target}")
             _log_event(f"DEBUG CAPTURE: {debug_local_path}")
             debug_args = (
@@ -999,7 +1147,8 @@ class Handler(BaseHTTPRequestHandler):
             )
         command = (
             f"cd {REMOTE_ROOT} && "
-            f"python3 -u apps/race_runner.py --config {LIVE_CONFIG_REL} --max-sec {max_sec:.1f}{debug_args}"
+            f"python3 -u apps/race_runner.py --config {LIVE_CONFIG_REL} "
+            f"--max-sec {max_sec:.1f} --publish-live-frames{debug_args}"
         )
         proc = subprocess.Popen(
             ["ssh", ssh_target, command],
@@ -1033,6 +1182,27 @@ class Handler(BaseHTTPRequestHandler):
         stop_live_processes(ssh_target)
         return {"ok": True, "message": "stop sent"}
 
+    def _clear_route_loss(self, data: dict) -> dict:
+        ssh_target = _ssh_target(data)
+        res = subprocess.run(
+            [
+                "ssh",
+                ssh_target,
+                "sh",
+                "-lc",
+                "pkill -USR1 -f 'apps/race_runner.py'",
+            ],
+            text=True,
+            capture_output=True,
+            timeout=6,
+        )
+        if res.returncode != 0:
+            raise RuntimeError(
+                (res.stderr or res.stdout or "runner is not active").strip()
+            )
+        _log_event("OPERATOR CLEAR: route-loss request sent")
+        return {"ok": True, "message": "已发送路线丢失恢复请求"}
+
     def stream_telemetry(self) -> None:
         sub: queue.Queue = queue.Queue(maxsize=64)
         with TELEMETRY_LOCK:
@@ -1064,8 +1234,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
         self.wfile.flush()
 
-    def serve_static(self) -> None:
-        rel = self.path[len("/ui"):].lstrip("/") or "index.html"
+    def serve_static(self, request_path: str) -> None:
+        rel = request_path[len("/ui"):].lstrip("/") or "index.html"
         target = (WEB_ROOT / rel).resolve()
         root = WEB_ROOT.resolve()
         if target != root and root not in target.parents:
@@ -1083,66 +1253,76 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    def stream_video(self) -> None:
-        ssh_target = SSH_TARGET
-        if "?" in self.path:
-            from urllib.parse import parse_qs, urlparse
-
-            query = parse_qs(urlparse(self.path).query)
-            ssh_target = _ssh_target({"ssh_target": query.get("ssh_target", [SSH_TARGET])[0]})
-        release_video_processes(ssh_target)
-        _log_event(f"VIDEO: connecting {ssh_target}")
-        code = r"""
-import cv2 as cv, sys, time
-cap = cv.VideoCapture(0)
-cap.set(cv.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv.CAP_PROP_FRAME_HEIGHT, 480)
-if not cap.isOpened():
-    raise SystemExit('camera open failed')
-while True:
-    ok, frame = cap.read()
-    if not ok:
-        time.sleep(0.05)
-        continue
-    ok, buf = cv.imencode('.jpg', frame, [int(cv.IMWRITE_JPEG_QUALITY), 72])
-    if not ok:
-        continue
-    data = buf.tobytes()
-    sys.stdout.buffer.write(b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ' + str(len(data)).encode() + b'\r\n\r\n' + data + b'\r\n')
-    sys.stdout.buffer.flush()
-    time.sleep(0.08)
-"""
-        proc = subprocess.Popen(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4", ssh_target, "python3", "-u", "-"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        with VIDEO_LOCK:
-            VIDEO_PROCS.add(proc)
-        threading.Thread(target=_read_process_stream, args=(proc, "stderr"), daemon=True).start()
-        assert proc.stdin is not None
-        proc.stdin.write(code.encode("utf-8"))
-        proc.stdin.close()
+    def download_current_run(self) -> None:
+        run_dir = _current_run_dir()
+        if run_dir is None:
+            self.send_error(404, "no debug run is available")
+            return
+        try:
+            members = _archive_member_paths(run_dir)
+        except ValueError as exc:
+            self.send_error(403, str(exc))
+            return
+        filename = f"{run_dir.name}.tar.gz"
         self.send_response(200)
-        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Content-Type", "application/gzip")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         try:
-            assert proc.stdout is not None
+            with tarfile.open(fileobj=self.wfile, mode="w|gz") as archive:
+                for member in members:
+                    archive.add(member, arcname=str(Path(run_dir.name) / member.relative_to(run_dir)), recursive=False)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def latest_frame(self) -> None:
+        with LIVE_FRAME_LOCK:
+            jpeg = LIVE_FRAME_JPEG
+            source_timestamp = LIVE_FRAME_TIMESTAMP
+            received_at = LIVE_FRAME_RECEIVED_AT
+        if jpeg is None:
+            _json_response(self, 503, {"ok": False, "error": "runner has not published a frame"})
+            return
+        age = max(0.0, time.monotonic() - received_at)
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(jpeg)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Source-Timestamp", f"{source_timestamp:.6f}")
+        self.send_header("X-Frame-Age-Sec", f"{age:.3f}")
+        self.end_headers()
+        self.wfile.write(jpeg)
+
+    def stream_video(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        seen_timestamp = -1.0
+        try:
             while True:
-                chunk = proc.stdout.read(8192)
-                if not chunk:
-                    break
-                try:
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
-                    break
-        finally:
-            proc.terminate()
-            with VIDEO_LOCK:
-                VIDEO_PROCS.discard(proc)
+                with LIVE_FRAME_LOCK:
+                    LIVE_FRAME_LOCK.wait_for(
+                        lambda: LIVE_FRAME_TIMESTAMP > seen_timestamp,
+                        timeout=5.0,
+                    )
+                    jpeg = LIVE_FRAME_JPEG
+                    timestamp = LIVE_FRAME_TIMESTAMP
+                if jpeg is None or timestamp <= seen_timestamp:
+                    continue
+                seen_timestamp = timestamp
+                self.wfile.write(
+                    b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                    + str(len(jpeg)).encode("ascii")
+                    + b"\r\n\r\n"
+                    + jpeg
+                    + b"\r\n"
+                )
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
 
 def main() -> None:

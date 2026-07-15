@@ -7,7 +7,7 @@ import math
 import cv2 as cv
 import numpy as np
 
-from .config import RaceConfig
+from .config import RaceConfig, StageGeometryConfig
 from .vision import preprocess_blackline
 
 
@@ -40,10 +40,10 @@ class CaptureGeometryDecision:
 
 @dataclass(frozen=True, slots=True)
 class CaptureGeometryDebug:
-    roi: np.ndarray
-    mask: np.ndarray
-    component: np.ndarray
-    skeleton: np.ndarray
+    roi: np.ndarray | None
+    mask: np.ndarray | None
+    component: np.ndarray | None
+    skeleton: np.ndarray | None
     path: tuple[tuple[int, int], ...]
     candidate_paths: tuple[tuple[tuple[int, int], ...], ...]
     candidate_directions: tuple[int, ...]
@@ -51,10 +51,14 @@ class CaptureGeometryDebug:
     roi_y0: int
 
 
-def _floor_roi(frame: np.ndarray, cfg: RaceConfig) -> tuple[np.ndarray, int]:
-    y0 = max(0, int(cfg.camera.crop[1]) - cfg.path_memory.geometry_roi_top_offset_px)
+def _floor_roi(
+    frame: np.ndarray,
+    cfg: RaceConfig,
+    geometry_cfg: StageGeometryConfig,
+) -> tuple[np.ndarray, int]:
+    y0 = max(0, int(cfg.camera.crop[1]) - geometry_cfg.roi_top_offset_px)
     y1 = min(frame.shape[0], max(int(cfg.camera.crop[3]) + 20, frame.shape[0] - 10))
-    return frame[y0:y1].copy(), y0
+    return frame[y0:y1], y0
 
 
 def _select_anchor_component(mask: np.ndarray, center_x: float, trim_px: int) -> np.ndarray:
@@ -82,7 +86,11 @@ def _select_anchor_component(mask: np.ndarray, center_x: float, trim_px: int) ->
     return np.where(labels == best_label, 255, 0).astype(np.uint8)
 
 
-def _geometry_mask(roi: np.ndarray, cfg: RaceConfig) -> np.ndarray:
+def _geometry_mask(
+    roi: np.ndarray,
+    cfg: RaceConfig,
+    geometry_cfg: StageGeometryConfig,
+) -> np.ndarray:
     # Geometry keeps the strict reflection guard.  The anchor-scoped exemption
     # is only for cruise crops, where the incoming track centre is known; a
     # wider geometry ROI also contains walls and stage furniture.
@@ -92,7 +100,7 @@ def _geometry_mask(roi: np.ndarray, cfg: RaceConfig) -> np.ndarray:
     # floor.  Those long dark seams can connect to the tape in perspective and
     # become a synthetic left/right arm.  Keep a small look-ahead allowance,
     # then make the non-floor strip ineligible in both mask paths.
-    floor_top = max(0, int(cfg.path_memory.geometry_roi_top_offset_px) - 20)
+    floor_top = max(0, int(geometry_cfg.roi_top_offset_px) - 20)
     if floor_top:
         primary[:floor_top] = 0
     # Never fall back to a raw global intensity percentile here.  In low light
@@ -295,12 +303,34 @@ def _path_exit_direction(path: list[tuple[int, int]]) -> int:
 
 
 def analyze_capture_geometry(
-    frame: np.ndarray, cfg: RaceConfig,
+    frame: np.ndarray,
+    cfg: RaceConfig,
+    *,
+    route_direction: int | None = None,
+    include_debug_images: bool = True,
+    geometry_cfg: StageGeometryConfig | None = None,
 ) -> tuple[CaptureGeometryObservation, CaptureGeometryDebug]:
-    roi, roi_y0 = _floor_roi(frame, cfg)
+    geometry_cfg = geometry_cfg or StageGeometryConfig(
+        cfg.path_memory.geometry_roi_top_offset_px,
+        cfg.path_memory.geometry_chassis_trim_px,
+    )
+    # Threshold in the calibrated common ROI so stage-local trimming cannot
+    # change percentiles or reflection guards. Then remove only rows that the
+    # common mask already marks non-drivable. This preserves visual decisions
+    # while reducing downstream component/skeleton work.
+    common_geometry_cfg = StageGeometryConfig(
+        cfg.path_memory.geometry_roi_top_offset_px,
+        geometry_cfg.chassis_trim_px,
+    )
+    common_roi, common_roi_y0 = _floor_roi(frame, cfg, common_geometry_cfg)
+    common_mask = _geometry_mask(common_roi, cfg, common_geometry_cfg)
+    requested_y0 = max(0, int(cfg.camera.crop[1]) - geometry_cfg.roi_top_offset_px)
+    top_trim = max(0, requested_y0 - common_roi_y0)
+    roi = common_roi[top_trim:]
+    roi_y0 = common_roi_y0 + top_trim
     center_x = 0.5 * (float(cfg.camera.crop[0]) + float(cfg.camera.crop[2]))
-    trim = cfg.path_memory.geometry_chassis_trim_px
-    mask = _geometry_mask(roi, cfg)
+    trim = geometry_cfg.chassis_trim_px
+    mask = common_mask[top_trim:]
     mask[-trim:] = 0
     component = _select_anchor_component(mask, center_x, trim)
     skeleton = _zhang_suen_skeleton(component)
@@ -321,7 +351,11 @@ def analyze_capture_geometry(
         3 <= len(endpoints) <= 4
         and {-1, 1}.issubset(available_directions)
     )
-    desired_direction = 1 if cfg.path_memory.roundabout_direction >= 0 else -1
+    selected_direction = (
+        cfg.mission.ring_entry_direction
+        if route_direction is None else route_direction
+    )
+    desired_direction = 1 if selected_direction >= 0 else -1
     desired_paths = [
         candidate for direction, candidate in candidate_directions
         if direction == desired_direction
@@ -398,7 +432,23 @@ def analyze_capture_geometry(
     anchor_x = float(anchor[0]) if anchor else center_x
     crop_half_width = max(1.0, 0.5 * (cfg.camera.crop[2] - cfg.camera.crop[0]))
     incoming_e = float(np.clip((anchor_x - center_x) / crop_half_width, -1.0, 1.0))
-    vertex_y_frac = None if vertex is None else vertex[1] / max(1.0, float(roi.shape[0]))
+    # Keep gate coordinates invariant when a stage trims known-empty rows from
+    # the top of its ROI. Thresholds are calibrated in the legacy common floor
+    # frame, while skeleton/path work may use a smaller stage-local view.
+    reference_y0 = max(
+        0,
+        int(cfg.camera.crop[1]) - cfg.path_memory.geometry_roi_top_offset_px,
+    )
+    reference_y1 = min(
+        frame.shape[0],
+        max(int(cfg.camera.crop[3]) + 20, frame.shape[0] - 10),
+    )
+    vertex_y_frac = (
+        None
+        if vertex is None
+        else (roi_y0 + vertex[1] - reference_y0)
+        / max(1.0, float(reference_y1 - reference_y0))
+    )
     # Direction is an image-space fact: after the first sustained departure,
     # does the exit enter from the right or the left?  The sign of a fitted
     # path angle is unstable under perspective and flipped on the same physical
@@ -425,10 +475,10 @@ def analyze_capture_geometry(
         is_fork=is_fork,
     )
     debug = CaptureGeometryDebug(
-        roi=roi,
-        mask=mask,
-        component=component,
-        skeleton=skeleton,
+        roi=roi if include_debug_images else None,
+        mask=mask if include_debug_images else None,
+        component=component if include_debug_images else None,
+        skeleton=skeleton if include_debug_images else None,
         path=tuple(path),
         candidate_paths=tuple(tuple(candidate) for _direction, candidate in candidate_directions),
         candidate_directions=tuple(direction for direction, _candidate in candidate_directions),
@@ -559,13 +609,13 @@ class CornerGeometryFilter(CaptureGeometryFilter):
         return self._session_decision(
             observation,
             event_kind="corner",
-            allowed_shapes={"corner", "curve"},
+            allowed_shapes={"corner"},
             require_fork=False,
         )
 
 
 class RingEntryGeometryFilter(CaptureGeometryFilter):
-    """Only emits the event understood by the ring-entry executor."""
+    """Only emits the oblique connection understood by ring entry."""
 
     def update(
         self,
@@ -582,6 +632,24 @@ class RingEntryGeometryFilter(CaptureGeometryFilter):
         )
 
 
+class RingExitGeometryFilter(CaptureGeometryFilter):
+    """Only emits a confirmed branch after ring-exit arming."""
+
+    def update(
+        self,
+        observation: CaptureGeometryObservation,
+    ) -> CaptureGeometryDecision | None:
+        self.window.append(observation)
+        if len(self.window) < self.confirm_frames:
+            return None
+        return self._session_decision(
+            observation,
+            event_kind="ring_exit",
+            allowed_shapes={"curve", "circle"},
+            require_fork=True,
+        )
+
+
 def draw_capture_geometry(
     debug: CaptureGeometryDebug,
     observation: CaptureGeometryObservation,
@@ -589,6 +657,12 @@ def draw_capture_geometry(
     event_kind: str | None = None,
     session: str | None = None,
 ) -> np.ndarray:
+    if (
+        debug.roi is None
+        or debug.component is None
+        or debug.skeleton is None
+    ):
+        raise ValueError("geometry debug images were not captured")
     overlay = debug.roi.copy()
     overlay[debug.component > 0] = (
         0.45 * overlay[debug.component > 0] + 0.55 * np.asarray([0, 180, 255])

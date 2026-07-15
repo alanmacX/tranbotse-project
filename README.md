@@ -63,14 +63,12 @@ For import/config smoke tests without touching motors:
 python3 apps/race_runner.py --dry-run --max-sec 1
 ```
 
-The default race config now uses the fixed course order (`obstacle -> corner ->
-ring_entry -> ring_exit -> fork -> return`). Obstacle handling is deferred, so
-the current default starts at `corner`. Ring entry defaults right and the fork
-defaults to the rightmost path; both are route choices for the same tracker.
+The current normal-flow config uses the fixed course order (`corner ->
+ring_entry -> ring_exit -> finished`). Ring entry and exit use fixed route
+choices; obstacle, color-sign, and direction-sign recognition are not run.
 Only the current session's event detector may request control. The arbiter
-selects one owner and emits one candidate/final command pair per tick. The
-legacy global detector remains available by setting `path_memory.mode` to
-`corner_event`.
+selects one owner and emits one candidate/final command pair per tick. There is
+no runtime switch back to the legacy global detector.
 
 ## Recorded Manual Fallback
 

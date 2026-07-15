@@ -24,9 +24,13 @@ class CameraConfig:
 
     frame_width: int = 640
     frame_height: int = 480
-    crop: tuple[int, int, int, int] = (300, 265, 430, 455)
+    crop: tuple[int, int, int, int] = (300, 265, 430, 442)
     expand_left_px: int = 20
     expand_right_px: int = 140
+    # The full crop remains available to stage geometry. Ordinary line
+    # following removes the fixed chassis/gripper band at its bottom so the
+    # body edge cannot become the first connected path.
+    control_bottom_trim_px: int = 22
 
 
 @dataclass(slots=True)
@@ -45,10 +49,8 @@ class OcclusionConfig:
 
 @dataclass(slots=True)
 class PathMemoryConfig:
-    """Selectable camera-to-axle experiment strategy."""
+    """Camera-to-axle and fixed-course executor configuration."""
 
-    enabled: bool = True
-    mode: str = "none"  # none, corner_event (legacy), fixed_sessions
     # Odometric distance from the near-field curvature-onset gate to the axle
     # turn point.  This is a gate-to-axle longitudinal extrinsic compensation,
     # not an image-processing margin and not a delay from first detection.
@@ -73,12 +75,11 @@ class PathMemoryConfig:
     corner_e_threshold: float = 0.48
     corner_hold_max_w: float = 0.0
     corner_replay_max_w: float = 0.20
-    # A roundabout fork is route-selected rather than inferred from the longest
-    # visible skeleton.  +1 is image/right, -1 image/left.
-    roundabout_direction: int = 1
-    # Oblique line/circle intersections do not share the corner gate-to-axle
-    # geometry.  Keep a rollback switch, disabled by default.
+    # Ring entry has its own perspective/axle compensation. It must not reuse
+    # the corner gate distance: the line/circle intersection is oblique and is
+    # detected from a different image-space landmark.
     roundabout_margin_enabled: bool = True
+    roundabout_margin_distance_m: float = 0.10
     roundabout_replay_max_w: float = 0.20
     corner_turn_angle_rad: float = 1.57
     corner_max_turn_angle_rad: float = 2.6179938779914944
@@ -91,6 +92,15 @@ class PathMemoryConfig:
     corner_search_extra_rad: float = 0.40
     corner_reacquire_confirm_frames: int = 3
     max_motion_dt_sec: float = 1.0
+
+
+@dataclass(slots=True)
+class StageGeometryConfig:
+    """Geometry cost/ROI owned by one fixed-course stage."""
+
+    roi_top_offset_px: int = 80
+    chassis_trim_px: int = 45
+    cadence_frames: int = 1
 
 
 @dataclass(slots=True)
@@ -113,23 +123,6 @@ class MissionConfig:
     initial_session: str = "corner"
     ring_entry_direction: int = 1
     ring_exit_direction: int = 1
-    fork_branch: str = "right"
-
-@dataclass(slots=True)
-class ObstacleConfig:
-    """Parallel monocular obstacle monitor for the straight track corridor."""
-
-    enabled: bool = True
-    stable_frames: int = 3
-    arm_hold_sec: float = 0.20
-    candidate_hold_frames: int = 3
-    corridor_half_width_ratio: float = 0.10
-    min_confidence: float = 0.52
-    approach_bottom_frac: float = 0.55
-    stop_bottom_frac: float = 0.78
-    approach_width_frac: float = 0.48
-    stop_width_frac: float = 0.62
-    slow_speed_ratio: float = 0.45
 
 
 @dataclass(slots=True)
@@ -243,7 +236,11 @@ class RaceConfig:
     vision: VisionConfig = field(default_factory=VisionConfig)
     occlusion: OcclusionConfig = field(default_factory=OcclusionConfig)
     path_memory: PathMemoryConfig = field(default_factory=PathMemoryConfig)
+    corner_geometry: StageGeometryConfig = field(
+        default_factory=lambda: StageGeometryConfig(roi_top_offset_px=60),
+    )
+    ring_entry_geometry: StageGeometryConfig = field(default_factory=StageGeometryConfig)
+    ring_exit_geometry: StageGeometryConfig = field(default_factory=StageGeometryConfig)
     ground_projection: GroundProjectionConfig = field(default_factory=GroundProjectionConfig)
     mission: MissionConfig = field(default_factory=MissionConfig)
-    obstacle: ObstacleConfig = field(default_factory=ObstacleConfig)
     tracker: TrackerConfig = field(default_factory=TrackerConfig)

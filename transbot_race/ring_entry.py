@@ -29,6 +29,21 @@ class RingEntryResult:
     phase_event: RingPhaseEvent = RingPhaseEvent.NONE
 
 
+@dataclass(frozen=True, slots=True)
+class RingStageTransfer:
+    direction: int
+    raw_fit: TrajectoryFit | None
+    pending_fit: TrajectoryFit | None
+    pending_fit_frames: int
+    last_fit: TrajectoryFit | None
+    missing_frames: int
+    command_w: float
+
+
+def effective_ring_margin_distance(margin_distance_m: float, enabled: bool) -> float:
+    return max(0.0, float(margin_distance_m)) if enabled else 0.0
+
+
 def selected_path_fit(
     debug: CaptureGeometryDebug | None,
     observation: CaptureGeometryObservation | None,
@@ -72,9 +87,11 @@ def selected_path_fit(
         theta=theta,
         kappa=0.0,
         conf=confidence,
-        n_bands=6,
+        # This is route memory derived from a selected skeleton, not a fresh
+        # ordinary scan-line observation. Keep scan-specific support explicit.
+        n_bands=0,
         quadratic=False,
-        disconnected=False,
+        disconnected=True,
         preview_dir=observation.direction,
         preview_e=e_look,
         preview_theta=theta,
@@ -94,6 +111,9 @@ class RingEntryExecutor:
         inside_arm_distance_m: float = 0.18,
         exit_distance_m: float = 0.08,
         margin_distance_m: float = 0.0,
+        align_e_tolerance: float = 0.22,
+        align_theta_tolerance: float = 0.28,
+        align_confirm_frames: int = 3,
         tracker_cfg: TrackerConfig | None = None,
     ) -> None:
         self.direction = 1 if direction >= 0 else -1
@@ -102,6 +122,9 @@ class RingEntryExecutor:
         self.inside_arm_distance_m = max(0.0, float(inside_arm_distance_m))
         self.exit_distance_m = max(0.0, float(exit_distance_m))
         self.margin_distance_m = max(0.0, float(margin_distance_m))
+        self.align_e_tolerance = max(0.0, float(align_e_tolerance))
+        self.align_theta_tolerance = max(0.0, float(align_theta_tolerance))
+        self.align_confirm_frames = max(1, int(align_confirm_frames))
         self.tracker_cfg = tracker_cfg or TrackerConfig()
         self.margin_remaining_m = 0.0
         self.margin_v = 0.0
@@ -110,9 +133,6 @@ class RingEntryExecutor:
         self.clear_frames = 0
         self.travelled_m = 0.0
         self.inside_travelled_m = 0.0
-        self.margin_remaining_m = 0.0
-        self.margin_v = 0.0
-        self.margin_w = 0.0
         self.last_now: float | None = None
         self.control_now: float | None = None
         self.command_w = 0.0
@@ -121,13 +141,21 @@ class RingEntryExecutor:
         self.pending_fit_frames = 0
         self.last_fit: TrajectoryFit | None = None
         self.missing_frames = 0
+        self.align_ready_frames = 0
 
     def reset(self) -> None:
         self.state = "waiting"
         self.clear_frames = 0
         self.travelled_m = 0.0
         self.inside_travelled_m = 0.0
+        self.margin_remaining_m = 0.0
+        self.margin_v = 0.0
+        self.margin_w = 0.0
+        self.align_ready_frames = 0
         self.last_now = None
+        self._reset_route_control()
+
+    def _reset_route_control(self) -> None:
         self.control_now = None
         self.command_w = 0.0
         self.raw_fit = None
@@ -138,6 +166,50 @@ class RingEntryExecutor:
 
     def set_direction(self, direction: int) -> None:
         self.direction = 1 if direction >= 0 else -1
+
+    def clear_route_loss(self) -> bool:
+        if self.state not in {"aligning", "tracking", "inside", "exiting"}:
+            return False
+        if self.last_fit is None or self.missing_frames <= 5:
+            return False
+        # An operator clear only permits a fresh selected path to recover the
+        # controller. It must never restart movement from the route that caused
+        # the safety latch.
+        self.raw_fit = None
+        self.last_fit = None
+        self.missing_frames = 0
+        self.pending_fit = None
+        self.pending_fit_frames = 0
+        self.control_now = None
+        self.command_w = 0.0
+        return True
+
+    def pause(self, now: float) -> None:
+        """Advance clocks without accumulating safety-hold motion or steering."""
+        self.last_now = float(now)
+        self.control_now = float(now)
+
+    def export_stage_transfer(self) -> RingStageTransfer:
+        return RingStageTransfer(
+            self.direction,
+            self.raw_fit,
+            self.pending_fit,
+            self.pending_fit_frames,
+            self.last_fit,
+            self.missing_frames,
+            self.command_w,
+        )
+
+    def initialize_exit(self, transfer: RingStageTransfer) -> None:
+        self.reset()
+        self.direction = transfer.direction
+        self.state = "inside"
+        self.raw_fit = transfer.raw_fit
+        self.pending_fit = transfer.pending_fit
+        self.pending_fit_frames = transfer.pending_fit_frames
+        self.last_fit = transfer.last_fit
+        self.missing_frames = transfer.missing_frames
+        self.command_w = transfer.command_w
 
     def _continuous_fit(self, route_fit: TrajectoryFit | None) -> TrajectoryFit | None:
         """Reject branch swaps and low-pass the carrot in robot image space."""
@@ -197,17 +269,14 @@ class RingEntryExecutor:
         now: float,
         linear: float,
         accepted_entry: bool,
-        confirmed_entry: bool = False,
         cruise_fit: TrajectoryFit | None = None,
         incoming_v: float = 0.0,
-        incoming_w: float = 0.0,
     ) -> RingEntryResult:
         dt = 0.0 if self.last_now is None else max(0.0, min(1.0, now - self.last_now))
         self.last_now = now
         travelled = max(0.0, float(linear)) * dt
         started = False
         margin_started = False
-        route_fit = self._continuous_fit(route_fit)
         if self.state == "completed":
             return RingEntryResult(
                 cruise_fit or route_fit or self.last_fit,
@@ -220,11 +289,10 @@ class RingEntryExecutor:
             if route_fit is None or not accepted_entry:
                 return RingEntryResult(None, "ring_entry_waiting_topology")
             self.margin_v = max(0.0, float(incoming_v))
-            self.margin_w = float(incoming_w)
+            self.margin_w = 0.0
             self.state = "margin"
             self.margin_remaining_m = self.margin_distance_m
             margin_started = True
-            self.last_fit = route_fit
             started = True
 
         if self.state == "margin":
@@ -234,12 +302,13 @@ class RingEntryExecutor:
                 return RingEntryResult(
                     None, "ring_entry_waiting_margin", started, False,
                 )
-            self.state = "tracking"
+            self.state = "aligning"
             self.travelled_m = 0.0
             self.clear_frames = 0
-            if route_fit is not None:
-                self.last_fit = route_fit
+            self.align_ready_frames = 0
+            self._reset_route_control()
 
+        route_fit = self._continuous_fit(route_fit)
         self.travelled_m += travelled
         if route_fit is not None:
             self.last_fit = route_fit
@@ -249,6 +318,24 @@ class RingEntryExecutor:
 
         coherent_arc = route_fit is not None and observation is not None
         fork_cleared = observation is not None and not observation.is_fork
+        if self.state == "aligning":
+            alignment_fit = self.raw_fit if route_fit is not None else None
+            aligned = bool(
+                coherent_arc
+                and alignment_fit is not None
+                and abs(alignment_fit.e_look) <= self.align_e_tolerance
+                and abs(alignment_fit.theta) <= self.align_theta_tolerance
+            )
+            self.align_ready_frames = self.align_ready_frames + 1 if aligned else 0
+            if self.align_ready_frames >= self.align_confirm_frames:
+                self.state = "tracking"
+                self.travelled_m = 0.0
+                self.clear_frames = 0
+                return RingEntryResult(
+                    route_fit,
+                    "ring_entry_alignment_established",
+                    started,
+                )
         if self.state == "tracking":
             # Entry progress is path-relative, not a shape-classification
             # event. A real ring remains fork/circle/curve from different
@@ -307,6 +394,8 @@ class RingEntryExecutor:
             reason = "ring_inside_tracking" if usable_fit is not None else "ring_inside_path_lost"
         elif self.state == "exiting":
             reason = "ring_exit_tracking_selected_path" if usable_fit is not None else "ring_exit_selected_path_lost"
+        elif self.state == "aligning":
+            reason = "ring_entry_aligning_selected_path" if usable_fit is not None else "ring_entry_alignment_path_lost"
         else:
             reason = "ring_entry_tracking_selected_path" if usable_fit is not None else "ring_entry_selected_path_lost"
         return RingEntryResult(
@@ -330,7 +419,7 @@ class RingEntryExecutor:
         invert_turn: bool = False,
     ) -> tuple[float, float]:
         """Curvature-regulated, slew-limited differential-drive command."""
-        limit = max_w
+        limit = approach_max_w if self.state in {"aligning", "tracking"} else max_w
         steering = k_pursuit * fit.e_look + k_theta * fit.theta
         sign = 1.0 if invert_turn else -1.0
         desired_w = max(-limit, min(limit, sign * steering))

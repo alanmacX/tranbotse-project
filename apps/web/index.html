@@ -1,114 +1,171 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Transbot Race Dashboard</title>
+  <title>Transbot 赛道控制台</title>
   <link rel="stylesheet" href="/ui/style.css" />
 </head>
 <body>
   <header>
-    <h1>Transbot Race Dashboard</h1>
+    <div>
+      <h1>Transbot 赛道控制台</h1>
+      <span id="runName" class="subtle">暂无运行</span>
+    </div>
     <div class="conn">
       <span id="dot" class="dot"></span>
-      <span id="connText">disconnected</span>
-      <button id="mockBtn">Mock on</button>
+      <span id="connText">遥测未连接</span>
+      <button id="mockBtn">模拟数据</button>
     </div>
   </header>
 
   <main>
     <section class="panel controls">
-      <h2>Run controls</h2>
-      <div class="ctlRow">
-        <label>SSH</label>
-        <input id="ssh" type="text" value="yahboom" />
-        <button id="deployBtn">Deploy</button>
+      <div class="sectionTitle">
+        <h2>运行控制</h2>
+        <div class="btnGrid">
+          <button id="downloadBtn" disabled>同步 Debug 到 live_debug</button>
+          <button id="reloadVideoBtn">重连视频</button>
+        </div>
       </div>
-      <div class="ctlRow">
-        <label>Max s</label>
-        <input id="maxSec" type="range" min="2" max="120" step="1" value="60" />
-        <input id="maxSecN" type="number" min="2" max="120" step="1" value="60" />
+      <div class="controlGrid">
+        <label>SSH<input id="ssh" type="text" value="yahboom" /></label>
+        <label>最长运行秒数<input id="maxSecN" type="number" min="2" max="120" step="1" value="60" /></label>
+        <label class="check"><input id="debugCapture" type="checkbox" /> 保存 Debug 帧和日志</label>
       </div>
-      <div class="ctlRow checkRow">
-        <label>Debug</label>
-        <label class="check"><input id="debugCapture" type="checkbox" /> capture frames + logs</label>
-      </div>
-      <div class="btnGrid">
-        <button class="run final" data-profile="final">统一运行</button>
+      <div class="btnGrid primaryActions">
+        <button id="deployBtn">部署</button>
+        <button class="run final" data-profile="final">启动固定赛道</button>
+        <button id="clearRouteBtn">清除路线丢失锁</button>
         <button id="stopBtn" class="stop">强制停车</button>
-        <button id="reloadVideoBtn">重连视频</button>
       </div>
       <div id="msg" class="msg"></div>
-      <p class="hint">先 Deploy 同步代码，再统一运行；拐点、虚线、圆环都走同一套连续跟踪器。</p>
     </section>
 
     <section class="panel video">
-      <h2>Live view</h2>
+      <div class="sectionTitle">
+        <h2>运行画面</h2>
+        <span id="frameAge" class="pill neutral">无帧</span>
+      </div>
       <div class="videoWrap">
-        <img id="video" alt="live video" />
+        <img id="video" alt="runner live video" />
         <div id="cropBox"></div>
+        <div id="videoEmpty" class="videoEmpty">Runner 启动后显示同一相机画面</div>
       </div>
-      <p class="hint">Video streams from the robot over SSH via the debug backend. The
-        amber box shows the configured crop.</p>
-    </section>
-
-    <section class="panel strategy">
-      <h2>Turn controller</h2>
-      <div class="ctlRow">
-        <label>Mode</label>
-        <select id="strategyMode">
-          <option value="fixed_sessions">Fixed course sessions</option>
-          <option value="none">Cruise only</option>
-          <option value="corner_event">Legacy global turn</option>
-        </select>
-        <button id="strategySaveBtn">Apply</button>
-      </div>
-      <div class="ctlRow checkRow">
-        <label>Obstacle</label>
-        <label class="check"><input id="obstacleEnabled" type="checkbox" /> enable detector</label>
-      </div>
-      <div class="ctlRow"><label>Gate-to-axle distance m</label><input id="strategyMargin" type="number" min="0" max="0.3" step="0.005" /></div>
-      <div class="strategyFields" data-modes="fixed_sessions,corner_event">
-        <div class="ctlRow"><label>Confirm</label><input id="cornerConfirm" type="number" min="3" max="10" step="1" /></div>
-        <div class="ctlRow"><label>Blind yaw limit rad</label><input id="cornerTurnAngle" type="number" min="0.3" max="2.4" step="0.05" /></div>
-        <div class="ctlRow"><label>Yaw response scale</label><input id="cornerYawScale" type="number" min="0.1" max="1.5" step="0.05" /></div>
-        <div class="ctlRow"><label>First exit eligible yaw rad</label><input id="cornerReacquireAngle" type="number" min="0.1" max="2" step="0.05" /></div>
-        <div class="ctlRow"><label>Turn w</label><input id="cornerTurnW" type="number" min="0.05" max="0.5" step="0.01" /></div>
-        <div class="ctlRow">
-          <label>Roundabout route</label>
-          <select id="roundaboutDirection">
-            <option value="1">Right (default)</option>
-            <option value="-1">Left</option>
-          </select>
-        </div>
-        <div class="ctlRow"><label>Roundabout turn w</label><input id="roundaboutTurnW" type="number" min="0.05" max="0.35" step="0.01" /></div>
-        <div class="ctlRow checkRow">
-          <label>Roundabout margin</label>
-          <label class="check"><input id="roundaboutMargin" type="checkbox" /> enable legacy axle delay</label>
-        </div>
-        <div class="ctlRow"><label>Reacquire frames</label><input id="cornerReacquireFrames" type="number" min="1" max="10" step="1" /></div>
-      </div>
-      <div id="strategyStatus" class="msg"></div>
+      <p class="hint">画面由 race runner 已打开的相机发布，后端不会再次打开摄像头。</p>
     </section>
 
     <section class="panel state">
-      <h2>Controller</h2>
-      <div class="stateRow">
-        <span id="stateLight" class="light"></span>
-        <span id="stateName" class="stateName">--</span>
-        <span id="modeName" class="pill">--</span>
+      <div class="sectionTitle">
+        <h2>阶段与控制权</h2>
+        <div class="stateRow compact">
+          <span id="stateLight" class="light"></span>
+          <span id="stateName" class="stateName">--</span>
+          <span id="modeName" class="pill">--</span>
+        </div>
       </div>
+      <div class="statusGrid">
+        <div><span>赛道阶段</span><strong id="missionState">--</strong></div>
+        <div><span>阶段检测器</span><strong id="sessionDetector">--</strong></div>
+        <div><span>阶段执行器</span><strong id="sessionExecutor">--</strong></div>
+        <div><span>执行阶段</span><strong id="executorPhase">--</strong></div>
+        <div><span>候选命令来源</span><strong id="candidateProducer">--</strong></div>
+        <div><span>底盘控制权</span><strong id="controlOwner">--</strong></div>
+        <div><span>交接屏障</span><strong id="barrierState">--</strong></div>
+        <div><span>静止确认</span><strong id="stationaryMethod">--</strong></div>
+        <div><span>安全状态</span><strong id="safetyState">--</strong></div>
+        <div><span>停车原因</span><strong id="stopCause">--</strong></div>
+        <div><span>阶段事件</span><strong id="transitionEvent">--</strong></div>
+      </div>
+      <div class="commandGrid">
+        <div><span>候选命令</span><strong id="candidateCommand">v -- / w --</strong></div>
+        <div><span>最终命令</span><strong id="finalCommand">v -- / w --</strong></div>
+      </div>
+    </section>
+
+    <section class="panel metrics">
+      <h2>巡线与延迟</h2>
       <div class="bars">
         <div class="bar"><label>e0</label><div class="track"><div id="bar_e0" class="fill signed"></div></div><span id="val_e0">0</span></div>
         <div class="bar"><label>theta</label><div class="track"><div id="bar_theta" class="fill signed"></div></div><span id="val_theta">0</span></div>
-        <div class="bar"><label>kappa</label><div class="track"><div id="bar_kappa" class="fill signed"></div></div><span id="val_kappa">0</span></div>
         <div class="bar"><label>conf</label><div class="track"><div id="bar_conf" class="fill"></div></div><span id="val_conf">0</span></div>
         <div class="bar"><label>v</label><div class="track"><div id="bar_v" class="fill"></div></div><span id="val_v">0</span></div>
         <div class="bar"><label>w</label><div class="track"><div id="bar_w" class="fill signed"></div></div><span id="val_w">0</span></div>
       </div>
-      <canvas id="chart" width="440" height="150"></canvas>
-      <p class="hint">Series: <b class="c-e0">e0</b> · <b class="c-theta">theta</b> · <b class="c-conf">conf</b></p>
+      <div class="timingGrid">
+        <div><span>采集</span><strong id="timingCapture">-- ms</strong></div>
+        <div><span>普通视觉</span><strong id="timingVision">-- ms</strong></div>
+        <div><span>阶段几何</span><strong id="timingGeometry">-- ms</strong></div>
+        <div><span>控制</span><strong id="timingControl">-- ms</strong></div>
+        <div><span>完整循环</span><strong id="timingWork">-- ms</strong></div>
+        <div><span>超期</span><strong id="deadlineMiss">--</strong></div>
+      </div>
+      <canvas id="chart" width="640" height="150"></canvas>
     </section>
+
+    <details class="panel advanced">
+      <summary>高级设置：赛道、相机、机械臂与诊断</summary>
+      <div class="advancedSections">
+        <section>
+          <h3>固定赛道</h3>
+          <div class="advancedBody">
+            <label>门线到车轴距离 m<input id="strategyMargin" type="number" min="0" max="0.6" step="0.005" /></label>
+            <label>直角确认帧<input id="cornerConfirm" type="number" min="3" max="10" step="1" /></label>
+            <label>直角转弯角速度<input id="cornerTurnW" type="number" min="0.05" max="0.5" step="0.01" /></label>
+            <label>环岛路线<select id="roundaboutDirection"><option value="1">右侧 right</option><option value="-1">左侧 left</option></select></label>
+            <label>环岛最大角速度<input id="roundaboutTurnW" type="number" min="0.05" max="0.35" step="0.01" /></label>
+            <label>环岛 margin 距离 m<input id="roundaboutMarginDistance" type="number" min="0" max="0.4" step="0.005" /></label>
+            <label class="check"><input id="roundaboutMargin" type="checkbox" /> 启用环岛 margin</label>
+          </div>
+        </section>
+
+        <section>
+          <h3>普通巡线与视觉</h3>
+          <div class="advancedBody">
+            <label>最大线速度 m/s<input id="trackerVMax" type="number" min="0.01" max="0.12" step="0.005" /></label>
+            <label>横向误差增益 k<sub>e</sub><input id="trackerKE" type="number" min="0.05" max="0.6" step="0.01" /></label>
+            <label>朝向增益 k<sub>θ</sub><input id="trackerKTheta" type="number" min="0" max="0.8" step="0.01" /></label>
+            <label>曲率前馈 k<sub>ff</sub><input id="trackerKff" type="number" min="0" max="0.6" step="0.01" /></label>
+            <label>最大角速度 rad/s<input id="trackerMaxW" type="number" min="0.05" max="0.6" step="0.01" /></label>
+            <label>丢线置信度衰减<input id="trackerConfDecay" type="number" min="0.02" max="0.4" step="0.01" /></label>
+            <label>最小线段宽度 px<input id="visionMinWidth" type="number" min="1" max="40" step="1" /></label>
+            <label>最小线段面积 px<input id="visionMinArea" type="number" min="1" max="200" step="1" /></label>
+          </div>
+        </section>
+
+        <section>
+          <h3>相机云台与机械臂</h3>
+          <div class="advancedBody">
+            <label>云台水平<input id="cam1" type="number" min="0" max="180" step="1" /></label>
+            <label>云台俯仰<input id="cam2" type="number" min="8" max="100" step="1" /></label>
+            <button id="cameraApplyBtn">应用云台位置</button>
+            <label>机械臂 j1<input id="armJ1" type="number" min="0" max="225" step="1" /></label>
+            <label>机械臂 j2<input id="armJ2" type="number" min="30" max="270" step="1" /></label>
+            <label>夹爪 j3<input id="armJ3" type="number" min="30" max="180" step="1" /></label>
+            <label>动作时间 ms<input id="armMs" type="number" min="600" max="2200" step="50" /></label>
+            <button id="armApplyBtn">应用机械臂位置</button>
+          </div>
+        </section>
+
+        <section>
+          <h3>图像裁剪与单帧诊断</h3>
+          <div class="advancedBody">
+            <label>裁剪 x0<input id="cropX0" type="number" min="0" max="639" step="1" /></label>
+            <label>裁剪 y0<input id="cropY0" type="number" min="0" max="479" step="1" /></label>
+            <label>裁剪 x1<input id="cropX1" type="number" min="1" max="640" step="1" /></label>
+            <label>裁剪 y1<input id="cropY1" type="number" min="1" max="480" step="1" /></label>
+            <label class="imagePath">本地图片路径<input id="imagePath" type="text" value="artifacts/baseline/line_follow_demo_result.jpg" /></label>
+            <button id="analyzeBtn">分析单帧</button>
+          </div>
+          <img id="analysisImage" class="analysisImage" alt="single-frame analysis" hidden />
+        </section>
+
+        <div class="advancedActions">
+          <button id="strategySaveBtn">保存所有高级设置</button>
+          <div id="strategyStatus" class="msg"></div>
+        </div>
+      </div>
+    </details>
   </main>
 
   <script src="/ui/app.js"></script>

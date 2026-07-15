@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "formal_runs": [
+    {
+      "run": "20260714-160851_final",
+      "telemetry_rows": 368,
+      "saved_points": 96,
+      "geometry_points": 67,
+      "key_frames": [
+        {"stem": "00026_0017300", "issue": "far_only"},
+        {"stem": "00030_0019470", "issue": "far_only"},
+        {"stem": "00033_0021180", "issue": "far_only"},
+        {"stem": "00071_0043860", "issue": "dashed_reacquire"},
+        {"stem": "00089_0055560", "issue": "ring_margin"}
+      ]
+    },
+    {
+      "run": "20260714-174902_final",
+      "telemetry_rows": 291,
+      "saved_points": 60,
+      "geometry_points": 15,
+      "key_frames": [
+        {"stem": "00040_0023470", "issue": "corner_exit_identity"},
+        {"stem": "00047_0027310", "issue": "corner_exit_loss"}
+      ]
+    },
+    {
+      "run": "20260714-185400_final",
+      "telemetry_rows": 437,
+      "saved_points": 112,
+      "geometry_points": 70,
+      "key_frames": [
+        {"stem": "00089_0053170", "issue": "ring_branch_swap"},
+        {"stem": "00093_0055250", "issue": "ring_branch_swap"}
+      ]
+    },
+    {
+      "run": "20260714-190744_final",
+      "telemetry_rows": 432,
+      "saved_points": 125,
+      "geometry_points": 99,
+      "key_frames": [
+        {"stem": "00077_0046960", "issue": "dashed_reacquire"},
+        {"stem": "00078_0047460", "issue": "dashed_reacquire"},
+        {"stem": "00079_0047960", "issue": "ring_margin_rotation"},
+        {"stem": "00107_0063880", "issue": "ring_margin_rotation"}
+      ]
+    },
+    {
+      "run": "20260714-201757_final",
+      "telemetry_rows": 224,
+      "saved_points": 48,
+      "geometry_points": 20,
+      "key_frames": [
+        {"stem": "00018_0012240", "issue": "curve_to_corner"},
+        {"stem": "00019_0012880", "issue": "curve_to_corner"},
+        {"stem": "00044_0026640", "issue": "handoff_atomicity"}
+      ]
+    },
+    {
+      "run": "20260714-203256_final",
+      "telemetry_rows": 364,
+      "saved_points": 101,
+      "geometry_points": 73,
+      "key_frames": [
+        {"stem": "00050_0030040", "issue": "handoff_oscillation"},
+        {"stem": "00055_0033330", "issue": "handoff_oscillation"},
+        {"stem": "00076", "issue": "observed_vs_memory"},
+        {"stem": "00084", "issue": "observed_vs_memory"},
+        {"stem": "00085", "issue": "ring_exit_not_completed"},
+        {"stem": "00100", "issue": "ring_exit_not_completed"}
+      ]
+    }
+  ],
+  "ci_fixtures": [
+    {
+      "path": "anti_interference/false_far_20260714-174902_00040_0023470.png",
+      "source_run": "20260714-174902_final",
+      "stem": "00040_0023470",
+      "sha256": "c99b3ddf16cb0421c58fb0183d4156544628bdd93bd5669826a96e4e23e3eb2a",
+      "expected": "observable_not_controllable"
+    },
+    {
+      "path": "anti_interference/false_far_20260714-174902_00041_0024050.png",
+      "source_run": "20260714-174902_final",
+      "stem": "00041_0024050",
+      "sha256": "8984a298dfe4b2004e5d8cabb06fa837864ea6a685b1a87e13db16678bc26efb",
+      "expected": "observable_not_controllable"
+    },
+    {
+      "path": "anti_interference/valid_near_20260714-174902_00008_0005620.png",
+      "source_run": "20260714-174902_final",
+      "stem": "00008_0005620",
+      "sha256": "ff7b0a4de58c11c2cbc439bcd42b83eed567453c043cb4e0be3c7e9871b2e4ca",
+      "expected": "controllable"
+    }
+  ]
+}

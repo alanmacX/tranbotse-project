@@ -3,10 +3,14 @@ from __future__ import annotations
 
 import argparse
 import ast
+import base64
 import json
+import queue
+import signal
 import sys
+import threading
 import time
-from dataclasses import asdict, fields, is_dataclass, replace
+from dataclasses import asdict, fields, is_dataclass
 from pathlib import Path
 
 import cv2 as cv
@@ -15,56 +19,32 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from transbot_race.config import RaceConfig, coerce_bool  # noqa: E402
-from transbot_race.control import (  # noqa: E402
-    CommandArbiter,
-    ControlOwner,
-    StopCause,
-    TransitionEvent,
-)
 from transbot_race.capture_geometry import (  # noqa: E402
-    CaptureGeometryFilter,
-    CornerGeometryFilter,
-    RingEntryGeometryFilter,
-    analyze_capture_geometry,
     draw_capture_geometry,
 )
-from transbot_race.geometry import apply_occlusion, band_is_occluded  # noqa: E402
+from transbot_race.frame_pipeline import FixedCourseFramePipeline  # noqa: E402
 from transbot_race.path_memory import (  # noqa: E402
-    CornerCommandDelay,
     PathStrategyStatus,
     read_motion_sample,
 )
-from transbot_race.obstacle import (  # noqa: E402
-    ObstacleMonitor,
-    draw_obstacle_overlay,
-)
-from transbot_race.mission import (  # noqa: E402
-    CourseSession,
-    DetectorKind,
-    ExecutorKind,
-    FixedSessionMission,
-    MissionEvent,
-)
+from transbot_race.mission import DetectorKind  # noqa: E402
 from transbot_race.motor import MotorGateway  # noqa: E402
-from transbot_race.ring_entry import (  # noqa: E402
-    RingEntryExecutor,
-    RingEntryResult,
-    RingPhaseEvent,
-    selected_path_fit,
-)
 from transbot_race.state_machine import (  # noqa: E402
     MotionCommand,
     RaceState,
-    RaceStateMachine,
     command_summary,
 )
 from transbot_race.vision import (  # noqa: E402
-    _band_bounds,
     draw_debug_overlay,
-    fit_line_trajectory,
-    preprocess_blackline,
-    scan_line_features,
 )
+
+
+_OPERATOR_CLEAR_REQUESTS = 0
+
+
+def _request_operator_clear(_signum: int, _frame: object) -> None:
+    global _OPERATOR_CLEAR_REQUESTS
+    _OPERATOR_CLEAR_REQUESTS += 1
 
 
 def coerce_tuple(value: object) -> tuple:
@@ -110,10 +90,17 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError(f"camera.crop must have 4 values, got {cfg.camera.crop!r}")
     x0, y0, x1, y1 = cfg.camera.crop
     crop_h = y1 - y0
-    min_h = cfg.vision.band_count * 12
-    if crop_h < min_h:
+    if not 0 <= cfg.camera.control_bottom_trim_px < crop_h:
         raise ValueError(
-            f"crop height {crop_h}px too small for band_count={cfg.vision.band_count} "
+            "camera.control_bottom_trim_px must be non-negative and smaller "
+            "than the crop height"
+        )
+    control_h = crop_h - cfg.camera.control_bottom_trim_px
+    min_h = cfg.vision.band_count * 12
+    if control_h < min_h:
+        raise ValueError(
+            f"control crop height {control_h}px too small for "
+            f"band_count={cfg.vision.band_count} "
             f"(need >= {min_h}px). Check camera.crop={cfg.camera.crop}."
         )
     if x1 <= x0:
@@ -126,18 +113,12 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError("vision component thickness cannot be negative")
     if cfg.path_memory.camera_to_axle_m < 0.0:
         raise ValueError("camera-to-axle distance cannot be negative")
-    if cfg.path_memory.mode not in ("none", "corner_event", "fixed_sessions"):
-        raise ValueError(f"unsupported path-memory mode: {cfg.path_memory.mode}")
+    if cfg.path_memory.roundabout_margin_distance_m < 0.0:
+        raise ValueError("roundabout margin distance cannot be negative")
     if cfg.mission.ring_entry_direction not in (-1, 1):
         raise ValueError("mission ring-entry direction must be -1 (left) or +1 (right)")
     if cfg.mission.ring_exit_direction not in (-1, 1):
         raise ValueError("mission ring-exit direction must be -1 (left) or +1 (right)")
-    if cfg.mission.fork_branch not in {"left", "middle", "right"}:
-        raise ValueError("mission.fork_branch must be left, middle, or right")
-    if cfg.path_memory.mode == "fixed_sessions":
-        # One route-direction source of truth in the new mode. The legacy
-        # geometry extractor reads this older field internally.
-        cfg.path_memory.roundabout_direction = cfg.mission.ring_entry_direction
     if cfg.path_memory.corner_confirm_frames <= 0:
         raise ValueError("corner confirmation frame count must be positive")
     if cfg.path_memory.corner_replay_max_w <= 0.0 or cfg.path_memory.corner_turn_angle_rad <= 0.0:
@@ -146,8 +127,6 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError("corner maximum turn angle must be within (0, pi]")
     if cfg.path_memory.corner_max_turn_angle_rad < cfg.path_memory.corner_reacquire_angle_rad:
         raise ValueError("corner maximum turn angle must exceed reacquire angle")
-    if cfg.path_memory.roundabout_direction not in (-1, 1):
-        raise ValueError("roundabout_direction must be -1 (left) or +1 (right)")
     if cfg.path_memory.roundabout_replay_max_w <= 0.0:
         raise ValueError("roundabout angular speed must be positive")
     if cfg.tracker.max_w <= 0.0 or cfg.tracker.max_w_slew_rate <= 0.0:
@@ -188,27 +167,15 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError("corner cruise-ready distance cannot be negative")
     if cfg.path_memory.geometry_roi_top_offset_px < 0 or cfg.path_memory.geometry_chassis_trim_px <= 0:
         raise ValueError("capture geometry ROI values are invalid")
-
-
-def _corner_control_allowed(
-    strategy_mode: str,
-    obstacle_stop_required: bool,
-    state_machine: RaceStateMachine,
-) -> bool:
-    obstacle_stop_latched = (
-        state_machine.state == RaceState.STOPPED
-        and state_machine.last_event == "obstacle"
-    )
-    return bool(
-        strategy_mode in {"corner_event", "fixed_sessions"}
-        and not obstacle_stop_required
-        and not obstacle_stop_latched
-    )
-
-
-def _corner_has_motor_ownership(state: str, pending_takeover: bool = False) -> bool:
-    """Single arbitration rule for every corner shape, including forks."""
-    return bool(state not in {"armed", "cooldown"} or pending_takeover)
+    for name, stage_geometry in (
+        ("corner_geometry", cfg.corner_geometry),
+        ("ring_entry_geometry", cfg.ring_entry_geometry),
+        ("ring_exit_geometry", cfg.ring_exit_geometry),
+    ):
+        if not 0 <= stage_geometry.roi_top_offset_px <= cfg.path_memory.geometry_roi_top_offset_px:
+            raise ValueError(f"{name}.roi_top_offset_px must fit inside common geometry ROI")
+        if stage_geometry.chassis_trim_px <= 0 or stage_geometry.cadence_frames <= 0:
+            raise ValueError(f"{name} trim/cadence values must be positive")
 
 
 class DryBot:
@@ -242,25 +209,62 @@ def stop_chassis(bot, count: int = 20, delay: float = 0.04) -> None:
         time.sleep(delay)
 
 
-def crop_frame(frame, cfg: RaceConfig):
-    x0, y0, x1, y1 = cfg.camera.crop
-    ex0 = max(0, x0 - cfg.camera.expand_left_px)
-    ex1 = min(cfg.camera.frame_width, x1 + cfg.camera.expand_right_px)
-    track_center = ((x0 + x1) / 2.0) - ex0
-    return frame[y0:y1, ex0:ex1], (ex0, y0, ex1, y1), track_center
+class LiveFramePublisher:
+    """Rate-limited latest-frame publisher with encoding off the control loop."""
 
+    def __init__(self, enabled: bool, period: float, jpeg_quality: int) -> None:
+        self.enabled = enabled
+        self.period = max(0.1, float(period))
+        self.jpeg_quality = max(40, min(90, int(jpeg_quality)))
+        self.last_publish_at = -1e9
+        self._queue: queue.Queue = queue.Queue(maxsize=1)
+        self._stop = threading.Event()
+        self._thread = None
+        if self.enabled:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
 
-def occluded_band_indices(height: int, width: int, cfg: RaceConfig) -> frozenset[int]:
-    """Bands (in scan_line_features geometry) that fall in a static dead zone."""
-    if not cfg.occlusion.enabled or not cfg.occlusion.rects:
-        return frozenset()
-    n = cfg.vision.band_count
-    indices = []
-    for index in range(n):
-        y0, y1 = _band_bounds(index, height, n)
-        if band_is_occluded(y0, y1, width, cfg.occlusion):
-            indices.append(index)
-    return frozenset(indices)
+    def publish(self, frame, now: float) -> None:
+        if not self.enabled or now - self.last_publish_at < self.period:
+            return
+        item = (frame.copy(), float(now))
+        try:
+            self._queue.put_nowait(item)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._queue.put_nowait(item)
+        self.last_publish_at = now
+
+    def close(self) -> None:
+        if self._thread is None:
+            return
+        self.enabled = False
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+        if not self._thread.is_alive():
+            self._thread = None
+
+    def _run(self) -> None:
+        while True:
+            try:
+                item = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                if self._stop.is_set():
+                    return
+                continue
+            frame, now = item
+            ok, encoded = cv.imencode(
+                ".jpg",
+                frame,
+                [int(cv.IMWRITE_JPEG_QUALITY), self.jpeg_quality],
+            )
+            if not ok:
+                continue
+            payload = base64.b64encode(encoded).decode("ascii")
+            print(f"LIVE_FRAME {now:.6f} {payload}", flush=True)
 
 
 class DebugRecorder:
@@ -275,6 +279,11 @@ class DebugRecorder:
         self.frame_count = 0
         self.started_at = time.time()
         self.telemetry = None
+        self.image_queue: queue.Queue = queue.Queue(maxsize=2)
+        self.image_thread = None
+        self.image_sequence = 0
+        self.image_drop_count = 0
+        self.image_write_error_count = 0
 
         if not self.enabled or self.root is None:
             return
@@ -283,9 +292,8 @@ class DebugRecorder:
         self.crops_dir = self.root / "crops"
         self.overlays_dir = self.root / "overlays"
         self.masks_dir = self.root / "masks"
-        self.obstacles_dir = self.root / "obstacles"
         self.geometry_dir = self.root / "geometry"
-        for path in (self.frames_dir, self.crops_dir, self.overlays_dir, self.masks_dir, self.obstacles_dir, self.geometry_dir):
+        for path in (self.frames_dir, self.crops_dir, self.overlays_dir, self.masks_dir, self.geometry_dir):
             path.mkdir(parents=True, exist_ok=True)
 
         with (self.root / "meta.json").open("w", encoding="utf-8") as f:
@@ -306,11 +314,19 @@ class DebugRecorder:
             f.write("\n")
 
         self.telemetry = (self.root / "telemetry.jsonl").open("a", encoding="utf-8", buffering=1)
+        self.image_thread = threading.Thread(target=self._write_images, daemon=True)
+        self.image_thread.start()
         print(f"debug_capture_dir={self.root}", file=sys.stderr, flush=True)
+
+    def should_capture(self, elapsed: float) -> bool:
+        return bool(
+            self.enabled
+            and self.root is not None
+            and float(elapsed) - self.last_frame_t >= self.frame_period
+        )
 
     def record(
         self, summary: dict, frame, crop, mask, features, cfg: RaceConfig, crop_center: float,
-        raw_crop=None, obstacle_decision=None, raw_track_center: float | None = None,
         strategy_status: PathStrategyStatus | None = None,
         geometry_observation=None, geometry_debug=None,
     ) -> None:
@@ -321,57 +337,133 @@ class DebugRecorder:
             self.telemetry.write(json.dumps(summary, ensure_ascii=False) + "\n")
 
         elapsed = float(summary.get("t", 0.0))
-        if elapsed - self.last_frame_t < self.frame_period:
+        if not self.should_capture(elapsed):
             return
 
-        stem = f"{self.frame_count:05d}_{int(elapsed * 1000):07d}"
-        params = [int(cv.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
-        overlay = draw_debug_overlay(crop, features, cfg.vision.trigger_y_frac, crop_center=crop_center)
-        if strategy_status is not None:
-            label = f"{strategy_status.mode}: {strategy_status.reason}"
-            if strategy_status.remaining_m > 0.0:
-                label += f" {strategy_status.remaining_m:.3f}m"
-            cv.rectangle(overlay, (0, 0), (min(overlay.shape[1], 300), 24), (0, 0, 0), -1)
-            cv.putText(overlay, label, (6, 17), cv.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1, cv.LINE_AA)
-
-        cv.imwrite(str(self.frames_dir / f"{stem}.jpg"), frame, params)
-        cv.imwrite(str(self.crops_dir / f"{stem}.jpg"), crop, params)
-        cv.imwrite(str(self.overlays_dir / f"{stem}.jpg"), overlay, params)
-        cv.imwrite(str(self.masks_dir / f"{stem}.png"), mask)
-        if raw_crop is not None and obstacle_decision is not None and raw_track_center is not None:
-            obstacle_overlay = draw_obstacle_overlay(raw_crop, obstacle_decision, raw_track_center, cfg.obstacle)
-            cv.imwrite(str(self.obstacles_dir / f"{stem}.jpg"), obstacle_overlay, params)
-        if geometry_observation is not None and geometry_debug is not None:
-            geometry_overlay = draw_capture_geometry(
-                geometry_debug,
-                geometry_observation,
-                cfg.path_memory.corner_gate_y_frac,
-                event_kind=summary.get("geometry_event"),
-                session=summary.get("course_session"),
-            )
-            cv.imwrite(str(self.geometry_dir / f"{stem}.jpg"), geometry_overlay, params)
-
+        if self.image_queue.full():
+            try:
+                self.image_queue.get_nowait()
+                self.image_queue.task_done()
+                self.image_drop_count += 1
+            except queue.Empty:
+                pass
+        stem = f"{self.image_sequence:05d}_{int(elapsed * 1000):07d}"
+        self.image_sequence += 1
+        self.image_queue.put_nowait({
+            "stem": stem,
+            "frame": frame.copy(),
+            "crop": crop.copy(),
+            "mask": mask.copy(),
+            "features": features,
+            "cfg": cfg,
+            "crop_center": crop_center,
+            "strategy_status": strategy_status,
+            "geometry_observation": geometry_observation,
+            "geometry_debug": geometry_debug,
+            "geometry_event": summary.get("geometry_event"),
+            "course_session": summary.get("course_session"),
+        })
         self.last_frame_t = elapsed
-        self.frame_count += 1
+
+    def _write_images(self) -> None:
+        params = [int(cv.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
+        while True:
+            item = self.image_queue.get()
+            if item is None:
+                self.image_queue.task_done()
+                return
+            try:
+                stem = item["stem"]
+                overlay = draw_debug_overlay(
+                    item["crop"],
+                    item["features"],
+                    item["cfg"].vision.trigger_y_frac,
+                    crop_center=item["crop_center"],
+                )
+                strategy_status = item["strategy_status"]
+                if strategy_status is not None:
+                    label = f"{strategy_status.mode}: {strategy_status.reason}"
+                    if strategy_status.remaining_m > 0.0:
+                        label += f" {strategy_status.remaining_m:.3f}m"
+                    cv.rectangle(
+                        overlay,
+                        (0, 0),
+                        (min(overlay.shape[1], 300), 24),
+                        (0, 0, 0),
+                        -1,
+                    )
+                    cv.putText(
+                        overlay,
+                        label,
+                        (6, 17),
+                        cv.FONT_HERSHEY_SIMPLEX,
+                        0.45,
+                        (0, 220, 255),
+                        1,
+                        cv.LINE_AA,
+                    )
+
+                cv.imwrite(str(self.frames_dir / f"{stem}.jpg"), item["frame"], params)
+                cv.imwrite(str(self.crops_dir / f"{stem}.jpg"), item["crop"], params)
+                cv.imwrite(str(self.overlays_dir / f"{stem}.jpg"), overlay, params)
+                cv.imwrite(str(self.masks_dir / f"{stem}.png"), item["mask"])
+                if (
+                    item["geometry_observation"] is not None
+                    and item["geometry_debug"] is not None
+                ):
+                    geometry_overlay = draw_capture_geometry(
+                        item["geometry_debug"],
+                        item["geometry_observation"],
+                        item["cfg"].path_memory.corner_gate_y_frac,
+                        event_kind=item["geometry_event"],
+                        session=item["course_session"],
+                    )
+                    cv.imwrite(
+                        str(self.geometry_dir / f"{stem}.jpg"),
+                        geometry_overlay,
+                        params,
+                    )
+                self.frame_count += 1
+            except Exception as exc:
+                self.image_write_error_count += 1
+                print(f"debug_image_write_error={exc!r}", file=sys.stderr, flush=True)
+            finally:
+                self.image_queue.task_done()
 
     def close(self) -> None:
         if not self.enabled or self.root is None:
             return
+        self.enabled = False
         if self.telemetry is not None:
             self.telemetry.close()
             self.telemetry = None
+        if self.image_thread is not None:
+            try:
+                self.image_queue.put_nowait(None)
+            except queue.Full:
+                try:
+                    self.image_queue.get_nowait()
+                    self.image_queue.task_done()
+                    self.image_drop_count += 1
+                except queue.Empty:
+                    pass
+                self.image_queue.put_nowait(None)
+            self.image_thread.join(timeout=2.0)
+            if not self.image_thread.is_alive():
+                self.image_thread = None
         with (self.root / "manifest.json").open("w", encoding="utf-8") as f:
             json.dump(
                 {
                     "ended_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     "duration_sec": round(time.time() - self.started_at, 3),
                     "frames_saved": self.frame_count,
+                    "image_drop_count": self.image_drop_count,
+                    "image_write_error_count": self.image_write_error_count,
                     "telemetry": "telemetry.jsonl",
                     "frames": "frames/",
                     "crops": "crops/",
                     "overlays": "overlays/",
                     "masks": "masks/",
-                    "obstacles": "obstacles/",
                     "geometry": "geometry/",
                 },
                 f,
@@ -382,7 +474,10 @@ class DebugRecorder:
 
 
 def run(args: argparse.Namespace) -> int:
+    global _OPERATOR_CLEAR_REQUESTS
     cfg = load_config(Path(args.config))
+    signal.signal(signal.SIGUSR1, _request_operator_clear)
+    handled_clear_requests = _OPERATOR_CLEAR_REQUESTS
     bot = MotorGateway(
         make_bot(args.dry_run),
         role="auto",
@@ -397,444 +492,184 @@ def run(args: argparse.Namespace) -> int:
             cfg.path_memory.roundabout_replay_max_w,
         ),
     )
-    sm = RaceStateMachine(cfg)
-    corner_margin = CornerCommandDelay(
-        cfg.path_memory,
-        handoff_conf_min=cfg.tracker.conf_predict,
-        tracker_cfg=cfg.tracker,
-    )
-    mission = FixedSessionMission(cfg.mission) if cfg.path_memory.mode == "fixed_sessions" else None
-    ring_entry = RingEntryExecutor(
-        cfg.mission.ring_entry_direction,
-        margin_distance_m=cfg.path_memory.camera_to_axle_m,
-        tracker_cfg=cfg.tracker,
-    )
-    legacy_geometry_filter = CaptureGeometryFilter(cfg.path_memory.corner_confirm_frames)
-    session_geometry_filters = {
-        DetectorKind.CORNER: CornerGeometryFilter(cfg.path_memory.corner_confirm_frames),
-        DetectorKind.RING_ENTRY: RingEntryGeometryFilter(cfg.path_memory.corner_confirm_frames),
-    }
-    obstacle_monitor = ObstacleMonitor(cfg.obstacle)
-    arbiter = CommandArbiter(
-        max_v=cfg.tracker.v_max,
-        max_w=max(
-            cfg.tracker.max_w,
-            cfg.tracker.w_search,
-            cfg.tracker.w_pivot,
-            cfg.tracker.preview_turn_w,
-            cfg.path_memory.corner_replay_max_w,
-            cfg.path_memory.corner_align_max_w,
-            cfg.path_memory.roundabout_replay_max_w,
-        ),
-    )
+    frame_pipeline = FixedCourseFramePipeline(cfg)
+    fixed_course = frame_pipeline.course
+    mission = fixed_course.mission
     cap = cv.VideoCapture(args.camera)
     cap.set(cv.CAP_PROP_FRAME_WIDTH, cfg.camera.frame_width)
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, cfg.camera.frame_height)
     if not cap.isOpened():
         raise RuntimeError(f"camera open failed: {args.camera}")
     debug = DebugRecorder(args.debug_dir, cfg, args)
+    live_frames = LiveFramePublisher(
+        args.publish_live_frames,
+        args.live_frame_period,
+        args.live_frame_jpeg_quality,
+    )
 
     if hasattr(bot, "set_floodlight"):
         bot.set_floodlight(args.light)
 
     start = time.monotonic()
     last_log = 0.0
-    occluded = frozenset()  # computed once from the first crop; static per run
     last_cmd_v = 0.0
     last_cmd_w = 0.0
-    straight_streak = 0
-    obstacle_armed_until = -1e9
+    previous_loop_total_ms = 0.0
+    previous_deadline_miss = False
+    previous_deadline_lag_ms = 0.0
     try:
         stop_chassis(bot, count=3, delay=0.03)
+        next_deadline = time.monotonic()
         while time.monotonic() - start < args.max_sec:
+            next_deadline += max(0.0, float(args.period))
+            loop_started_at = time.monotonic()
             ok, frame = cap.read()
+            capture_finished_at = time.monotonic()
             if not ok:
                 bot.set_car_motion(0.0, 0.0)
                 time.sleep(0.05)
                 continue
-            crop, (x0, y0, x1, y1), track_center = crop_frame(frame, cfg)
-            raw_crop = crop.copy()
-            raw_track_center = track_center
-            strategy_mode = cfg.path_memory.mode if cfg.path_memory.enabled else "disabled"
-            crop_w = crop.shape[1]
-            mask = preprocess_blackline(crop, cfg.vision, anchor_x=track_center)
-            mask = apply_occlusion(mask, cfg.occlusion)
-            if not occluded and cfg.occlusion.enabled:
-                occluded = occluded_band_indices(crop.shape[0], crop.shape[1], cfg)
-            features = scan_line_features(mask, cfg.vision, crop_center=track_center)
-            visual_fit = fit_line_trajectory(
-                features,
-                cfg.vision,
-                crop_center=track_center,
-                crop_width=crop_w,
-                lookahead_frac=cfg.tracker.lookahead_frac,
-                occluded_band_indices=occluded,
-            )
-            now = time.monotonic()
             motion = read_motion_sample(bot, last_cmd_v, last_cmd_w)
-            stable_straight = bool(
-                visual_fit.found
-                and visual_fit.conf >= 0.65
-                and visual_fit.n_bands >= 3
-                and abs(visual_fit.theta) <= 0.16
-                and abs(visual_fit.e0) <= 0.28
-                and not visual_fit.disconnected
-                and features.branch_left is None
-                and features.branch_right is None
-            )
-            straight_streak = straight_streak + 1 if stable_straight else 0
-            if straight_streak >= cfg.obstacle.stable_frames:
-                obstacle_armed_until = now + cfg.obstacle.arm_hold_sec
-            obstacle_armed = now <= obstacle_armed_until
-            obstacle_decision = obstacle_monitor.update(raw_crop, raw_track_center, obstacle_armed)
-
-            geometry_observation = None
-            geometry_decision = None
-            geometry_debug = None
-            if mission is not None:
-                cfg.path_memory.roundabout_direction = (
-                    cfg.mission.ring_exit_direction
-                    if mission.session == CourseSession.RING_EXIT
-                    else cfg.mission.ring_entry_direction
-                )
-            geometry_active = corner_margin.state in {"armed", "approach"}
-            if (
-                strategy_mode in {"corner_event", "fixed_sessions"}
-                and cfg.path_memory.capture_geometry_enabled
-                and geometry_active
-                and (mission is None or mission.detector_enabled)
-            ):
-                geometry_observation, geometry_debug = analyze_capture_geometry(frame, cfg)
-                active_geometry_filter = (
-                    session_geometry_filters[mission.detector_kind]
-                    if mission is not None else legacy_geometry_filter
-                )
-                geometry_decision = active_geometry_filter.update(geometry_observation)
-
-            fit = visual_fit
-            memory_status = PathStrategyStatus(False, strategy_mode, "disabled")
-            if cfg.path_memory.enabled:
-                if strategy_mode == "none":
-                    memory_status = PathStrategyStatus(False, "none", "passthrough")
-                elif strategy_mode == "corner_event":
-                    memory_status = PathStrategyStatus(True, "corner_event", corner_margin.state)
-                elif strategy_mode == "fixed_sessions" and mission is not None:
-                    memory_status = PathStrategyStatus(
-                        mission.detector_enabled,
-                        "fixed_sessions",
-                        mission.session.value,
-                    )
-            fork_straight_phase = bool(
-                corner_margin.event_shape == "fork"
-                and corner_margin.state in {"approach", "waiting"}
-            )
-            ring_session = bool(
-                mission is not None
-                and mission.executor_kind == ExecutorKind.RING_ENTRY
-            )
-            route_fit = selected_path_fit(
-                geometry_debug,
-                geometry_observation,
-                frame_center_x=x0 + track_center,
-                control_width=crop_w,
-            ) if ring_session else None
-            effective_geometry_decision = geometry_decision
-            if mission is not None:
-                effective_geometry_decision = mission.gate(
-                    effective_geometry_decision,
-                    geometry_observation,
-                    visual_fit,
-                    incoming_ready=sm.can_take_moving_handoff(visual_fit),
-                )
-            mission_geometry_decision = effective_geometry_decision
-            ring_result = None
-            ring_travelled_for_log = None
-            ring_clear_for_log = None
-            if ring_session:
-                ring_entry.set_direction(cfg.path_memory.roundabout_direction)
-                if obstacle_decision.stop_required and ring_entry.state != "waiting":
-                    ring_result = RingEntryResult(
-                        ring_entry.last_fit,
-                        "ring_executor_held_by_obstacle",
-                    )
-                else:
-                    ring_result = ring_entry.step(
-                        geometry_observation,
-                        route_fit,
-                        now=now,
-                        linear=motion.linear,
-                        accepted_entry=effective_geometry_decision is not None,
-                        # A raw far-field candidate is observation only. Motor
-                        # ownership begins exclusively after the mission gate.
-                        confirmed_entry=False,
-                        cruise_fit=visual_fit,
-                        incoming_v=last_cmd_v,
-                        incoming_w=last_cmd_w,
-                    )
-                ring_travelled_for_log = ring_entry.travelled_m
-                ring_clear_for_log = ring_entry.clear_frames
-
-            if not ring_session and corner_margin.state == "armed" and sm.state == RaceState.STOPPED:
-                # A stopped cruise controller may observe geometry, but must
-                # first recover a trustworthy line before a new event can take
-                # motor ownership.
-                effective_geometry_decision = None
-            pending_corner_takeover = bool(
-                not ring_session
-                and corner_margin.will_accept_geometry(effective_geometry_decision)
-            )
-            corner_owns_chassis = _corner_has_motor_ownership(
-                corner_margin.state,
-                pending_corner_takeover,
-            ) if not ring_session else False
-            if ring_session and ring_result is not None:
-                fit = ring_result.fit or visual_fit
-                if obstacle_decision.stop_required and ring_entry.state != "waiting":
-                    command = MotionCommand(
-                        last_cmd_v, last_cmd_w, ring_result.reason, RaceState.TRACK, None,
-                    )
-                elif ring_result.fit is not None:
-                    ring_v, ring_w = ring_entry.control(
-                        ring_result.fit,
-                        now=now,
-                        v_max=cfg.tracker.v_max,
-                        k_pursuit=cfg.tracker.k_pursuit,
-                        k_theta=cfg.tracker.k_theta,
-                        max_w=cfg.path_memory.roundabout_replay_max_w,
-                        approach_max_w=cfg.path_memory.corner_approach_max_w,
-                        invert_turn=cfg.tracker.invert_turn,
-                    )
-                    command = MotionCommand(
-                        ring_v,
-                        ring_w,
-                        ring_result.reason,
-                        RaceState.TRACK,
-                        None,
-                    )
-                elif ring_entry.state == "waiting":
-                    command = sm.step(visual_fit, now=now, obstacle=False)
-                elif ring_entry.state == "margin":
-                    command = MotionCommand(
-                        ring_entry.margin_v,
-                        ring_entry.margin_w,
-                        ring_result.reason,
-                        RaceState.TRACK,
-                        None,
-                    )
-                else:
-                    # Once a route has been committed, silently switching back
-                    # to the generic near-line tracker may select the other
-                    # branch. Stop if the selected skeleton is lost too long.
-                    command = MotionCommand(
-                        0.0,
-                        0.0,
-                        ring_result.reason,
-                        RaceState.STOPPED,
-                        None,
-                    )
-                memory_status = PathStrategyStatus(
-                    True,
-                    "fixed_sessions",
-                    ring_result.reason,
-                    max(0.0, ring_entry.min_distance_m - ring_entry.travelled_m),
-                    cfg.mission.ring_entry_direction,
-                    ring_entry.clear_frames,
-                )
-                if ring_entry.state == "margin":
-                    memory_status = replace(
-                        memory_status,
-                        remaining_m=ring_entry.margin_remaining_m,
-                    )
-                if (
-                    ring_result.phase_event
-                    in {RingPhaseEvent.ENTRY_ESTABLISHED, RingPhaseEvent.EXECUTOR_COMPLETED}
-                    and mission is not None
-                ):
-                    next_session = mission.transition(MissionEvent.PHASE_COMPLETED)
-                    for session_filter in session_geometry_filters.values():
-                        session_filter.reset()
-                    legacy_geometry_filter.reset()
-                    if next_session == CourseSession.RING_EXIT:
-                        # Entry completion is only a topology phase boundary.
-                        # Keep the same filtered path and controller command
-                        # while circulating; generic cruise cannot own a ring.
-                        memory_status = replace(
-                            memory_status,
-                            reason="ring_inside_tracking",
-                        )
-                    else:
-                        if ring_result.fit is not None:
-                            command = sm.reacquire_from(ring_result.fit, now)
-                        ring_entry.reset()
-            elif corner_owns_chassis:
-                # Do not even advance the cruise TRACK/LOST/PIVOT state while
-                # a turn is active.  Its output used to be overwritten later,
-                # but its hidden state still timed out or flipped search/pivot
-                # direction, then leaked back at handoff.
-                command = MotionCommand(
-                    last_cmd_v if obstacle_decision.stop_required else 0.0,
-                    last_cmd_w if obstacle_decision.stop_required else 0.0,
-                    "corner_executor_held" if obstacle_decision.stop_required else "corner_owned",
-                    sm.state,
+            now = time.monotonic()
+            capture_geometry_debug = debug.should_capture(now - start)
+            pipeline_result = frame_pipeline.step(
+                frame,
+                now=now,
+                motion=motion,
+                last_command=MotionCommand(
+                    last_cmd_v,
+                    last_cmd_w,
+                    "previous_final",
+                    RaceState.TRACK,
                     None,
-                )
-            else:
-                command = sm.step(
-                    fit, now=now, obstacle=False,
-                )
-            if (
-                not ring_session
-                and
-                _corner_control_allowed(strategy_mode, obstacle_decision.stop_required, sm)
-                and (mission is None or mission.detector_enabled)
-            ):
-                corner_state_before = corner_margin.state
-                delayed = corner_margin.step(
-                    visual_fit, features, command.v, command.w, now,
-                    motion.linear, motion.angular,
-                    geometry=geometry_observation,
-                    geometry_decision=effective_geometry_decision,
-                    invert_turn=cfg.tracker.invert_turn,
-                    angular_scale=(
-                        cfg.path_memory.corner_command_yaw_scale
-                        if motion.source == "command_fallback"
-                        else 1.0
-                    ),
-                )
-                memory_status = delayed.status
-                if mission is not None:
-                    memory_status = replace(memory_status, mode="fixed_sessions")
-                    if (
-                        mission.executor_kind == ExecutorKind.CORNER
-                        and corner_state_before == "armed"
-                        and corner_margin.state == "armed"
-                    ):
-                        if mission_geometry_decision is not None:
-                            fixed_reason = (
-                                "corner_waiting_cruise_recovery"
-                                if sm.state == RaceState.STOPPED
-                                else "corner_waiting_control_prerequisite"
-                            )
-                        elif geometry_decision is not None:
-                            fixed_reason = mission.last_gate_reason
-                        elif (
-                            geometry_observation is not None
-                            and geometry_observation.kind != "straight_or_unknown"
-                        ):
-                            fixed_reason = f"corner_observing_{geometry_observation.kind}"
-                        else:
-                            fixed_reason = "corner_waiting_geometry"
-                        memory_status = replace(memory_status, reason=fixed_reason)
-                if (
-                    memory_status.transition_event == TransitionEvent.HANDOFF_READY
-                    or (corner_state_before != "armed" and corner_margin.state == "armed")
-                ):
-                    for session_filter in session_geometry_filters.values():
-                        session_filter.reset()
-                    legacy_geometry_filter.reset()
-                if memory_status.transition_event == TransitionEvent.HANDOFF_READY:
-                    command = sm.reacquire_from(visual_fit, now)
-                    if mission is not None:
-                        mission.transition(MissionEvent.PHASE_COMPLETED)
-                        # Session progress itself prevents duplicate triggers.
-                        # Begin the next detector fresh instead of cooldown.
-                        corner_margin = CornerCommandDelay(
-                            cfg.path_memory,
-                            handoff_conf_min=cfg.tracker.conf_predict,
-                            tracker_cfg=cfg.tracker,
-                        )
-                        for session_filter in session_geometry_filters.values():
-                            session_filter.reset()
-                        legacy_geometry_filter.reset()
-                elif corner_state_before == "approach" and corner_margin.state == "armed":
-                    # Approach rejection is an ownership hand-back, not a
-                    # continuation of the cruise filter that was frozen before
-                    # the event.  Rebuild it atomically from the current view.
-                    sm.reset()
-                    command = sm.step(
-                        visual_fit,
-                        now=now,
-                        obstacle=obstacle_decision.stop_required,
-                    )
-                elif delayed.v != command.v or delayed.w != command.w:
-                    command = replace(
-                        command,
-                        v=delayed.v,
-                        w=delayed.w,
-                        reason=f"corner_{memory_status.reason}",
-                    )
-            if ring_session and ring_entry.state != "waiting":
-                control_owner = ControlOwner.RING_EXECUTOR
-            elif corner_owns_chassis:
-                control_owner = ControlOwner.CORNER_EXECUTOR
-            else:
-                control_owner = ControlOwner.CRUISE
-
-            stop_cause = None
-            transition_event = memory_status.transition_event
-            if mission is not None and mission.session == CourseSession.FINISHED:
-                stop_cause = StopCause.MISSION_FINISHED
-            elif obstacle_decision.stop_required:
-                stop_cause = StopCause.OBSTACLE
-                if control_owner != ControlOwner.CRUISE:
-                    transition_event = TransitionEvent.EXECUTOR_HELD
-            elif (
-                control_owner == ControlOwner.RING_EXECUTOR
-                and ring_entry.state in {"tracking", "inside", "exiting"}
-                and ring_result is not None
-                and ring_result.fit is None
-            ):
-                stop_cause = StopCause.ROUTE_LOST
-                transition_event = TransitionEvent.ROUTE_LOST
-            elif control_owner == ControlOwner.CORNER_EXECUTOR and corner_margin.state in {
-                "failed", "failed_locked",
-            }:
-                stop_cause = StopCause.EXECUTOR_FAILED
-            elif sm.state == RaceState.STOPPED and sm.last_event == "search_timeout":
-                stop_cause = StopCause.SEARCH_TIMEOUT
-
-            arbitration = arbiter.resolve(
-                command,
-                owner=control_owner,
-                stop_cause=stop_cause,
-                slow_v_limit=(
-                    cfg.tracker.v_max * cfg.obstacle.slow_speed_ratio
-                    if obstacle_decision.slow_required else None
                 ),
-                transition_event=transition_event,
+                capture_geometry_debug=capture_geometry_debug,
             )
+            crop = pipeline_result.crop
+            x0, y0, x1, y1 = pipeline_result.crop_rect
+            track_center = pipeline_result.track_center
+            mask = pipeline_result.mask
+            features = pipeline_result.features
+            visual_fit = pipeline_result.ordinary_fit
+            fixed_step = pipeline_result.stage
+            vision_finished_at = capture_finished_at + (
+                pipeline_result.timings.ordinary_vision_ms / 1000.0
+            )
+            stage_started_at = vision_finished_at
+            operator_clear_event = None
+            if _OPERATOR_CLEAR_REQUESTS != handled_clear_requests:
+                handled_clear_requests = _OPERATOR_CLEAR_REQUESTS
+                if frame_pipeline.clear_route_loss():
+                    operator_clear_event = "route_lost_cleared"
+                else:
+                    operator_clear_event = "clear_rejected"
+            geometry_observation = fixed_step.geometry_observation
+            geometry_decision = fixed_step.geometry_decision
+            geometry_debug = fixed_step.geometry_debug
+            geometry_finished_at = (
+                stage_started_at + pipeline_result.timings.stage_ms / 1000.0
+            )
+
+            fit = fixed_step.fit
+            memory_status = fixed_step.memory_status
+            route_fit = fixed_step.route_fit
+            mission_geometry_decision = geometry_decision
+            barrier_step = fixed_step.barrier
+            candidate_producer = fixed_step.candidate_producer
+            ring_result = fixed_step.ring_result
+            ring_executor = (
+                getattr(fixed_course.component, "executor", None)
+                if fixed_step.detector in {DetectorKind.RING_ENTRY, DetectorKind.RING_EXIT}
+                else None
+            )
+            ring_travelled_for_log = (
+                None
+                if ring_executor is None
+                else ring_executor.travelled_m
+            )
+            ring_clear_for_log = (
+                None
+                if ring_executor is None
+                else ring_executor.clear_frames
+            )
+
+            command = fixed_step.candidate
+            arbitration = pipeline_result.arbitration
             command = arbitration.final
             cmd_v, cmd_w = command.v, command.w
             bot.set_car_motion(cmd_v, cmd_w)
+            control_finished_at = time.monotonic()
             last_cmd_v, last_cmd_w = cmd_v, cmd_w
 
+            active_component = fixed_course.component
+            corner_executor = (
+                getattr(active_component, "executor", None)
+                if fixed_step.detector == DetectorKind.CORNER
+                else None
+            )
+            ring_executor = (
+                getattr(active_component, "executor", None)
+                if fixed_step.detector in {DetectorKind.RING_ENTRY, DetectorKind.RING_EXIT}
+                else None
+            )
             summary = command_summary(command, fit)
             summary["t"] = round(now - start, 2)
             summary["motion_v"] = round(motion.linear, 4)
             summary["motion_w"] = round(motion.angular, 4)
             summary["motion_source"] = motion.source
+            summary["timing_capture_ms"] = round(
+                (capture_finished_at - loop_started_at) * 1000.0, 3,
+            )
+            summary["timing_ordinary_vision_ms"] = round(
+                (vision_finished_at - capture_finished_at) * 1000.0, 3,
+            )
+            summary["timing_geometry_ms"] = round(
+                (geometry_finished_at - stage_started_at) * 1000.0, 3,
+            )
+            summary["timing_control_ms"] = round(
+                (control_finished_at - geometry_finished_at) * 1000.0, 3,
+            )
+            summary["timing_control_path_ms"] = round(
+                (control_finished_at - loop_started_at) * 1000.0, 3,
+            )
+            summary["timing_loop_total_ms"] = previous_loop_total_ms
+            summary["deadline_miss"] = previous_deadline_miss
+            summary["deadline_lag_ms"] = previous_deadline_lag_ms
             summary["path_strategy"] = memory_status.mode
-            summary["mission_state"] = None if mission is None else mission.session.value
+            summary["mission_state"] = mission.session.value
             summary["mission_transition_event"] = (
                 None
-                if mission is None or mission.last_transition_event is None
+                if mission.last_transition_event is None
                 else mission.last_transition_event.value
             )
+            summary["candidate_producer"] = candidate_producer.value
             summary["control_owner"] = arbitration.owner.value
-            summary["owner_epoch"] = arbitration.owner_epoch
-            summary["executor_phase"] = (
-                ring_entry.state
-                if arbitration.owner == ControlOwner.RING_EXECUTOR
-                else corner_margin.state
-                if arbitration.owner == ControlOwner.CORNER_EXECUTOR
-                else sm.state.value
+            summary["transition_barrier_state"] = fixed_step.barrier.barrier_state.value
+            summary["stationary_method"] = (
+                None
+                if barrier_step is None
+                else barrier_step.stationary_method.value
             )
+            summary["stationary_samples"] = (
+                0 if barrier_step is None else barrier_step.stationary_samples
+            )
+            summary["stationary_elapsed_sec"] = (
+                0.0
+                if barrier_step is None
+                else round(barrier_step.stationary_elapsed_sec, 3)
+            )
+            summary["stationary_fallback_reason"] = (
+                None if barrier_step is None else barrier_step.fallback_reason
+            )
+            summary["owner_epoch"] = arbitration.owner_epoch
+            summary["executor_phase"] = fixed_step.executor_phase
             summary["safety_state"] = arbitration.safety_state.value
             summary["stop_cause"] = (
                 None if arbitration.stop_cause is None else arbitration.stop_cause.value
             )
             summary["transition_event"] = arbitration.transition_event.value
             summary["safety_override"] = arbitration.safety_override
+            summary["operator_clear_event"] = operator_clear_event
             summary["candidate_command"] = {
                 "v": round(arbitration.candidate.v, 4),
                 "w": round(arbitration.candidate.w, 4),
@@ -845,23 +680,24 @@ def run(args: argparse.Namespace) -> int:
                 "w": round(arbitration.final.w, 4),
                 "reason": arbitration.final.reason,
             }
-            summary["course_session"] = None if mission is None else mission.session.value
-            summary["session_detector"] = (
-                None if mission is None else mission.detector_kind.value
-            )
-            summary["session_executor"] = (
-                None if mission is None else mission.executor_kind.value
-            )
+            summary["course_session"] = mission.session.value
+            summary["session_detector"] = fixed_step.detector.value
+            summary["session_executor"] = mission.executor_kind.value
             summary["path_strategy_active"] = memory_status.active
             summary["path_strategy_reason"] = memory_status.reason
             summary["path_strategy_remaining_m"] = round(memory_status.remaining_m, 4)
             summary["path_strategy_intent_dir"] = memory_status.intent_dir
             summary["path_strategy_points"] = memory_status.point_count
             summary["path_strategy_target"] = memory_status.target
-            summary["turn_exit_latched"] = corner_margin.exit_latch.latched
+            summary["turn_exit_latched"] = bool(
+                corner_executor is not None
+                and corner_executor.exit_latch.latched
+            )
             summary["turn_exit_last_e"] = (
-                round(corner_margin.exit_latch.last_e, 4)
-                if corner_margin.exit_latch.latched else None
+                round(corner_executor.exit_latch.last_e, 4)
+                if corner_executor is not None
+                and corner_executor.exit_latch.latched
+                else None
             )
             summary["camera_to_axle_m"] = round(cfg.path_memory.camera_to_axle_m, 4)
             summary["turn_entry_delay_m"] = round(cfg.path_memory.camera_to_axle_m, 4)
@@ -892,23 +728,32 @@ def run(args: argparse.Namespace) -> int:
             summary["geometry_decision"] = summary["geometry_kind"]
             summary["geometry_event"] = summary["geometry_kind"]
             summary["geometry_gate_accepted"] = mission_geometry_decision is not None
+            summary["geometry_observation_age_frames"] = (
+                fixed_step.geometry_age_frames
+            )
             summary["geometry_controller_eligible"] = bool(
-                pending_corner_takeover
+                mission_geometry_decision is not None
                 or (ring_result is not None and ring_result.fit is not None)
             )
-            summary["geometry_gate_reason"] = (
-                None if mission is None else mission.last_gate_reason
-            )
+            summary["geometry_gate_reason"] = mission.last_gate_reason
             summary["geometry_candidate_directions"] = (
                 [] if geometry_debug is None else list(geometry_debug.candidate_directions)
             )
             summary["ring_entry_state"] = (
                 None
                 if ring_result is None
-                else "completed" if ring_result.completed else ring_entry.state
+                else "completed"
+                if ring_result.completed
+                else None if ring_executor is None else ring_executor.state
             )
             summary["ring_phase_event"] = (
                 None if ring_result is None else ring_result.phase_event.value
+            )
+            summary["ring_observed_now"] = bool(
+                geometry_observation is not None and route_fit is not None
+            )
+            summary["ring_route_memory_available"] = bool(
+                ring_executor is not None and ring_executor.last_fit is not None
             )
             summary["ring_entry_selected_e_look"] = (
                 None if route_fit is None else round(route_fit.e_look, 4)
@@ -922,21 +767,32 @@ def run(args: argparse.Namespace) -> int:
             summary["ring_entry_clear_frames"] = (
                 ring_clear_for_log
             )
-            summary["fork_straight_phase"] = fork_straight_phase
-            summary["roundabout_direction"] = cfg.path_memory.roundabout_direction
+            summary["roundabout_direction"] = (
+                None if ring_executor is None else ring_executor.direction
+            )
             summary["roundabout_margin_enabled"] = cfg.path_memory.roundabout_margin_enabled
+            summary["ring_effective_margin_m"] = (
+                0.0
+                if ring_executor is None
+                else round(ring_executor.margin_distance_m, 4)
+            )
+            summary["ring_margin_remaining_m"] = (
+                round(ring_executor.margin_remaining_m, 4)
+                if ring_executor is not None and ring_executor.state == "margin"
+                else 0.0
+            )
+            summary["ring_route_control_active"] = bool(
+                ring_result is not None
+                and ring_result.fit is not None
+                and ring_executor is not None
+                and ring_executor.state in {"tracking", "inside", "exiting"}
+            )
             summary["roundabout_turn_w"] = cfg.path_memory.roundabout_replay_max_w
-            summary["obstacle_state"] = obstacle_decision.state.value
-            summary["obstacle_conf"] = round(obstacle_decision.confidence, 3)
-            summary["obstacle_armed"] = obstacle_armed
-            candidate = obstacle_decision.evidence.candidate
-            summary["obstacle_cue"] = None if candidate is None else candidate.cue
-            summary["obstacle_bbox"] = None if candidate is None else candidate.bbox
+            summary["debug_queue_depth"] = debug.image_queue.qsize() if debug.enabled else 0
+            summary["debug_image_drop_count"] = debug.image_drop_count
+            summary["debug_image_write_error_count"] = debug.image_write_error_count
             debug.record(
                 summary, frame, crop, mask, features, cfg, track_center,
-                raw_crop=raw_crop,
-                obstacle_decision=obstacle_decision,
-                raw_track_center=raw_track_center,
                 strategy_status=memory_status,
                 geometry_observation=geometry_observation,
                 geometry_debug=geometry_debug,
@@ -944,6 +800,7 @@ def run(args: argparse.Namespace) -> int:
             if now - last_log >= args.log_period:
                 print(json.dumps(summary, ensure_ascii=False))
                 last_log = now
+            live_frames.publish(frame, now)
 
             if args.display:
                 overlay = draw_debug_overlay(crop, features, cfg.vision.trigger_y_frac, crop_center=track_center)
@@ -951,9 +808,25 @@ def run(args: argparse.Namespace) -> int:
                 cv.imshow("race_runner", frame)
                 if cv.waitKey(1) & 0xFF == 27:
                     break
-            time.sleep(args.period)
+            loop_finished_at = time.monotonic()
+            previous_loop_total_ms = round(
+                (loop_finished_at - loop_started_at) * 1000.0,
+                3,
+            )
+            previous_deadline_miss = loop_finished_at > next_deadline
+            previous_deadline_lag_ms = round(
+                max(0.0, loop_finished_at - next_deadline) * 1000.0,
+                3,
+            )
+            sleep_sec = next_deadline - loop_finished_at
+            if sleep_sec > 0.0:
+                time.sleep(sleep_sec)
+            else:
+                # Do not accumulate permanent lag after one slow frame.
+                next_deadline = loop_finished_at
     finally:
         stop_chassis(bot)
+        live_frames.close()
         debug.close()
         cap.release()
         bot.close(stop_count=1, stop_delay=0.0)
@@ -975,6 +848,9 @@ def main() -> int:
     parser.add_argument("--debug-dir", default="", help="Save runtime frames and telemetry JSONL to this directory.")
     parser.add_argument("--debug-frame-period", type=float, default=0.5)
     parser.add_argument("--debug-jpeg-quality", type=int, default=82)
+    parser.add_argument("--publish-live-frames", action="store_true")
+    parser.add_argument("--live-frame-period", type=float, default=0.15)
+    parser.add_argument("--live-frame-jpeg-quality", type=int, default=72)
     return run(parser.parse_args())
 
 

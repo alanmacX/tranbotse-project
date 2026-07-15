@@ -173,8 +173,12 @@ class PathStrategyTests(unittest.TestCase):
         self.assertEqual(output.status.reason, "armed")
 
     def test_motion_reader_fallback(self):
-        measured = read_motion_sample(FakeBot((0.04, -0.2)), 0.01, 0.02)
+        unverified = read_motion_sample(FakeBot((0.04, -0.2)), 0.01, 0.02)
+        self.assertEqual(unverified.source, "measured_unverified")
+        self.assertFalse(unverified.fresh)
+        measured = read_motion_sample(FakeBot((0.04, -0.2, True)), 0.01, 0.02)
         self.assertEqual(measured.source, "measured")
+        self.assertTrue(measured.fresh)
         stale = read_motion_sample(FakeBot((0.0, 0.0)), 0.03, -0.1)
         self.assertEqual(stale.source, "command_fallback")
         stale_pivot = read_motion_sample(FakeBot((0.0, 0.0)), 0.0, -0.2)
@@ -813,6 +817,47 @@ class PathStrategyTests(unittest.TestCase):
                 output.v,
                 cfg.corner_align_v * cfg.corner_exit_predict_v_ratio,
             )
+
+    def test_far_only_component_cannot_latch_corner_exit(self):
+        latch = FirstEntryLineLatch(confirm_frames=3)
+        far = TrajectoryFit(
+            found=True, e0=0.8, theta=0.5, conf=0.9, n_bands=5,
+            nearest_band_index=3,
+        )
+        for _ in range(5):
+            self.assertFalse(latch.try_latch(far, direction=1))
+        self.assertEqual(latch.candidate_frames, 0)
+        self.assertFalse(latch.latched)
+
+    def test_far_only_component_cannot_refresh_committed_corner_exit(self):
+        cfg = PathMemoryConfig(
+            corner_exit_predict_sec=0.25,
+            corner_exit_predict_v_ratio=0.60,
+        )
+        gate = CornerCommandDelay(cfg)
+        gate.state = "exit_tracking"
+        gate.candidate_dir = 1
+        gate.exit_latch.latched = True
+        gate.exit_last_seen_now = 0.0
+        gate.exit_track_w = -0.12
+        far = TrajectoryFit(
+            found=True, e0=0.7, theta=0.4, conf=0.9, n_bands=5,
+            nearest_band_index=3,
+        )
+        features = LineFeatures(found=True)
+
+        held = gate.step(far, features, 0.0, 0.0, 0.1, 0.0, 0.0)
+        self.assertEqual(held.status.reason, "corner_exit_tracking")
+        self.assertAlmostEqual(held.w, -0.12)
+        self.assertAlmostEqual(
+            held.v,
+            cfg.corner_align_v * cfg.corner_exit_predict_v_ratio,
+        )
+        self.assertEqual(gate.exit_last_seen_now, 0.0)
+
+        lost = gate.step(far, features, 0.0, 0.0, 0.3, 0.0, 0.0)
+        self.assertEqual(lost.status.reason, "corner_exit_lost")
+        self.assertEqual(gate.state, "failed_locked")
 
     def test_failed_turn_hands_complete_offcentre_line_to_cruise(self):
         gate = CornerCommandDelay(
