@@ -142,7 +142,7 @@ def test_route_loss_clear_only_reaches_active_ring_executor():
     cfg.mission.initial_session = "ring_entry"
     controller = FixedCourseController(cfg)
     executor = controller.component.executor
-    executor.state = "aligning"
+    executor.state = "exiting"
     executor.last_fit = context().visual_fit
     executor.missing_frames = 6
 
@@ -150,21 +150,21 @@ def test_route_loss_clear_only_reaches_active_ring_executor():
     assert executor.missing_frames == 0
 
 
-def test_ring_rotate_search_is_owned_in_place_rotation_only():
+def test_ring_radius_acquire_is_owned_fixed_arc_only():
     cfg = RaceConfig()
     stage = _RingEntryStage(cfg, FixedSessionMission(cfg.mission))
-    stage.executor.state = "rotate_search"
+    stage.executor.state = "radius_acquire"
 
     command, producer = stage._command(
         context(),
-        RingEntryResult(None, "ring_entry_rotating_search"),
+        RingEntryResult(None, "ring_entry_radius_acquiring"),
         MotionCommand(0.06, 0.15, "cruise", RaceState.TRACK),
     )
 
     assert producer == CandidateProducer.RING_EXECUTOR
-    assert command.v == 0.0
+    assert command.v == cfg.path_memory.roundabout_arc_v
     assert command.w == -cfg.path_memory.roundabout_entry_search_w
-    assert command.reason == "ring_entry_rotating_search"
+    assert command.reason == "ring_entry_radius_acquiring"
 
 
 def test_finished_stage_is_stationary_and_terminal():

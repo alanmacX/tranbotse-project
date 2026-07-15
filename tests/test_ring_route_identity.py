@@ -33,9 +33,9 @@ def route(e=0.55, theta=0.30):
     )
 
 
-def tracking_executor():
+def inside_executor():
     executor = RingEntryExecutor(1)
-    executor.state = "tracking"
+    executor.state = "inside"
     executor.raw_fit = route()
     executor.last_fit = executor.raw_fit
     executor.last_now = 0.0
@@ -43,7 +43,7 @@ def tracking_executor():
 
 
 def test_single_frame_branch_swap_cannot_replace_locked_route():
-    executor = tracking_executor()
+    executor = inside_executor()
     locked = executor.last_fit
     swapped = route(-0.75, -0.45)
 
@@ -62,7 +62,7 @@ def test_single_frame_branch_swap_cannot_replace_locked_route():
 
 
 def test_branch_swap_requires_repeated_matching_candidate_and_is_bounded():
-    executor = tracking_executor()
+    executor = inside_executor()
     locked = executor.last_fit
     swapped = route(-0.75, -0.45)
     executor.step(ARC, swapped, now=0.1, linear=0.0, accepted_entry=False)
@@ -81,7 +81,7 @@ def test_branch_swap_requires_repeated_matching_candidate_and_is_bounded():
 
 
 def test_route_memory_bridges_only_bounded_gap_then_emits_typed_loss():
-    executor = tracking_executor()
+    executor = inside_executor()
     for index in range(5):
         bridged = executor.step(
             None,
@@ -105,7 +105,7 @@ def test_route_memory_bridges_only_bounded_gap_then_emits_typed_loss():
 
 
 def test_operator_clear_discards_route_that_caused_latch():
-    executor = tracking_executor()
+    executor = inside_executor()
     executor.missing_frames = 6
 
     assert executor.clear_route_loss()

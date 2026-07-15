@@ -285,6 +285,17 @@ class _RingEntryStage(_Stage):
             entry_search_timeout_sec=(
                 cfg.path_memory.roundabout_entry_search_timeout_sec
             ),
+            arc_v=cfg.path_memory.roundabout_arc_v,
+            radius_window_rad=cfg.path_memory.roundabout_radius_window_rad,
+            radius_stable_e=cfg.path_memory.roundabout_radius_stable_e,
+            radius_w_step=cfg.path_memory.roundabout_radius_w_step,
+            radius_confirm_windows=cfg.path_memory.roundabout_radius_confirm_windows,
+            radius_min_w=cfg.path_memory.roundabout_radius_min_w,
+            half_arc_yaw_rad=cfg.path_memory.roundabout_half_arc_yaw_rad,
+            half_arc_timeout_sec=cfg.path_memory.roundabout_half_arc_timeout_sec,
+            exit_reacquire_extra_rad=(
+                cfg.path_memory.roundabout_exit_reacquire_extra_rad
+            ),
             tracker_cfg=cfg.tracker,
         )
         self.geometry_filter = RingEntryGeometryFilter(
@@ -338,6 +349,7 @@ class _RingEntryStage(_Stage):
             now=context.now,
             linear=context.motion.linear,
             angular=context.motion.angular,
+            motion_source=context.motion.source,
             accepted_entry=accepted is not None,
             cruise_fit=context.visual_fit,
             incoming_v=context.last_command.v,
@@ -403,13 +415,15 @@ class _RingEntryStage(_Stage):
                 RaceState.TRACK,
                 None,
             ), CandidateProducer.RING_EXECUTOR
-        if self.executor.state == "rotate_search":
-            v, w = self.executor.entry_search_command(
+        if self.executor.state in {"radius_acquire", "half_arc", "exit_reacquire"}:
+            v, w = self.executor.fixed_arc_command(
                 invert_turn=self.cfg.tracker.invert_turn,
             )
             return MotionCommand(
                 v, w, result.reason, RaceState.TRACK, None,
             ), CandidateProducer.RING_EXECUTOR
+        if self.executor.state == "exit_ready":
+            return zero_command(result.reason), CandidateProducer.RING_EXECUTOR
         if result.fit is None:
             return zero_command(result.reason), CandidateProducer.RING_EXECUTOR
         v, w = self.executor.control(

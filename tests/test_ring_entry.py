@@ -26,6 +26,17 @@ class RingEntryTests(unittest.TestCase):
         observation, debug = analyze_capture_geometry(frame, cfg)
         return cfg, observation, debug
 
+    @staticmethod
+    def _fit(e0=0.1, e_look=0.2, theta=-0.4):
+        return TrajectoryFit(
+            found=True,
+            e0=e0,
+            e_look=e_look,
+            theta=theta,
+            conf=0.9,
+            path_memory=True,
+        )
+
     def test_debug_retains_both_paths_and_selected_route(self):
         _cfg, observation, debug = self._fork(direction=1)
         self.assertTrue(observation.is_fork)
@@ -45,553 +56,301 @@ class RingEntryTests(unittest.TestCase):
         self.assertIsNotNone(fit)
         self.assertTrue(fit.path_memory)
         self.assertTrue(fit.control_valid)
-        self.assertEqual(fit.n_bands, 0)
-        self.assertTrue(fit.disconnected)
         self.assertGreater(fit.e_look, 0.0)
         self.assertGreater(fit.theta, 0.0)
 
-    def _establish_alignment(self, executor, observation, now=0.1):
-        aligned = TrajectoryFit(
-            found=True, e_look=0.05, theta=0.08, conf=0.9,
-            path_memory=True,
-        )
-        if executor.state == "rotate_search":
-            executor.step(
-                observation, aligned, now=now,
-                linear=0.0, accepted_entry=False,
-            )
-            now += 0.1
-        for index in range(executor.align_confirm_frames):
-            executor.step(
-                observation, aligned, now=now + index * 0.1,
-                linear=0.0, accepted_entry=False,
-            )
-        self.assertEqual(executor.state, "tracking")
-        return aligned
-
-    def test_entry_completes_only_after_motion_and_fork_clear(self):
-        _cfg, fork, debug = self._fork(direction=1)
-        route_fit = selected_path_fit(
-            debug, fork, frame_center_x=365.0, control_width=290.0,
-        )
-        executor = RingEntryExecutor(1, clear_frames=2, min_distance_m=0.05)
-        started = executor.step(
-            fork, route_fit, now=0.0, linear=0.0, accepted_entry=True,
-        )
-        self.assertTrue(started.started)
-        self.assertFalse(started.completed)
-        aligned_fit = self._establish_alignment(executor, fork)
-        # Losing the fork without physical progress is not completion.
-        arc = type(fork)(
-            # Direction may flip once the chassis is on the sole visible arc;
-            # route identity was already locked while the fork was visible.
-            kind="curve", direction=-1, angle_rad=-0.7, confidence=0.9,
-            vertex_y_frac=0.55, incoming_e=0.0, incoming_theta=0.1,
-            endpoints=2, component_area=2000, is_fork=False,
-        )
-        self.assertFalse(executor.step(
-            arc, aligned_fit, now=0.5, linear=0.05, accepted_entry=False,
-        ).completed)
-        completed = executor.step(
-            arc, aligned_fit, now=1.5, linear=0.05, accepted_entry=False,
-        )
-        self.assertTrue(completed.completed)
-        self.assertEqual(completed.reason, "ring_entry_path_established")
-
-    def test_committed_route_bridges_five_missing_frames(self):
+    def test_raw_topology_cannot_own_motor_before_gate(self):
         _cfg, fork, debug = self._fork(direction=1)
         route_fit = selected_path_fit(
             debug, fork, frame_center_x=365.0, control_width=290.0,
         )
         executor = RingEntryExecutor(1)
-        executor.step(fork, route_fit, now=0.0, linear=0.0, accepted_entry=True)
-        executor.step(fork, route_fit, now=0.05, linear=0.0, accepted_entry=False)
-        for index in range(1, 6):
-            held = executor.step(
-                None, None, now=0.05 + index * 0.1, linear=0.03, accepted_entry=False,
-            )
-            self.assertIsNotNone(held.fit)
-        lost = executor.step(
-            None, None, now=0.65, linear=0.03, accepted_entry=False,
-        )
-        self.assertIsNone(lost.fit)
-        self.assertEqual(lost.phase_event, RingPhaseEvent.ROUTE_LOST)
-        self.assertEqual(lost.reason, "ring_entry_alignment_path_lost")
-
-    def test_route_loss_requires_explicit_clear_before_memory_is_reused(self):
-        _cfg, fork, debug = self._fork(direction=1)
-        route_fit = selected_path_fit(
-            debug, fork, frame_center_x=365.0, control_width=290.0,
-        )
-        executor = RingEntryExecutor(1)
-        executor.step(fork, route_fit, now=0.0, linear=0.0, accepted_entry=True)
-        executor.step(fork, route_fit, now=0.05, linear=0.0, accepted_entry=False)
-        for index in range(1, 7):
-            lost = executor.step(
-                None, None, now=0.05 + index * 0.1, linear=0.0,
-                accepted_entry=False,
-            )
-        self.assertIsNone(lost.fit)
-        self.assertTrue(executor.clear_route_loss())
-        self.assertEqual(executor.missing_frames, 0)
-        resumed = executor.step(
-            None, None, now=0.75, linear=0.0, accepted_entry=False,
-        )
-        self.assertIsNone(resumed.fit)
-        recovered = executor.step(
-            fork, route_fit, now=0.85, linear=0.0, accepted_entry=False,
-        )
-        self.assertIsNotNone(recovered.fit)
-
-    def test_route_loss_clear_rejects_non_lost_executor(self):
-        executor = RingEntryExecutor(1)
-        self.assertFalse(executor.clear_route_loss())
-
-    def test_raw_confirmed_topology_cannot_own_motor_before_gate(self):
-        _cfg, fork, debug = self._fork(direction=1)
-        route_fit = selected_path_fit(
-            debug, fork, frame_center_x=365.0, control_width=290.0,
-        )
-        executor = RingEntryExecutor(1)
-        observing = executor.step(
-            fork, route_fit, now=0.0, linear=0.0,
-            accepted_entry=False,
+        result = executor.step(
+            fork, route_fit, now=0.0, linear=0.0, accepted_entry=False,
         )
         self.assertEqual(executor.state, "waiting")
-        self.assertIsNone(observing.fit)
-        self.assertEqual(observing.reason, "ring_entry_waiting_topology")
+        self.assertIsNone(result.fit)
+        self.assertEqual(result.reason, "ring_entry_waiting_topology")
 
     def test_ring_margin_uses_independent_distance(self):
         cfg = RaceConfig()
-        cfg.path_memory.camera_to_axle_m = 0.45
-        cfg.path_memory.roundabout_margin_distance_m = 0.12
+        cfg.path_memory.camera_to_axle_m = 0.10
+        cfg.path_memory.roundabout_margin_distance_m = 0.45
         cfg.path_memory.roundabout_margin_enabled = False
-        self.assertEqual(effective_ring_margin_distance(
-            cfg.path_memory.roundabout_margin_distance_m,
-            cfg.path_memory.roundabout_margin_enabled,
-        ), 0.0)
-        cfg.path_memory.roundabout_margin_enabled = True
-        self.assertEqual(effective_ring_margin_distance(
-            cfg.path_memory.roundabout_margin_distance_m,
-            cfg.path_memory.roundabout_margin_enabled,
-        ), 0.12)
+        self.assertEqual(effective_ring_margin_distance(0.45, False), 0.0)
+        self.assertEqual(effective_ring_margin_distance(0.45, True), 0.45)
 
     def test_ring_margin_is_enabled_by_default(self):
         cfg = RaceConfig()
         self.assertTrue(cfg.path_memory.roundabout_margin_enabled)
         self.assertAlmostEqual(cfg.path_memory.roundabout_margin_distance_m, 0.45)
 
-    def test_zero_margin_still_passes_through_rotate_search(self):
+    def test_margin_transitions_only_to_radius_acquire(self):
         _cfg, fork, debug = self._fork(direction=1)
         route_fit = selected_path_fit(
             debug, fork, frame_center_x=365.0, control_width=290.0,
         )
-        executor = RingEntryExecutor(1, margin_distance_m=0.0)
-        started = executor.step(
+        executor = RingEntryExecutor(1, margin_distance_m=0.10)
+        first = executor.step(
             fork, route_fit, now=0.0, linear=0.0,
             accepted_entry=True, incoming_v=0.05,
         )
-        self.assertTrue(started.started)
-        self.assertEqual(executor.state, "rotate_search")
-        self.assertIsNone(started.fit)
-        self.assertEqual(started.reason, "ring_entry_rotating_search")
-        captured = executor.step(
-            fork, route_fit, now=0.1, linear=0.02, accepted_entry=False,
-        )
-        self.assertEqual(executor.state, "aligning")
-        self.assertIsNotNone(captured.fit)
-        self.assertEqual(captured.reason, "ring_entry_search_path_captured")
-
-    def test_rotate_search_requires_fresh_stable_path(self):
-        _cfg, fork, debug = self._fork(direction=1)
-        route_fit = selected_path_fit(
-            debug, fork, frame_center_x=365.0, control_width=290.0,
-        )
-        executor = RingEntryExecutor(
-            1, margin_distance_m=0.0, entry_capture_frames=3,
-        )
+        self.assertEqual(first.reason, "ring_entry_waiting_margin")
+        self.assertEqual(executor.state, "margin")
+        self.assertAlmostEqual(executor.margin_v, 0.05)
         executor.step(
-            fork, route_fit, now=0.0, linear=0.0, accepted_entry=True,
+            fork, route_fit, now=1.0, linear=0.05, accepted_entry=False,
         )
-        self.assertEqual(executor.state, "rotate_search")
+        transitioned = executor.step(
+            fork, route_fit, now=2.0, linear=0.05, accepted_entry=False,
+        )
+        self.assertEqual(executor.state, "radius_acquire")
+        self.assertEqual(transitioned.reason, "ring_entry_radius_acquiring")
+        self.assertIsNone(transitioned.fit)
 
-        stale = executor.step(
-            fork, route_fit, now=0.1, linear=0.02, accepted_entry=False,
-            fresh_geometry=False,
-        )
-        self.assertEqual(executor.state, "rotate_search")
-        self.assertEqual(stale.reason, "ring_entry_rotating_search")
+    def _advance_radius_window(self, executor, observation, e0, now):
+        fit = self._fit(e0=e0)
+        for offset in (0.5, 1.0):
+            result = executor.step(
+                observation,
+                fit,
+                now=now + offset,
+                linear=0.02,
+                angular=-0.10,
+                motion_source="measured",
+                accepted_entry=False,
+            )
+        return result, now + 1.0
 
-        executor.step(
-            fork, route_fit, now=0.2, linear=0.02, accepted_entry=False,
-        )
-        executor.step(
-            fork, route_fit, now=0.3, linear=0.02, accepted_entry=False,
-        )
-        captured = executor.step(
-            fork, route_fit, now=0.4, linear=0.02, accepted_entry=False,
-        )
-        self.assertEqual(executor.state, "aligning")
-        self.assertEqual(captured.reason, "ring_entry_search_path_captured")
-
-    def test_rotate_search_accepts_continuous_path_after_local_direction_flips(self):
-        _cfg, fork, debug = self._fork(direction=1)
-        route_fit = selected_path_fit(
-            debug, fork, frame_center_x=365.0, control_width=290.0,
-        )
+    def test_runtime_radius_locks_only_after_stable_windows(self):
+        _cfg, fork, _debug = self._fork(direction=1)
         executor = RingEntryExecutor(
             1,
-            entry_capture_frames=3,
+            margin_distance_m=0.0,
+            entry_search_w=0.08,
+            entry_search_max_angle_rad=0.8,
+            radius_window_rad=0.10,
+            radius_stable_e=0.05,
+            radius_confirm_windows=2,
         )
         executor.step(
-            fork, route_fit, now=0.0, linear=0.0, accepted_entry=True,
+            fork, self._fit(), now=0.0, linear=0.0, accepted_entry=True,
         )
-        opposite = type(fork)(
-            kind=fork.kind, direction=-1, angle_rad=fork.angle_rad,
-            confidence=fork.confidence, vertex_y_frac=fork.vertex_y_frac,
-            incoming_e=fork.incoming_e, incoming_theta=fork.incoming_theta,
-            endpoints=fork.endpoints, component_area=fork.component_area,
-            is_fork=fork.is_fork,
-        )
-        for index in range(2):
-            searching = executor.step(
-                opposite, route_fit, now=0.1 + index * 0.1,
-                linear=0.0, angular=-0.2, accepted_entry=False,
-            )
-            self.assertEqual(executor.state, "rotate_search")
-            self.assertIsNone(searching.fit)
-        captured = executor.step(
-            opposite, route_fit, now=0.3, linear=0.0,
-            angular=-0.2, accepted_entry=False,
-        )
-        self.assertEqual(executor.state, "aligning")
-        self.assertIsNotNone(captured.fit)
+        now = 0.0
+        for e0 in (0.20, 0.21, 0.22):
+            result, now = self._advance_radius_window(executor, fork, e0, now)
+        self.assertEqual(executor.state, "half_arc")
+        self.assertEqual(result.reason, "ring_entry_radius_locked")
+        self.assertEqual(executor.arc_turned_rad, 0.0)
+        self.assertEqual(executor.entry_search_elapsed_sec, 0.0)
+        self.assertAlmostEqual(executor.radius_estimate_m, 0.20, places=3)
+        self.assertEqual(executor.radius_source, "measured")
 
-    def test_rotate_search_times_out_at_angular_safety_boundary(self):
-        _cfg, fork, debug = self._fork(direction=1)
-        route_fit = selected_path_fit(
-            debug, fork, frame_center_x=365.0, control_width=290.0,
+    def test_radius_adjustment_occurs_only_at_window_boundary(self):
+        _cfg, fork, _debug = self._fork(direction=1)
+        executor = RingEntryExecutor(
+            1,
+            margin_distance_m=0.0,
+            entry_search_w=0.08,
+            entry_search_max_angle_rad=1.0,
+            radius_window_rad=0.10,
+            radius_stable_e=0.05,
+            radius_w_step=0.01,
+            radius_confirm_windows=3,
         )
+        executor.step(fork, self._fit(), now=0.0, linear=0.0, accepted_entry=True)
+        _result, now = self._advance_radius_window(executor, fork, 0.10, 0.0)
+        self.assertAlmostEqual(executor.arc_w, 0.08)
+        executor.step(
+            fork, self._fit(e0=0.30), now=now + 0.5,
+            linear=0.02, angular=-0.10, accepted_entry=False,
+        )
+        self.assertAlmostEqual(executor.arc_w, 0.08)
+        executor.step(
+            fork, self._fit(e0=0.30), now=now + 1.0,
+            linear=0.02, angular=-0.10, accepted_entry=False,
+        )
+        self.assertAlmostEqual(executor.arc_w, 0.09)
+
+    def test_fixed_arc_command_has_one_direction_and_never_reverses(self):
+        right = RingEntryExecutor(1, arc_v=0.02, entry_search_w=0.08)
+        left = RingEntryExecutor(-1, arc_v=0.02, entry_search_w=0.08)
+        self.assertEqual(right.fixed_arc_command(), (0.02, -0.08))
+        self.assertEqual(left.fixed_arc_command(), (0.02, 0.08))
+        right.arc_w = 0.10
+        self.assertEqual(right.fixed_arc_command(), (0.02, -0.10))
+
+    def test_half_arc_ignores_visual_fit_until_target_yaw(self):
+        _cfg, fork, _debug = self._fork(direction=1)
+        executor = RingEntryExecutor(1, half_arc_yaw_rad=0.30)
+        executor.state = "half_arc"
+        executor.arc_w = 0.09
+        executor.last_now = 0.0
+        wild = self._fit(e0=-0.8, e_look=1.0, theta=1.1)
+        first = executor.step(
+            fork, wild, now=1.0, linear=0.02, angular=-0.20,
+            accepted_entry=False,
+        )
+        self.assertEqual(executor.state, "half_arc")
+        self.assertEqual(first.reason, "ring_half_arc_running")
+        self.assertAlmostEqual(executor.arc_w, 0.09)
+        executor.step(
+            fork, wild, now=1.5, linear=0.02, angular=-0.20,
+            accepted_entry=False,
+        )
+        self.assertEqual(executor.state, "exit_reacquire")
+        self.assertAlmostEqual(executor.arc_w, 0.09)
+
+    def test_exit_reacquire_hands_off_only_after_confirmed_path(self):
+        _cfg, fork, _debug = self._fork(direction=1)
         executor = RingEntryExecutor(
             1, entry_capture_frames=3,
+            half_arc_yaw_rad=0.30,
+            exit_reacquire_extra_rad=0.40,
+        )
+        executor.state = "exit_reacquire"
+        executor.arc_turned_rad = 0.30
+        executor.last_now = 0.0
+        result = None
+        for index in range(3):
+            result = executor.step(
+                fork, self._fit(e0=0.1 + index * 0.01),
+                now=0.1 + index * 0.1,
+                linear=0.02,
+                angular=-0.08,
+                accepted_entry=False,
+            )
+        self.assertEqual(executor.state, "exit_ready")
+        self.assertEqual(result.phase_event, RingPhaseEvent.ENTRY_ESTABLISHED)
+        self.assertEqual(result.reason, "ring_half_arc_exit_path_captured")
+
+    def test_entry_states_advance_in_one_linear_order(self):
+        _cfg, fork, _debug = self._fork(direction=1)
+        executor = RingEntryExecutor(
+            1,
+            margin_distance_m=0.02,
+            entry_capture_frames=2,
+            entry_search_max_angle_rad=1.0,
+            radius_window_rad=0.05,
+            radius_confirm_windows=1,
+            half_arc_yaw_rad=0.20,
+            exit_reacquire_extra_rad=0.20,
+        )
+        states = []
+        executor.step(
+            fork, self._fit(), now=0.0, linear=0.0,
+            incoming_v=0.02, accepted_entry=True,
+        )
+        states.append(executor.state)
+        executor.step(
+            fork, self._fit(), now=1.0, linear=0.02,
+            accepted_entry=False,
+        )
+        states.append(executor.state)
+        # One baseline window plus one matching window locks the radius.
+        for now in (1.5, 2.0, 2.5, 3.0):
+            executor.step(
+                fork, self._fit(e0=0.20), now=now, linear=0.02,
+                angular=-0.05, accepted_entry=False,
+            )
+        states.append(executor.state)
+        for now in (3.5, 4.0):
+            executor.step(
+                fork, self._fit(e0=-0.80), now=now, linear=0.02,
+                angular=-0.20, accepted_entry=False,
+            )
+        states.append(executor.state)
+        for now in (4.1, 4.2):
+            executor.step(
+                fork, self._fit(e0=0.10), now=now, linear=0.02,
+                angular=-0.08, accepted_entry=False,
+            )
+        states.append(executor.state)
+        self.assertEqual(
+            states,
+            ["margin", "radius_acquire", "half_arc", "exit_reacquire", "exit_ready"],
+        )
+
+    def test_command_fallback_is_reported_as_proxy_radius(self):
+        _cfg, fork, _debug = self._fork(direction=1)
+        executor = RingEntryExecutor(
+            1, margin_distance_m=0.0, radius_window_rad=0.05,
+        )
+        executor.step(fork, self._fit(), now=0.0, linear=0.0, accepted_entry=True)
+        executor.step(
+            fork, self._fit(), now=0.5, linear=0.02, angular=-0.10,
+            motion_source="command_fallback", accepted_entry=False,
+        )
+        self.assertEqual(executor.radius_source, "command_proxy")
+        self.assertAlmostEqual(executor.radius_estimate_m, 0.20)
+
+    def test_radius_acquire_stops_at_angular_boundary(self):
+        _cfg, fork, _debug = self._fork(direction=1)
+        executor = RingEntryExecutor(
+            1,
+            margin_distance_m=0.0,
             entry_search_max_angle_rad=0.02,
             entry_search_timeout_sec=10.0,
         )
-        executor.step(
-            fork, route_fit, now=0.0, linear=0.0, accepted_entry=True,
-        )
+        executor.step(fork, self._fit(), now=0.0, linear=0.0, accepted_entry=True)
         lost = executor.step(
             None, None, now=1.0, linear=0.0,
             angular=-0.03, accepted_entry=False,
         )
         self.assertEqual(executor.state, "failed")
-        self.assertIsNone(lost.fit)
         self.assertEqual(lost.phase_event, RingPhaseEvent.ROUTE_LOST)
+        self.assertEqual(lost.reason, "ring_entry_radius_acquire_timeout")
+        repeated = executor.step(
+            None, None, now=2.0, linear=0.0,
+            angular=0.0, accepted_entry=False,
+        )
+        self.assertEqual(repeated.reason, "ring_entry_radius_acquire_timeout")
 
-    def test_rotate_search_has_one_fixed_owner_and_zero_translation(self):
-        right = RingEntryExecutor(1, entry_search_w=0.2)
-        left = RingEntryExecutor(-1, entry_search_w=0.2)
-        self.assertEqual(right.entry_search_command(), (0.0, -0.2))
-        self.assertEqual(left.entry_search_command(), (0.0, 0.2))
-        self.assertEqual(right.entry_search_command(invert_turn=True), (0.0, 0.2))
-
-    def test_alignment_requires_stable_selected_route_tangent(self):
-        executor = RingEntryExecutor(
-            1,
-            margin_distance_m=0.0,
-            align_e_tolerance=0.20,
-            align_theta_tolerance=0.25,
-            align_confirm_frames=2,
-        )
-        observation = type("Observation", (), {"is_fork": True})()
-        off_axis = TrajectoryFit(
-            found=True, e_look=0.55, theta=0.60, conf=0.9,
-            path_memory=True,
-        )
-        aligned = TrajectoryFit(
-            found=True, e_look=0.08, theta=0.12, conf=0.9,
-            path_memory=True,
-        )
-
-        first = executor.step(
-            observation, off_axis, now=0.0, linear=0.0, accepted_entry=True,
-        )
-        self.assertEqual(executor.state, "rotate_search")
-        self.assertEqual(first.reason, "ring_entry_rotating_search")
-        executor.step(
-            observation, aligned, now=0.1, linear=0.0, accepted_entry=False,
-        )
-        self.assertEqual(executor.state, "aligning")
-        executor.step(
-            observation, aligned, now=0.2, linear=0.0, accepted_entry=False,
-        )
-        established = executor.step(
-            observation, aligned, now=0.3, linear=0.0, accepted_entry=False,
-        )
-        self.assertEqual(executor.state, "tracking")
-        self.assertEqual(established.reason, "ring_entry_alignment_established")
-
-    def test_entry_margin_uses_translation_only_until_axle_margin_is_consumed(self):
-        _cfg, fork, debug = self._fork(direction=1)
-        route_fit = selected_path_fit(
-            debug, fork, frame_center_x=365.0, control_width=290.0,
-        )
-        executor = RingEntryExecutor(1, margin_distance_m=0.10)
-        started = executor.step(
-            fork, route_fit, now=0.0, linear=0.0,
-            accepted_entry=True, incoming_v=0.05,
-        )
-        self.assertEqual(started.reason, "ring_entry_waiting_margin")
-        self.assertEqual(executor.state, "margin")
-        self.assertAlmostEqual(executor.margin_remaining_m, 0.10)
-        self.assertAlmostEqual(executor.margin_v, 0.05)
-        self.assertAlmostEqual(executor.margin_w, 0.0)
-
-        waiting = executor.step(
-            fork, route_fit, now=1.0, linear=0.05, accepted_entry=True,
-        )
-        self.assertEqual(waiting.reason, "ring_entry_waiting_margin")
-        self.assertAlmostEqual(executor.margin_remaining_m, 0.05)
-        self.assertAlmostEqual(executor.margin_w, 0.0)
-        executor.command_w = -0.18
-        executor.control_now = 1.0
-        executor.pending_fit = route_fit
-        executor.pending_fit_frames = 1
-        committing = executor.step(
-            fork, route_fit, now=2.0, linear=0.05, accepted_entry=True,
-        )
-        self.assertEqual(executor.state, "rotate_search")
-        self.assertIsNone(committing.fit)
-        self.assertAlmostEqual(executor.command_w, 0.0)
-        self.assertIsNone(executor.control_now)
-        self.assertIsNone(executor.pending_fit)
-        self.assertEqual(executor.pending_fit_frames, 0)
-        self.assertIsNone(executor.raw_fit)
-        captured = executor.step(
-            fork, route_fit, now=2.1, linear=0.02, accepted_entry=False,
-        )
-        self.assertEqual(executor.state, "aligning")
-        self.assertIs(captured.fit, route_fit)
-        self.assertIs(executor.raw_fit, route_fit)
-
-    def test_reset_clears_margin_and_route_control_state(self):
-        executor = RingEntryExecutor(1, margin_distance_m=0.10)
-        executor.state = "margin"
-        executor.margin_remaining_m = 0.07
-        executor.margin_v = 0.05
-        executor.margin_w = -0.24
-        executor.command_w = -0.18
-        executor.control_now = 1.0
-        executor.raw_fit = TrajectoryFit(found=True, path_memory=True)
-        executor.pending_fit = executor.raw_fit
-        executor.pending_fit_frames = 1
-        executor.last_fit = executor.raw_fit
-        executor.missing_frames = 3
-
+    def test_reset_clears_runtime_radius_state(self):
+        executor = RingEntryExecutor(1)
+        executor.state = "half_arc"
+        executor.arc_w = 0.12
+        executor.arc_turned_rad = 1.2
+        executor.radius_estimate_m = 0.21
+        executor.radius_stable_windows = 2
         executor.reset()
-
         self.assertEqual(executor.state, "waiting")
-        self.assertEqual(executor.margin_remaining_m, 0.0)
-        self.assertEqual(executor.margin_v, 0.0)
-        self.assertEqual(executor.margin_w, 0.0)
-        self.assertEqual(executor.command_w, 0.0)
-        self.assertIsNone(executor.control_now)
-        self.assertIsNone(executor.raw_fit)
-        self.assertIsNone(executor.pending_fit)
-        self.assertEqual(executor.pending_fit_frames, 0)
-        self.assertIsNone(executor.last_fit)
-        self.assertEqual(executor.missing_frames, 0)
+        self.assertAlmostEqual(executor.arc_w, executor.entry_search_w)
+        self.assertEqual(executor.arc_turned_rad, 0.0)
+        self.assertIsNone(executor.radius_estimate_m)
+        self.assertEqual(executor.radius_stable_windows, 0)
 
-    def test_tracking_rejects_single_frame_branch_swap(self):
-        _cfg, fork, debug = self._fork(direction=1)
-        route_fit = selected_path_fit(
-            debug, fork, frame_center_x=365.0, control_width=290.0,
-        )
+    def test_inside_control_uses_roundabout_angular_limit(self):
         executor = RingEntryExecutor(1)
-        executor.step(fork, route_fit, now=0.0, linear=0.0, accepted_entry=True)
-        executor.step(fork, route_fit, now=0.05, linear=0.0, accepted_entry=False)
-        swapped = type(route_fit)(
-            **{
-                field: getattr(route_fit, field)
-                for field in route_fit.__dataclass_fields__
-                if field not in {"e_look", "theta"}
-            },
-            e_look=-route_fit.e_look - 1.0,
-            theta=-route_fit.theta,
-        )
-        held = executor.step(
-            fork, swapped, now=0.1, linear=0.03, accepted_entry=True,
-        )
-        self.assertAlmostEqual(held.fit.e_look, route_fit.e_look)
-
-    def test_persistent_new_local_path_segment_advances_reference(self):
-        _cfg, fork, debug = self._fork(direction=1)
-        route_fit = selected_path_fit(
-            debug, fork, frame_center_x=365.0, control_width=290.0,
-        )
-        executor = RingEntryExecutor(1)
-        executor.step(fork, route_fit, now=0.0, linear=0.0, accepted_entry=True)
-        executor.step(fork, route_fit, now=0.05, linear=0.0, accepted_entry=False)
-        advanced = type(route_fit)(
-            **{
-                field: getattr(route_fit, field)
-                for field in route_fit.__dataclass_fields__
-                if field not in {"e_look", "theta"}
-            },
-            e_look=-route_fit.e_look,
-            theta=route_fit.theta - 0.9,
-        )
-        first = executor.step(
-            fork, advanced, now=0.1, linear=0.03, accepted_entry=True,
-        )
-        second = executor.step(
-            fork, advanced, now=0.2, linear=0.03, accepted_entry=True,
-        )
-        self.assertAlmostEqual(first.fit.e_look, route_fit.e_look)
-        self.assertIsNotNone(second.fit)
-        executor.step(
-            fork, advanced, now=0.3, linear=0.03, accepted_entry=True,
-        )
-        self.assertIs(executor.raw_fit, advanced)
-
-    def test_route_carrot_is_slew_limited_and_filtered(self):
-        _cfg, fork, debug = self._fork(direction=1)
-        route_fit = selected_path_fit(
-            debug, fork, frame_center_x=365.0, control_width=290.0,
-        )
-        executor = RingEntryExecutor(1)
-        executor.step(fork, route_fit, now=0.0, linear=0.0, accepted_entry=True)
-        executor.step(fork, route_fit, now=0.05, linear=0.0, accepted_entry=False)
-        moved = type(route_fit)(
-            **{
-                field: getattr(route_fit, field)
-                for field in route_fit.__dataclass_fields__
-                if field != "e_look"
-            },
-            e_look=route_fit.e_look + 0.60,
-        )
-        result = executor.step(
-            fork, moved, now=0.1, linear=0.03, accepted_entry=True,
-        )
-        self.assertLess(result.fit.e_look - route_fit.e_look, 0.10)
-
-    def test_tracking_uses_approach_angular_limit(self):
-        executor = RingEntryExecutor(1)
-        executor.state = "tracking"
-        fit = TrajectoryFit(
-            found=True, e_look=1.0, theta=0.4, conf=0.9, n_bands=6,
-        )
+        executor.state = "inside"
+        fit = TrajectoryFit(found=True, e_look=1.0, theta=0.4, conf=0.9, n_bands=6)
         _v, w = executor.control(
             fit, now=0.0, v_max=0.06, k_pursuit=0.9, k_theta=0.3,
             max_w=0.2, approach_max_w=0.08,
         )
-        self.assertAlmostEqual(abs(w), 0.08)
-
-        executor.state = "inside"
-        executor.control_now = None
-        _v, w = executor.control(
-            fit, now=0.1, v_max=0.06, k_pursuit=0.9, k_theta=0.3,
-            max_w=0.2, approach_max_w=0.08,
-        )
         self.assertAlmostEqual(abs(w), 0.2)
 
-    def test_angular_command_cannot_reverse_at_full_rate_in_one_frame(self):
-        executor = RingEntryExecutor(1)
-        executor.state = "tracking"
-        right = type("Fit", (), {})
-        # Use real fits so this test covers the executor's public control API.
-        from transbot_race.vision import TrajectoryFit
-        first = TrajectoryFit(found=True, e_look=1.0, theta=0.3, conf=0.9, n_bands=6)
-        opposite = TrajectoryFit(found=True, e_look=-1.0, theta=-0.3, conf=0.9, n_bands=6)
-        _v, first_w = executor.control(
-            first, now=0.0, v_max=0.06, k_pursuit=0.9, k_theta=0.3,
-            max_w=0.2, approach_max_w=0.08,
-        )
-        _v, next_w = executor.control(
-            opposite, now=0.1, v_max=0.06, k_pursuit=0.9, k_theta=0.3,
-            max_w=0.2, approach_max_w=0.08,
-        )
-        self.assertLess(first_w, 0.0)
-        self.assertLess(next_w, 0.0)
-        self.assertLessEqual(abs(next_w - first_w), 0.0351)
-
-    def test_roundabout_keeps_control_through_inside_and_confirms_exit_cruise(self):
-        _cfg, fork, debug = self._fork(direction=1)
-        route_fit = selected_path_fit(
-            debug, fork, frame_center_x=365.0, control_width=290.0,
-        )
-        executor = RingEntryExecutor(
-            1, clear_frames=2, min_distance_m=0.02,
-            inside_arm_distance_m=0.02, exit_distance_m=0.02,
-        )
-        executor.step(fork, route_fit, now=0.0, linear=0.0, accepted_entry=True)
-        aligned_fit = self._establish_alignment(executor, fork)
-        arc = type(fork)(
-            kind="curve", direction=1, angle_rad=0.7, confidence=0.9,
-            vertex_y_frac=0.55, incoming_e=0.0, incoming_theta=0.1,
-            endpoints=2, component_area=2000, is_fork=False,
-        )
-        first_arc = executor.step(
-            arc, aligned_fit, now=0.5, linear=0.05, accepted_entry=False,
-        )
-        self.assertFalse(first_arc.completed)
-        entry_done = executor.step(
-            arc, aligned_fit, now=0.9, linear=0.05, accepted_entry=False,
-        )
-        self.assertTrue(entry_done.completed)
-        self.assertEqual(entry_done.phase_event, RingPhaseEvent.ENTRY_ESTABLISHED)
-        self.assertEqual(executor.state, "inside")
-
-        executor.step(arc, route_fit, now=1.0, linear=0.04, accepted_entry=False)
-        executor.step(arc, route_fit, now=1.5, linear=0.04, accepted_entry=False)
-        exiting = executor.step(
-            fork, route_fit, now=2.0, linear=0.04, accepted_entry=True,
-        )
-        self.assertEqual(executor.state, "exiting")
-        self.assertFalse(exiting.completed)
-        self.assertEqual(exiting.phase_event, RingPhaseEvent.EXIT_SELECTED)
-
-        from transbot_race.vision import TrajectoryFit
+    def test_ring_exit_uses_normal_cruise_follow_boundary(self):
+        _cfg, fork, _debug = self._fork(direction=1)
+        executor = RingEntryExecutor(1, clear_frames=4, exit_distance_m=0.0)
+        executor.state = "exiting"
         cruise = TrajectoryFit(
             found=True, e0=0.1, e_look=0.1, theta=0.1,
             conf=0.9, n_bands=6, disconnected=False,
         )
-        result = None
-        for index in range(4):
-            result = executor.step(
-                arc, route_fit, now=2.5 + index * 0.5,
-                linear=0.04, accepted_entry=False, cruise_fit=cruise,
-            )
-        self.assertTrue(result.completed)
-        self.assertEqual(result.phase_event, RingPhaseEvent.EXECUTOR_COMPLETED)
-        self.assertEqual(result.reason, "ring_exit_cruise_established")
-
-    def test_ring_exit_uses_normal_cruise_follow_boundary(self):
-        _cfg, fork, _debug = self._fork(direction=1)
-        executor = RingEntryExecutor(
-            1, clear_frames=4, exit_distance_m=0.0,
-        )
-        executor.state = "exiting"
-        cruise = TrajectoryFit(
-            found=True, e0=0.463, e_look=0.463, theta=0.338,
-            conf=0.90, n_bands=5, disconnected=False,
-        )
         arc = type(fork)(
             kind="curve", direction=1, angle_rad=0.7, confidence=0.9,
             vertex_y_frac=0.55, incoming_e=0.0, incoming_theta=0.1,
             endpoints=2, component_area=2000, is_fork=False,
         )
-
         result = None
         for index in range(4):
             result = executor.step(
                 arc, None, now=index * 0.1, linear=0.0,
                 accepted_entry=False, cruise_fit=cruise,
             )
-
         self.assertTrue(result.completed)
         self.assertEqual(result.phase_event, RingPhaseEvent.EXECUTOR_COMPLETED)
-        self.assertEqual(result.reason, "ring_exit_cruise_established")
 
 
 if __name__ == "__main__":

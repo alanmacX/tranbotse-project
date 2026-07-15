@@ -80,10 +80,21 @@ class PathMemoryConfig:
     # detected from a different image-space landmark.
     roundabout_margin_enabled: bool = True
     roundabout_margin_distance_m: float = 0.45
-    roundabout_entry_search_w: float = 0.20
+    # Legacy "entry_search" config names now parameterize the bounded runtime
+    # radius-acquisition state; there is no rotate-in-place search state.
+    roundabout_entry_search_w: float = 0.08
     roundabout_entry_capture_frames: int = 3
-    roundabout_entry_search_max_angle_rad: float = 1.75
-    roundabout_entry_search_timeout_sec: float = 9.0
+    roundabout_entry_search_max_angle_rad: float = 0.75
+    roundabout_entry_search_timeout_sec: float = 12.0
+    roundabout_arc_v: float = 0.020
+    roundabout_radius_window_rad: float = 0.15
+    roundabout_radius_stable_e: float = 0.08
+    roundabout_radius_w_step: float = 0.01
+    roundabout_radius_confirm_windows: int = 2
+    roundabout_radius_min_w: float = 0.05
+    roundabout_half_arc_yaw_rad: float = 3.141592653589793
+    roundabout_half_arc_timeout_sec: float = 50.0
+    roundabout_exit_reacquire_extra_rad: float = 0.35
     roundabout_replay_max_w: float = 0.20
     corner_turn_angle_rad: float = 1.57
     corner_max_turn_angle_rad: float = 2.6179938779914944

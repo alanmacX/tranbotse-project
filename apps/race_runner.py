@@ -123,6 +123,26 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError("roundabout entry search angle must be positive")
     if cfg.path_memory.roundabout_entry_search_timeout_sec <= 0.0:
         raise ValueError("roundabout entry search timeout must be positive")
+    if cfg.path_memory.roundabout_arc_v <= 0.0:
+        raise ValueError("roundabout arc speed must be positive")
+    if cfg.path_memory.roundabout_radius_window_rad <= 0.0:
+        raise ValueError("roundabout radius window must be positive")
+    if cfg.path_memory.roundabout_radius_stable_e < 0.0:
+        raise ValueError("roundabout radius stability tolerance cannot be negative")
+    if cfg.path_memory.roundabout_radius_w_step < 0.0:
+        raise ValueError("roundabout radius turn-rate step cannot be negative")
+    if cfg.path_memory.roundabout_radius_confirm_windows < 1:
+        raise ValueError("roundabout radius confirmation windows must be positive")
+    if cfg.path_memory.roundabout_radius_min_w <= 0.0:
+        raise ValueError("roundabout minimum turn rate must be positive")
+    if cfg.path_memory.roundabout_radius_min_w > cfg.path_memory.roundabout_entry_search_w:
+        raise ValueError("roundabout minimum turn rate cannot exceed its initial rate")
+    if cfg.path_memory.roundabout_half_arc_yaw_rad <= 0.0:
+        raise ValueError("roundabout half arc yaw must be positive")
+    if cfg.path_memory.roundabout_half_arc_timeout_sec <= 0.0:
+        raise ValueError("roundabout half arc timeout must be positive")
+    if cfg.path_memory.roundabout_exit_reacquire_extra_rad < 0.0:
+        raise ValueError("roundabout exit reacquire angle cannot be negative")
     if cfg.mission.ring_entry_direction not in (-1, 1):
         raise ValueError("mission ring-entry direction must be -1 (left) or +1 (right)")
     if cfg.mission.ring_exit_direction not in (-1, 1):
@@ -789,22 +809,42 @@ def run(args: argparse.Namespace) -> int:
                 if ring_executor is not None and ring_executor.state == "margin"
                 else 0.0
             )
-            summary["ring_search_candidate_frames"] = (
+            summary["ring_exit_reacquire_candidate_frames"] = (
                 None if ring_executor is None else ring_executor.entry_candidate_frames
             )
-            summary["ring_search_yaw_rad"] = (
+            summary["ring_radius_acquire_yaw_rad"] = (
                 None if ring_executor is None
                 else round(ring_executor.entry_search_yaw_rad, 4)
             )
-            summary["ring_search_elapsed_sec"] = (
+            summary["ring_fixed_arc_elapsed_sec"] = (
                 None if ring_executor is None
                 else round(ring_executor.entry_search_elapsed_sec, 4)
+            )
+            summary["ring_arc_turned_rad"] = (
+                None if ring_executor is None
+                else round(ring_executor.arc_turned_rad, 4)
+            )
+            summary["ring_arc_v"] = (
+                None if ring_executor is None else round(ring_executor.arc_v, 4)
+            )
+            summary["ring_arc_w"] = (
+                None if ring_executor is None else round(ring_executor.arc_w, 4)
+            )
+            summary["ring_radius_estimate_m"] = (
+                None if ring_executor is None or ring_executor.radius_estimate_m is None
+                else round(ring_executor.radius_estimate_m, 4)
+            )
+            summary["ring_radius_source"] = (
+                None if ring_executor is None else ring_executor.radius_source
+            )
+            summary["ring_radius_stable_windows"] = (
+                None if ring_executor is None else ring_executor.radius_stable_windows
             )
             summary["ring_route_control_active"] = bool(
                 ring_result is not None
                 and ring_result.fit is not None
                 and ring_executor is not None
-                and ring_executor.state in {"aligning", "tracking", "inside", "exiting"}
+                and ring_executor.state in {"inside", "exiting"}
             )
             summary["roundabout_turn_w"] = cfg.path_memory.roundabout_replay_max_w
             summary["debug_queue_depth"] = debug.image_queue.qsize() if debug.enabled else 0
