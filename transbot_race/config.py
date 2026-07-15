@@ -80,16 +80,17 @@ class PathMemoryConfig:
     # detected from a different image-space landmark.
     roundabout_margin_enabled: bool = True
     roundabout_margin_distance_m: float = 0.45
-    # Legacy "entry_search" config names now parameterize the bounded runtime
-    # radius-acquisition state; there is no rotate-in-place search state.
+    # The bounded entry-search state is a fixed right pivot that establishes
+    # the upward tangent before the opposite-side circle arc begins.
     roundabout_entry_search_w: float = 0.08
     roundabout_entry_capture_frames: int = 3
     roundabout_entry_search_max_angle_rad: float = 0.75
     roundabout_entry_search_timeout_sec: float = 12.0
+    roundabout_tangent_theta_tolerance: float = 0.20
     roundabout_arc_v: float = 0.020
-    # The selected roundabout is entered while reversing after the forward
-    # margin. Keep longitudinal direction independent from left/right yaw.
-    roundabout_arc_motion_sign: int = -1
+    roundabout_radius_initial_w: float = 0.08
+    roundabout_radius_acquire_max_yaw_rad: float = 0.75
+    roundabout_radius_acquire_timeout_sec: float = 12.0
     roundabout_radius_window_rad: float = 0.15
     roundabout_radius_stable_e: float = 0.08
     roundabout_radius_w_step: float = 0.01
@@ -97,6 +98,7 @@ class PathMemoryConfig:
     roundabout_radius_min_w: float = 0.05
     roundabout_half_arc_yaw_rad: float = 3.141592653589793
     roundabout_half_arc_timeout_sec: float = 50.0
+    roundabout_exit_reacquire_frames: int = 3
     roundabout_exit_reacquire_extra_rad: float = 0.35
     roundabout_replay_max_w: float = 0.20
     corner_turn_angle_rad: float = 1.57

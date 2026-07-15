@@ -123,10 +123,16 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError("roundabout entry search angle must be positive")
     if cfg.path_memory.roundabout_entry_search_timeout_sec <= 0.0:
         raise ValueError("roundabout entry search timeout must be positive")
+    if cfg.path_memory.roundabout_tangent_theta_tolerance < 0.0:
+        raise ValueError("roundabout tangent tolerance cannot be negative")
     if cfg.path_memory.roundabout_arc_v <= 0.0:
         raise ValueError("roundabout arc speed must be positive")
-    if cfg.path_memory.roundabout_arc_motion_sign not in (-1, 1):
-        raise ValueError("roundabout arc motion sign must be -1 or +1")
+    if cfg.path_memory.roundabout_radius_initial_w <= 0.0:
+        raise ValueError("roundabout initial radius turn rate must be positive")
+    if cfg.path_memory.roundabout_radius_acquire_max_yaw_rad <= 0.0:
+        raise ValueError("roundabout radius acquisition yaw must be positive")
+    if cfg.path_memory.roundabout_radius_acquire_timeout_sec <= 0.0:
+        raise ValueError("roundabout radius acquisition timeout must be positive")
     if cfg.path_memory.roundabout_radius_window_rad <= 0.0:
         raise ValueError("roundabout radius window must be positive")
     if cfg.path_memory.roundabout_radius_stable_e < 0.0:
@@ -137,12 +143,14 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError("roundabout radius confirmation windows must be positive")
     if cfg.path_memory.roundabout_radius_min_w <= 0.0:
         raise ValueError("roundabout minimum turn rate must be positive")
-    if cfg.path_memory.roundabout_radius_min_w > cfg.path_memory.roundabout_entry_search_w:
+    if cfg.path_memory.roundabout_radius_min_w > cfg.path_memory.roundabout_radius_initial_w:
         raise ValueError("roundabout minimum turn rate cannot exceed its initial rate")
     if cfg.path_memory.roundabout_half_arc_yaw_rad <= 0.0:
         raise ValueError("roundabout half arc yaw must be positive")
     if cfg.path_memory.roundabout_half_arc_timeout_sec <= 0.0:
         raise ValueError("roundabout half arc timeout must be positive")
+    if cfg.path_memory.roundabout_exit_reacquire_frames < 1:
+        raise ValueError("roundabout exit reacquire frames must be positive")
     if cfg.path_memory.roundabout_exit_reacquire_extra_rad < 0.0:
         raise ValueError("roundabout exit reacquire angle cannot be negative")
     if cfg.mission.ring_entry_direction not in (-1, 1):
@@ -811,16 +819,28 @@ def run(args: argparse.Namespace) -> int:
                 if ring_executor is not None and ring_executor.state == "margin"
                 else 0.0
             )
+            summary["ring_tangent_candidate_frames"] = (
+                None if ring_executor is None
+                else ring_executor.tangent_candidate_frames
+            )
             summary["ring_exit_reacquire_candidate_frames"] = (
                 None if ring_executor is None else ring_executor.entry_candidate_frames
             )
+            summary["ring_tangent_yaw_rad"] = (
+                None if ring_executor is None
+                else round(ring_executor.tangent_yaw_rad, 4)
+            )
+            summary["ring_tangent_elapsed_sec"] = (
+                None if ring_executor is None
+                else round(ring_executor.tangent_elapsed_sec, 4)
+            )
             summary["ring_radius_acquire_yaw_rad"] = (
                 None if ring_executor is None
-                else round(ring_executor.entry_search_yaw_rad, 4)
+                else round(ring_executor.radius_acquire_yaw_rad, 4)
             )
             summary["ring_fixed_arc_elapsed_sec"] = (
                 None if ring_executor is None
-                else round(ring_executor.entry_search_elapsed_sec, 4)
+                else round(ring_executor.arc_elapsed_sec, 4)
             )
             summary["ring_arc_turned_rad"] = (
                 None if ring_executor is None
@@ -828,9 +848,6 @@ def run(args: argparse.Namespace) -> int:
             )
             summary["ring_arc_v"] = (
                 None if ring_executor is None else round(ring_executor.arc_v, 4)
-            )
-            summary["ring_arc_motion_sign"] = (
-                None if ring_executor is None else ring_executor.arc_motion_sign
             )
             summary["ring_arc_w"] = (
                 None if ring_executor is None else round(ring_executor.arc_w, 4)

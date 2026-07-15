@@ -162,12 +162,25 @@ def test_ring_radius_acquire_is_owned_fixed_arc_only():
     )
 
     assert producer == CandidateProducer.RING_EXECUTOR
-    assert command.v == (
-        cfg.path_memory.roundabout_arc_motion_sign
-        * cfg.path_memory.roundabout_arc_v
-    )
-    assert command.w == -cfg.path_memory.roundabout_entry_search_w
+    assert command.v == cfg.path_memory.roundabout_arc_v
+    assert command.w == cfg.path_memory.roundabout_radius_initial_w
     assert command.reason == "ring_entry_radius_acquiring"
+
+
+def test_ring_tangent_alignment_is_owned_right_pivot_only():
+    cfg = RaceConfig()
+    stage = _RingEntryStage(cfg, FixedSessionMission(cfg.mission))
+    stage.executor.state = "tangent_align"
+
+    command, producer = stage._command(
+        context(),
+        RingEntryResult(None, "ring_entry_tangent_aligning"),
+        MotionCommand(0.06, 0.15, "cruise", RaceState.TRACK),
+    )
+
+    assert producer == CandidateProducer.RING_EXECUTOR
+    assert command.v == 0.0
+    assert command.w == -cfg.path_memory.roundabout_entry_search_w
 
 
 def test_finished_stage_is_stationary_and_terminal():

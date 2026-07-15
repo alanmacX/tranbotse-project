@@ -114,8 +114,11 @@ class RingEntryExecutor:
         entry_capture_frames: int = 1,
         entry_search_max_angle_rad: float = 1.75,
         entry_search_timeout_sec: float = 9.0,
+        tangent_theta_tolerance: float = 0.20,
         arc_v: float = 0.020,
-        arc_motion_sign: int = -1,
+        radius_initial_w: float | None = None,
+        radius_acquire_max_yaw_rad: float = 0.75,
+        radius_acquire_timeout_sec: float = 12.0,
         radius_window_rad: float = 0.15,
         radius_stable_e: float = 0.08,
         radius_w_step: float = 0.01,
@@ -123,6 +126,7 @@ class RingEntryExecutor:
         radius_min_w: float = 0.05,
         half_arc_yaw_rad: float = math.pi,
         half_arc_timeout_sec: float = 50.0,
+        exit_reacquire_frames: int = 3,
         exit_reacquire_extra_rad: float = 0.35,
         tracker_cfg: TrackerConfig | None = None,
     ) -> None:
@@ -139,8 +143,17 @@ class RingEntryExecutor:
         self.entry_search_timeout_sec = max(
             0.0, float(entry_search_timeout_sec),
         )
+        self.tangent_theta_tolerance = max(0.0, float(tangent_theta_tolerance))
         self.arc_v = max(0.0, float(arc_v))
-        self.arc_motion_sign = 1 if int(arc_motion_sign) >= 0 else -1
+        self.radius_initial_w = abs(float(
+            self.entry_search_w if radius_initial_w is None else radius_initial_w
+        ))
+        self.radius_acquire_max_yaw_rad = max(
+            0.0, float(radius_acquire_max_yaw_rad),
+        )
+        self.radius_acquire_timeout_sec = max(
+            0.0, float(radius_acquire_timeout_sec),
+        )
         self.radius_window_rad = max(0.01, float(radius_window_rad))
         self.radius_stable_e = max(0.0, float(radius_stable_e))
         self.radius_w_step = max(0.0, float(radius_w_step))
@@ -148,6 +161,7 @@ class RingEntryExecutor:
         self.radius_min_w = max(0.01, abs(float(radius_min_w)))
         self.half_arc_yaw_rad = max(0.1, float(half_arc_yaw_rad))
         self.half_arc_timeout_sec = max(0.1, float(half_arc_timeout_sec))
+        self.exit_reacquire_frames_required = max(1, int(exit_reacquire_frames))
         self.exit_reacquire_extra_rad = max(0.0, float(exit_reacquire_extra_rad))
         self.tracker_cfg = tracker_cfg or TrackerConfig()
         self.margin_remaining_m = 0.0
@@ -167,9 +181,12 @@ class RingEntryExecutor:
         self.missing_frames = 0
         self.entry_candidate_fit: TrajectoryFit | None = None
         self.entry_candidate_frames = 0
-        self.entry_search_yaw_rad = 0.0
-        self.entry_search_elapsed_sec = 0.0
-        self.arc_w = self.entry_search_w
+        self.tangent_yaw_rad = 0.0
+        self.tangent_elapsed_sec = 0.0
+        self.tangent_candidate_frames = 0
+        self.radius_acquire_yaw_rad = 0.0
+        self.arc_elapsed_sec = 0.0
+        self.arc_w = self.radius_initial_w
         self.arc_turned_rad = 0.0
         self.radius_window_yaw_rad = 0.0
         self.radius_window_distance_m = 0.0
@@ -191,9 +208,12 @@ class RingEntryExecutor:
         self.margin_w = 0.0
         self.entry_candidate_fit = None
         self.entry_candidate_frames = 0
-        self.entry_search_yaw_rad = 0.0
-        self.entry_search_elapsed_sec = 0.0
-        self.arc_w = self.entry_search_w
+        self.tangent_yaw_rad = 0.0
+        self.tangent_elapsed_sec = 0.0
+        self.tangent_candidate_frames = 0
+        self.radius_acquire_yaw_rad = 0.0
+        self.arc_elapsed_sec = 0.0
+        self.arc_w = self.radius_initial_w
         self.arc_turned_rad = 0.0
         self.radius_window_yaw_rad = 0.0
         self.radius_window_distance_m = 0.0
@@ -218,6 +238,11 @@ class RingEntryExecutor:
 
     def set_direction(self, direction: int) -> None:
         self.direction = 1 if direction >= 0 else -1
+
+    @property
+    def arc_direction(self) -> int:
+        """The circle bends opposite the entry pivot around the tangent point."""
+        return -self.direction
 
     def clear_route_loss(self) -> bool:
         if self.state not in {"inside", "exiting"}:
@@ -345,11 +370,33 @@ class RingEntryExecutor:
         self.entry_candidate_fit = route_fit
 
     def fixed_arc_command(self, *, invert_turn: bool = False) -> tuple[float, float]:
-        """The sole command source during radius acquisition and the half arc."""
+        """Drive forward along the circle, opposite the entry-pivot side."""
         image_to_motor_sign = 1.0 if invert_turn else -1.0
         return (
-            self.arc_motion_sign * self.arc_v,
-            image_to_motor_sign * self.direction * self.arc_w,
+            self.arc_v,
+            image_to_motor_sign * self.arc_direction * self.arc_w,
+        )
+
+    def tangent_align_command(
+        self, *, invert_turn: bool = False,
+    ) -> tuple[float, float]:
+        """Pivot toward the requested entry side without translating."""
+        image_to_motor_sign = 1.0 if invert_turn else -1.0
+        return 0.0, image_to_motor_sign * self.direction * self.entry_search_w
+
+    def _observe_tangent_candidate(
+        self, route_fit: TrajectoryFit | None, *, fresh_geometry: bool,
+    ) -> None:
+        aligned = bool(
+            fresh_geometry
+            and route_fit is not None
+            and route_fit.control_valid
+            and route_fit.conf >= 0.55
+            and abs(route_fit.e0) <= 0.85
+            and abs(route_fit.theta) <= self.tangent_theta_tolerance
+        )
+        self.tangent_candidate_frames = (
+            self.tangent_candidate_frames + 1 if aligned else 0
         )
 
     def _reset_radius_window(self) -> None:
@@ -423,14 +470,17 @@ class RingEntryExecutor:
                 return RingEntryResult(
                     None, "ring_entry_waiting_margin", started, False,
                 )
-            self.state = "radius_acquire"
+            self.state = "tangent_align"
             self.travelled_m = 0.0
             self.clear_frames = 0
             self.entry_candidate_fit = None
             self.entry_candidate_frames = 0
-            self.entry_search_yaw_rad = 0.0
-            self.entry_search_elapsed_sec = 0.0
-            self.arc_w = self.entry_search_w
+            self.tangent_yaw_rad = 0.0
+            self.tangent_elapsed_sec = 0.0
+            self.tangent_candidate_frames = 0
+            self.radius_acquire_yaw_rad = 0.0
+            self.arc_elapsed_sec = 0.0
+            self.arc_w = self.radius_initial_w
             self.arc_turned_rad = 0.0
             self.radius_previous_e = None
             self.radius_stable_windows = 0
@@ -438,21 +488,55 @@ class RingEntryExecutor:
             self._reset_radius_window()
             self._reset_route_control()
             return RingEntryResult(
-                None, "ring_entry_radius_acquiring", started, False,
+                None, "ring_entry_tangent_aligning", started, False,
+            )
+
+        if self.state == "tangent_align":
+            self.tangent_yaw_rad += rotated
+            self.tangent_elapsed_sec += dt
+            self._observe_tangent_candidate(
+                route_fit, fresh_geometry=fresh_geometry,
+            )
+            if self.tangent_candidate_frames >= self.entry_capture_frames_required:
+                self.state = "radius_acquire"
+                # The right pivot establishes the tangent only. The geometric
+                # half-circle starts from zero with the forward-left arc.
+                self.radius_acquire_yaw_rad = 0.0
+                self.arc_elapsed_sec = 0.0
+                self.arc_turned_rad = 0.0
+                self.arc_w = self.radius_initial_w
+                self.radius_previous_e = None
+                self.radius_stable_windows = 0
+                self.radius_estimate_m = None
+                self._reset_radius_window()
+                self._reset_route_control()
+                return RingEntryResult(
+                    None, "ring_entry_radius_acquiring", started, False,
+                )
+            if (
+                self.tangent_yaw_rad >= self.entry_search_max_angle_rad
+                or self.tangent_elapsed_sec >= self.entry_search_timeout_sec
+            ):
+                self.state = "failed"
+                self.failure_reason = "ring_entry_tangent_align_timeout"
+                return RingEntryResult(
+                    None, self.failure_reason, started, False,
+                    RingPhaseEvent.ROUTE_LOST,
+                )
+            return RingEntryResult(
+                None, "ring_entry_tangent_aligning", started, False,
             )
 
         if self.state == "radius_acquire":
-            self.entry_search_yaw_rad += rotated
-            self.entry_search_elapsed_sec += dt
+            self.radius_acquire_yaw_rad += rotated
+            self.arc_elapsed_sec += dt
             self.arc_turned_rad += rotated
             self.radius_window_yaw_rad += rotated
-            # The fixed ring arc may deliberately run in reverse. Radius is a
-            # distance magnitude, so reverse travel must not be clipped away.
             self.radius_window_distance_m += arc_travelled
             self._observe_radius_anchor(route_fit, fresh_geometry=fresh_geometry)
             timed_out = bool(
-                self.entry_search_yaw_rad >= self.entry_search_max_angle_rad
-                or self.entry_search_elapsed_sec >= self.entry_search_timeout_sec
+                self.radius_acquire_yaw_rad >= self.radius_acquire_max_yaw_rad
+                or self.arc_elapsed_sec >= self.radius_acquire_timeout_sec
             )
             if timed_out:
                 self.state = "failed"
@@ -474,18 +558,11 @@ class RingEntryExecutor:
                 )
                 self.radius_stable_windows = self.radius_stable_windows + 1 if stable else 0
                 if mean_e is not None and self.radius_previous_e is not None and not stable:
-                    # Reversing flips the relationship between image drift and
-                    # a tighter/looser curvature, while the yaw side stays the
-                    # same. Include longitudinal direction exactly once.
-                    drift = (
-                        self.direction
-                        * self.arc_motion_sign
-                        * (mean_e - self.radius_previous_e)
-                    )
+                    drift = self.arc_direction * (mean_e - self.radius_previous_e)
                     if abs(drift) > self.radius_stable_e:
                         self.arc_w += math.copysign(self.radius_w_step, drift)
                         self.arc_w = float(np.clip(
-                            self.arc_w, self.radius_min_w, self.entry_search_w * 2.0,
+                            self.arc_w, self.radius_min_w, self.radius_initial_w * 2.0,
                         ))
                 if mean_e is not None:
                     self.radius_previous_e = mean_e
@@ -502,11 +579,8 @@ class RingEntryExecutor:
                 self._reset_radius_window()
             if self.radius_stable_windows >= self.radius_confirm_windows_required:
                 self.state = "half_arc"
-                # Radius acquisition is a separate state. The commanded half
-                # circle starts at zero here; its angle and timeout must not
-                # inherit motion already spent learning the radius.
-                self.arc_turned_rad = 0.0
-                self.entry_search_elapsed_sec = 0.0
+                # Radius acquisition is the first portion of this same circle;
+                # retain its yaw so the total tangent-to-exit arc is exactly pi.
                 return RingEntryResult(
                     None, "ring_entry_radius_locked", started,
                 )
@@ -516,8 +590,8 @@ class RingEntryExecutor:
 
         if self.state == "half_arc":
             self.arc_turned_rad += rotated
-            self.entry_search_elapsed_sec += dt
-            if self.entry_search_elapsed_sec >= self.half_arc_timeout_sec:
+            self.arc_elapsed_sec += dt
+            if self.arc_elapsed_sec >= self.half_arc_timeout_sec:
                 self.state = "failed"
                 self.failure_reason = "ring_half_arc_timeout"
                 return RingEntryResult(
@@ -536,7 +610,7 @@ class RingEntryExecutor:
             self._observe_entry_candidate(
                 observation, route_fit, fresh_geometry=fresh_geometry,
             )
-            if self.entry_candidate_frames >= self.entry_capture_frames_required:
+            if self.entry_candidate_frames >= self.exit_reacquire_frames_required:
                 captured_fit = self.entry_candidate_fit
                 self._reset_route_control()
                 route_fit = self._continuous_fit(captured_fit)

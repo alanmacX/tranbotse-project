@@ -285,8 +285,17 @@ class _RingEntryStage(_Stage):
             entry_search_timeout_sec=(
                 cfg.path_memory.roundabout_entry_search_timeout_sec
             ),
+            tangent_theta_tolerance=(
+                cfg.path_memory.roundabout_tangent_theta_tolerance
+            ),
             arc_v=cfg.path_memory.roundabout_arc_v,
-            arc_motion_sign=cfg.path_memory.roundabout_arc_motion_sign,
+            radius_initial_w=cfg.path_memory.roundabout_radius_initial_w,
+            radius_acquire_max_yaw_rad=(
+                cfg.path_memory.roundabout_radius_acquire_max_yaw_rad
+            ),
+            radius_acquire_timeout_sec=(
+                cfg.path_memory.roundabout_radius_acquire_timeout_sec
+            ),
             radius_window_rad=cfg.path_memory.roundabout_radius_window_rad,
             radius_stable_e=cfg.path_memory.roundabout_radius_stable_e,
             radius_w_step=cfg.path_memory.roundabout_radius_w_step,
@@ -294,6 +303,9 @@ class _RingEntryStage(_Stage):
             radius_min_w=cfg.path_memory.roundabout_radius_min_w,
             half_arc_yaw_rad=cfg.path_memory.roundabout_half_arc_yaw_rad,
             half_arc_timeout_sec=cfg.path_memory.roundabout_half_arc_timeout_sec,
+            exit_reacquire_frames=(
+                cfg.path_memory.roundabout_exit_reacquire_frames
+            ),
             exit_reacquire_extra_rad=(
                 cfg.path_memory.roundabout_exit_reacquire_extra_rad
             ),
@@ -415,6 +427,13 @@ class _RingEntryStage(_Stage):
                 result.reason,
                 RaceState.TRACK,
                 None,
+            ), CandidateProducer.RING_EXECUTOR
+        if self.executor.state == "tangent_align":
+            v, w = self.executor.tangent_align_command(
+                invert_turn=self.cfg.tracker.invert_turn,
+            )
+            return MotionCommand(
+                v, w, result.reason, RaceState.TRACK, None,
             ), CandidateProducer.RING_EXECUTOR
         if self.executor.state in {"radius_acquire", "half_arc", "exit_reacquire"}:
             v, w = self.executor.fixed_arc_command(
