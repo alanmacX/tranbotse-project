@@ -57,14 +57,17 @@ def test_fallback_config_loads_without_full_mission_sections():
 
 def test_default_dry_run_stops_before_unvalidated_parking(tmp_path):
     summary = run_dry(dry_args(tmp_path, unlocked=False), FallbackConfig())
-    assert summary["state"] == FallbackState.PARK_TRIGGER.value
+    assert summary["state"] == FallbackState.TERMINAL_STOP.value
     assert summary["fan_events"] == []
     assert not summary["unvalidated_parking_unlocked"]
 
 
 def test_unlocked_dry_run_finishes_and_turns_fan_off(tmp_path):
     cfg = FallbackConfig()
-    cfg.parking.stage_sec = 0.05
+    cfg.left_turn.stop_hold_sec = 0.05
+    cfg.left_turn.w_radps = 0.2
+    cfg.left_turn.target_yaw_rad = 0.1
+    cfg.left_turn.hard_timeout_sec = 1.0
     cfg.parking.reverse_sec = 0.10
     cfg.parking.reverse_hard_max_sec = 0.20
     cfg.parking.verify_hold_sec = 0.05
@@ -73,6 +76,14 @@ def test_unlocked_dry_run_finishes_and_turns_fan_off(tmp_path):
     summary = run_dry(dry_args(tmp_path, unlocked=True), cfg)
     assert summary["state"] == FallbackState.FINISHED.value
     assert summary["fan_events"] == ["on", "off"]
+    assert FallbackState.LEFT_TURN.value in summary["states"]
+    assert FallbackState.BAY_CONFIRM.value in summary["states"]
+    assert summary["states"].index(FallbackState.BAY_CONFIRM.value) < summary["states"].index(FallbackState.PARK_REVERSE.value)
+    commands = [tuple(command) for command in summary["commands"]]
+    left_index = next(index for index, (v, w) in enumerate(commands) if v == 0.0 and w > 0.0)
+    reverse_index = next(index for index, (v, _w) in enumerate(commands) if v < 0.0)
+    assert left_index < reverse_index
+    assert (0.0, 0.0) in commands[left_index + 1:reverse_index + 1]
 
 
 def test_dry_run_timeout_latches_fault(tmp_path):

@@ -22,7 +22,12 @@ from transbot_race.fallback_config import FallbackConfig, load_fallback_config  
 from transbot_race.fallback_mission import FallbackMission, FallbackState  # noqa: E402
 from transbot_race.fan import DryRunFan, Fan, UnavailableFan  # noqa: E402
 from transbot_race.motor import MotorGateway  # noqa: E402
-from transbot_race.parking import ParkingObservation, ParkingTriggerDetector  # noqa: E402
+from transbot_race.parking import (  # noqa: E402
+    ParkingBayDetector,
+    ParkingObservation,
+    TerminalLineDetector,
+    TerminalLineObservation,
+)
 from transbot_race.vision import (  # noqa: E402
     TrajectoryFit,
     fit_line_trajectory,
@@ -97,11 +102,11 @@ def crop_frame(frame: np.ndarray, cfg: FallbackConfig) -> tuple[np.ndarray, floa
     return frame[y0:y1, ex0:ex1], track_center
 
 
-def analyze_frame(
+def analyze_track_frame(
     frame: np.ndarray,
     cfg: FallbackConfig,
-    detector: ParkingTriggerDetector,
-) -> tuple[TrajectoryFit, ParkingObservation]:
+    terminal_detector: TerminalLineDetector,
+) -> tuple[TrajectoryFit, TerminalLineObservation]:
     crop, track_center = crop_frame(frame, cfg)
     if crop.size == 0:
         raise ValueError("configured camera crop is empty")
@@ -114,9 +119,20 @@ def analyze_frame(
         crop_width=crop.shape[1],
         lookahead_frac=cfg.tracker.lookahead_frac,
     )
+    terminal = terminal_detector.analyze(track_mask, features)
+    return fit, terminal
+
+
+def analyze_bay_frame(
+    frame: np.ndarray,
+    cfg: FallbackConfig,
+    bay_detector: ParkingBayDetector,
+) -> ParkingObservation:
+    crop, _ = crop_frame(frame, cfg)
+    if crop.size == 0:
+        raise ValueError("configured camera crop is empty")
     parking_mask = preprocess_blackline(crop, cfg.vision, anchor_x=None)
-    parking = detector.analyze(parking_mask)
-    return fit, parking
+    return bay_detector.analyze(parking_mask)
 
 
 def apply_step(step, arbiter: CommandArbiter, motor: MotorGateway, fan: Fan):
@@ -140,18 +156,22 @@ def apply_step(step, arbiter: CommandArbiter, motor: MotorGateway, fan: Fan):
     return result
 
 
-def dry_run_inputs(index: int, cfg: FallbackConfig) -> tuple[TrajectoryFit, ParkingObservation]:
+def dry_run_inputs(index: int, cfg: FallbackConfig) -> tuple[TrajectoryFit, TerminalLineObservation, ParkingObservation]:
     fit = TrajectoryFit(found=True, conf=0.9, n_bands=6)
     trigger_at = cfg.runtime.startup_line_frames + 3
-    candidate = index >= trigger_at
-    confirmed = index >= trigger_at + cfg.parking_trigger.confirm_frames - 1
-    parking = ParkingObservation(candidate, confirmed, 0.9 if candidate else 0.0, "dry_run")
-    return fit, parking
+    terminal_candidate = index >= trigger_at
+    terminal_confirmed = index >= trigger_at + cfg.terminal_line.confirm_frames - 1
+    terminal = TerminalLineObservation(
+        terminal_candidate,
+        terminal_confirmed,
+        0.9 if terminal_candidate else 0.0,
+        "dry_run_terminal",
+    )
+    parking = ParkingObservation(True, True, 0.9, "dry_run_bay")
+    return fit, terminal, parking
 
 
 def run_dry(args: argparse.Namespace, cfg: FallbackConfig) -> dict:
-    detector = ParkingTriggerDetector(cfg.parking_trigger)
-    del detector
     mission = FallbackMission(cfg, allow_unvalidated_parking=args.allow_unvalidated_parking)
     arbiter = CommandArbiter(max_v=cfg.runtime.max_v_mps, max_w=cfg.runtime.max_w_radps)
     motor = MotorGateway(
@@ -165,15 +185,17 @@ def run_dry(args: argparse.Namespace, cfg: FallbackConfig) -> dict:
     now = 0.0
     index = 0
     states: deque[str] = deque(maxlen=512)
+    commands: deque[tuple[float, float]] = deque(maxlen=512)
     try:
         while now <= args.max_sec:
-            fit, parking = dry_run_inputs(index, cfg)
-            step = mission.step(fit=fit, parking=parking, now=now)
-            apply_step(step, arbiter, motor, fan)
+            fit, terminal, parking = dry_run_inputs(index, cfg)
+            step = mission.step(fit=fit, terminal=terminal, parking=parking, now=now)
+            result = apply_step(step, arbiter, motor, fan)
             states.append(step.state.value)
+            commands.append((result.final.v, result.final.w))
             if mission.state in {FallbackState.FINISHED, FallbackState.FAULT}:
                 break
-            if mission.state == FallbackState.PARK_TRIGGER and not args.allow_unvalidated_parking:
+            if mission.state == FallbackState.TERMINAL_STOP and not args.allow_unvalidated_parking:
                 break
             index += 1
             now += cfg.runtime.loop_period_sec
@@ -187,6 +209,7 @@ def run_dry(args: argparse.Namespace, cfg: FallbackConfig) -> dict:
             "event": mission.last_event,
             "fan_events": fan.events,
             "states": list(states),
+            "commands": list(commands),
             "unvalidated_parking_unlocked": args.allow_unvalidated_parking,
         }
     finally:
@@ -199,6 +222,7 @@ def run_live(args: argparse.Namespace, cfg: FallbackConfig) -> dict:
     fan: Fan | None = None
     cap: cv.VideoCapture | None = None
     reader: CameraReader | None = None
+    mission: FallbackMission | None = None
     try:
         bot = make_bot(False)
         motor = MotorGateway(
@@ -209,7 +233,8 @@ def run_live(args: argparse.Namespace, cfg: FallbackConfig) -> dict:
             lease_path=args.lease_path,
         )
         fan = make_fan(False)
-        detector = ParkingTriggerDetector(cfg.parking_trigger)
+        terminal_detector = TerminalLineDetector(cfg.terminal_line)
+        bay_detector = ParkingBayDetector(cfg.parking_bay)
         mission = FallbackMission(cfg, allow_unvalidated_parking=args.allow_unvalidated_parking)
         arbiter = CommandArbiter(max_v=cfg.runtime.max_v_mps, max_w=cfg.runtime.max_w_radps)
         cap = cv.VideoCapture(args.camera)
@@ -231,16 +256,32 @@ def run_live(args: argparse.Namespace, cfg: FallbackConfig) -> dict:
             ok, frame = reader.read(min(cfg.runtime.camera_frame_timeout_sec, remaining_sec))
             now = time.monotonic()
             if not ok or frame is None:
+                fit = TrajectoryFit(found=False)
+                terminal = TerminalLineObservation(False, False, 0.0, "camera_failure")
                 parking = ParkingObservation(False, False, 0.0, "camera_failure")
                 step = mission.step(
-                    fit=TrajectoryFit(found=False),
+                    fit=fit,
+                    terminal=terminal,
                     parking=parking,
                     now=now,
                     camera_ok=False,
                 )
             else:
-                fit, parking = analyze_frame(frame, cfg, detector)
-                step = mission.step(fit=fit, parking=parking, now=now)
+                terminal = TerminalLineObservation(False, False, 0.0, "terminal_line_not_sampled")
+                parking = ParkingObservation(False, False, 0.0, "parking_bay_not_sampled")
+                if mission.state in {FallbackState.STARTUP, FallbackState.FOLLOW_LINE}:
+                    fit, terminal = analyze_track_frame(frame, cfg, terminal_detector)
+                elif mission.state in {FallbackState.BAY_CONFIRM, FallbackState.PARK_REVERSE}:
+                    fit = TrajectoryFit(found=False)
+                    parking = analyze_bay_frame(frame, cfg, bay_detector)
+                else:
+                    fit = TrajectoryFit(found=False)
+                step = mission.step(
+                    fit=fit,
+                    terminal=terminal,
+                    parking=parking,
+                    now=now,
+                )
             result = apply_step(step, arbiter, motor, fan)
             print(json.dumps({
                 "state": step.state.value,
@@ -248,15 +289,29 @@ def run_live(args: argparse.Namespace, cfg: FallbackConfig) -> dict:
                 "reason": result.final.reason,
                 "v": result.final.v,
                 "w": result.final.w,
-                "parking": parking.reason,
+                "terminal": terminal.reason,
+                "parking_bay": parking.reason,
+                "turn_nominal_rad": step.turn_yaw_rad,
                 "fan": step.fan_requested,
             }, ensure_ascii=False))
             if mission.state in {FallbackState.FINISHED, FallbackState.FAULT}:
                 break
-            if mission.state == FallbackState.PARK_TRIGGER and not args.allow_unvalidated_parking:
+            if mission.state == FallbackState.TERMINAL_STOP and not args.allow_unvalidated_parking:
                 break
             time.sleep(cfg.runtime.loop_period_sec)
         return {"mode": "live", "state": mission.state.value, "event": mission.last_event}
+    except BaseException as exc:
+        if mission is not None:
+            step = mission.fail(time.monotonic(), f"runtime_exception:{type(exc).__name__}", StopCause.EXECUTOR_FAILED)
+            print(json.dumps({
+                "state": step.state.value,
+                "event": step.event,
+                "reason": step.command.reason,
+                "v": 0.0,
+                "w": 0.0,
+                "fan": False,
+            }, ensure_ascii=False))
+        raise
     finally:
         try:
             if fan is not None:
@@ -294,7 +349,7 @@ def main() -> int:
         raise ValueError("--max-sec must be finite and positive")
     summary = run_dry(args, cfg) if args.dry_run else run_live(args, cfg)
     print(json.dumps(summary, ensure_ascii=False))
-    expected = FallbackState.FINISHED.value if args.allow_unvalidated_parking else FallbackState.PARK_TRIGGER.value
+    expected = FallbackState.FINISHED.value if args.allow_unvalidated_parking else FallbackState.TERMINAL_STOP.value
     return 0 if summary["state"] == expected else 2
 
 

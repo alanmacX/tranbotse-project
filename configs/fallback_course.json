@@ -70,21 +70,37 @@
     "preview_turn_v_ratio": 0.45,
     "preview_turn_w": 0.18
   },
-  "parking_trigger": {
+  "terminal_line": {
+    "enabled": true,
+    "roi": [0.08, 0.12, 0.92, 0.72],
+    "min_width_ratio": 0.34,
+    "min_width_to_line": 3.0,
+    "row_band_frac": 0.06,
+    "horizontal_occupancy_min": 0.55,
+    "stem_half_width_ratio": 1.8,
+    "stem_occupancy_min": 0.18,
+    "above_occupancy_max": 0.1,
+    "max_wide_row_groups": 1,
+    "confirm_frames": 4
+  },
+  "parking_bay": {
     "enabled": true,
     "roi": [0.5, 0.05, 0.98, 0.95],
     "border_frac": 0.12,
     "edge_occupancy_min": 0.42,
     "required_edges": 3,
     "interior_occupancy_max": 0.28,
-    "confirm_frames": 4
+    "confirm_frames": 4,
+    "confirm_timeout_sec": 1.0
+  },
+  "left_turn": {
+    "stop_hold_sec": 0.4,
+    "w_radps": 0.16,
+    "target_yaw_rad": 1.5707963267948966,
+    "hard_timeout_sec": 14.0
   },
   "parking": {
-    "trigger_timeout_sec": 1.0,
     "geometry_missing_frames": 2,
-    "stage_v_mps": 0.0,
-    "stage_w_radps": 0.0,
-    "stage_sec": 0.4,
     "reverse_v_mps": 0.018,
     "reverse_w_radps": 0.0,
     "reverse_sec": 1.5,
