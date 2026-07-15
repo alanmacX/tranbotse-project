@@ -286,6 +286,7 @@ class _RingEntryStage(_Stage):
                 cfg.path_memory.roundabout_entry_search_timeout_sec
             ),
             arc_v=cfg.path_memory.roundabout_arc_v,
+            arc_motion_sign=cfg.path_memory.roundabout_arc_motion_sign,
             radius_window_rad=cfg.path_memory.roundabout_radius_window_rad,
             radius_stable_e=cfg.path_memory.roundabout_radius_stable_e,
             radius_w_step=cfg.path_memory.roundabout_radius_w_step,

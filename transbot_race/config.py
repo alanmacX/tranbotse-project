@@ -87,6 +87,9 @@ class PathMemoryConfig:
     roundabout_entry_search_max_angle_rad: float = 0.75
     roundabout_entry_search_timeout_sec: float = 12.0
     roundabout_arc_v: float = 0.020
+    # The selected roundabout is entered while reversing after the forward
+    # margin. Keep longitudinal direction independent from left/right yaw.
+    roundabout_arc_motion_sign: int = -1
     roundabout_radius_window_rad: float = 0.15
     roundabout_radius_stable_e: float = 0.08
     roundabout_radius_w_step: float = 0.01

@@ -115,6 +115,7 @@ class RingEntryExecutor:
         entry_search_max_angle_rad: float = 1.75,
         entry_search_timeout_sec: float = 9.0,
         arc_v: float = 0.020,
+        arc_motion_sign: int = -1,
         radius_window_rad: float = 0.15,
         radius_stable_e: float = 0.08,
         radius_w_step: float = 0.01,
@@ -139,6 +140,7 @@ class RingEntryExecutor:
             0.0, float(entry_search_timeout_sec),
         )
         self.arc_v = max(0.0, float(arc_v))
+        self.arc_motion_sign = 1 if int(arc_motion_sign) >= 0 else -1
         self.radius_window_rad = max(0.01, float(radius_window_rad))
         self.radius_stable_e = max(0.0, float(radius_stable_e))
         self.radius_w_step = max(0.0, float(radius_w_step))
@@ -345,7 +347,10 @@ class RingEntryExecutor:
     def fixed_arc_command(self, *, invert_turn: bool = False) -> tuple[float, float]:
         """The sole command source during radius acquisition and the half arc."""
         image_to_motor_sign = 1.0 if invert_turn else -1.0
-        return self.arc_v, image_to_motor_sign * self.direction * self.arc_w
+        return (
+            self.arc_motion_sign * self.arc_v,
+            image_to_motor_sign * self.direction * self.arc_w,
+        )
 
     def _reset_radius_window(self) -> None:
         self.radius_window_yaw_rad = 0.0
@@ -379,7 +384,8 @@ class RingEntryExecutor:
     ) -> RingEntryResult:
         dt = 0.0 if self.last_now is None else max(0.0, min(1.0, now - self.last_now))
         self.last_now = now
-        travelled = max(0.0, float(linear)) * dt
+        forward_travelled = max(0.0, float(linear)) * dt
+        arc_travelled = abs(float(linear)) * dt
         rotated = abs(float(angular)) * dt
         started = False
         margin_started = False
@@ -410,7 +416,9 @@ class RingEntryExecutor:
 
         if self.state == "margin":
             if not margin_started:
-                self.margin_remaining_m = max(0.0, self.margin_remaining_m - travelled)
+                self.margin_remaining_m = max(
+                    0.0, self.margin_remaining_m - forward_travelled,
+                )
             if self.margin_remaining_m > 1e-6:
                 return RingEntryResult(
                     None, "ring_entry_waiting_margin", started, False,
@@ -438,7 +446,9 @@ class RingEntryExecutor:
             self.entry_search_elapsed_sec += dt
             self.arc_turned_rad += rotated
             self.radius_window_yaw_rad += rotated
-            self.radius_window_distance_m += travelled
+            # The fixed ring arc may deliberately run in reverse. Radius is a
+            # distance magnitude, so reverse travel must not be clipped away.
+            self.radius_window_distance_m += arc_travelled
             self._observe_radius_anchor(route_fit, fresh_geometry=fresh_geometry)
             timed_out = bool(
                 self.entry_search_yaw_rad >= self.entry_search_max_angle_rad
@@ -464,7 +474,14 @@ class RingEntryExecutor:
                 )
                 self.radius_stable_windows = self.radius_stable_windows + 1 if stable else 0
                 if mean_e is not None and self.radius_previous_e is not None and not stable:
-                    drift = self.direction * (mean_e - self.radius_previous_e)
+                    # Reversing flips the relationship between image drift and
+                    # a tighter/looser curvature, while the yaw side stays the
+                    # same. Include longitudinal direction exactly once.
+                    drift = (
+                        self.direction
+                        * self.arc_motion_sign
+                        * (mean_e - self.radius_previous_e)
+                    )
                     if abs(drift) > self.radius_stable_e:
                         self.arc_w += math.copysign(self.radius_w_step, drift)
                         self.arc_w = float(np.clip(
@@ -542,7 +559,7 @@ class RingEntryExecutor:
             return RingEntryResult(None, "ring_exit_reacquiring", started)
 
         route_fit = self._continuous_fit(route_fit)
-        self.travelled_m += travelled
+        self.travelled_m += forward_travelled
         if route_fit is not None:
             self.last_fit = route_fit
             self.missing_frames = 0
@@ -551,7 +568,7 @@ class RingEntryExecutor:
 
         fork_cleared = observation is not None and not observation.is_fork
         if self.state == "inside":
-            self.inside_travelled_m += travelled
+            self.inside_travelled_m += forward_travelled
             if accepted_entry and self.inside_travelled_m >= self.inside_arm_distance_m:
                 self.state = "exiting"
                 self.travelled_m = 0.0

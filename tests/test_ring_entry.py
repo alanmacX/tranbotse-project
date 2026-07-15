@@ -115,7 +115,7 @@ class RingEntryTests(unittest.TestCase):
                 observation,
                 fit,
                 now=now + offset,
-                linear=0.02,
+                linear=-0.02,
                 angular=-0.10,
                 motion_source="measured",
                 accepted_entry=False,
@@ -163,22 +163,48 @@ class RingEntryTests(unittest.TestCase):
         self.assertAlmostEqual(executor.arc_w, 0.08)
         executor.step(
             fork, self._fit(e0=0.30), now=now + 0.5,
-            linear=0.02, angular=-0.10, accepted_entry=False,
+            linear=-0.02, angular=-0.10, accepted_entry=False,
         )
         self.assertAlmostEqual(executor.arc_w, 0.08)
         executor.step(
             fork, self._fit(e0=0.30), now=now + 1.0,
-            linear=0.02, angular=-0.10, accepted_entry=False,
+            linear=-0.02, angular=-0.10, accepted_entry=False,
         )
-        self.assertAlmostEqual(executor.arc_w, 0.09)
+        self.assertAlmostEqual(executor.arc_w, 0.07)
 
-    def test_fixed_arc_command_has_one_direction_and_never_reverses(self):
-        right = RingEntryExecutor(1, arc_v=0.02, entry_search_w=0.08)
-        left = RingEntryExecutor(-1, arc_v=0.02, entry_search_w=0.08)
-        self.assertEqual(right.fixed_arc_command(), (0.02, -0.08))
-        self.assertEqual(left.fixed_arc_command(), (0.02, 0.08))
-        right.arc_w = 0.10
-        self.assertEqual(right.fixed_arc_command(), (0.02, -0.10))
+        forward = RingEntryExecutor(
+            1,
+            margin_distance_m=0.0,
+            entry_search_w=0.08,
+            entry_search_max_angle_rad=1.0,
+            arc_motion_sign=1,
+            radius_window_rad=0.10,
+            radius_stable_e=0.05,
+            radius_w_step=0.01,
+            radius_confirm_windows=3,
+        )
+        forward.step(
+            fork, self._fit(), now=0.0, linear=0.0, accepted_entry=True,
+        )
+        self._advance_radius_window(forward, fork, 0.10, 0.0)
+        self._advance_radius_window(forward, fork, 0.30, 1.0)
+        self.assertAlmostEqual(forward.arc_w, 0.09)
+
+    def test_fixed_arc_command_keeps_motion_and_yaw_axes_independent(self):
+        cases = {
+            (1, 1): (0.02, -0.08),
+            (1, -1): (-0.02, -0.08),
+            (-1, 1): (0.02, 0.08),
+            (-1, -1): (-0.02, 0.08),
+        }
+        for (direction, motion_sign), expected in cases.items():
+            executor = RingEntryExecutor(
+                direction,
+                arc_v=0.02,
+                arc_motion_sign=motion_sign,
+                entry_search_w=0.08,
+            )
+            self.assertEqual(executor.fixed_arc_command(), expected)
 
     def test_half_arc_ignores_visual_fit_until_target_yaw(self):
         _cfg, fork, _debug = self._fork(direction=1)
@@ -278,7 +304,7 @@ class RingEntryTests(unittest.TestCase):
         )
         executor.step(fork, self._fit(), now=0.0, linear=0.0, accepted_entry=True)
         executor.step(
-            fork, self._fit(), now=0.5, linear=0.02, angular=-0.10,
+            fork, self._fit(), now=0.5, linear=-0.02, angular=-0.10,
             motion_source="command_fallback", accepted_entry=False,
         )
         self.assertEqual(executor.radius_source, "command_proxy")

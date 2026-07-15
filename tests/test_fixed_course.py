@@ -162,7 +162,10 @@ def test_ring_radius_acquire_is_owned_fixed_arc_only():
     )
 
     assert producer == CandidateProducer.RING_EXECUTOR
-    assert command.v == cfg.path_memory.roundabout_arc_v
+    assert command.v == (
+        cfg.path_memory.roundabout_arc_motion_sign
+        * cfg.path_memory.roundabout_arc_v
+    )
     assert command.w == -cfg.path_memory.roundabout_entry_search_w
     assert command.reason == "ring_entry_radius_acquiring"
 

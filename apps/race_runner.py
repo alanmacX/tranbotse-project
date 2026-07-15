@@ -125,6 +125,8 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError("roundabout entry search timeout must be positive")
     if cfg.path_memory.roundabout_arc_v <= 0.0:
         raise ValueError("roundabout arc speed must be positive")
+    if cfg.path_memory.roundabout_arc_motion_sign not in (-1, 1):
+        raise ValueError("roundabout arc motion sign must be -1 or +1")
     if cfg.path_memory.roundabout_radius_window_rad <= 0.0:
         raise ValueError("roundabout radius window must be positive")
     if cfg.path_memory.roundabout_radius_stable_e < 0.0:
@@ -826,6 +828,9 @@ def run(args: argparse.Namespace) -> int:
             )
             summary["ring_arc_v"] = (
                 None if ring_executor is None else round(ring_executor.arc_v, 4)
+            )
+            summary["ring_arc_motion_sign"] = (
+                None if ring_executor is None else ring_executor.arc_motion_sign
             )
             summary["ring_arc_w"] = (
                 None if ring_executor is None else round(ring_executor.arc_w, 4)
