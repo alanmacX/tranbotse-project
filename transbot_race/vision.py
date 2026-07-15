@@ -222,9 +222,13 @@ def _filter_preprocess_components(
         effective_thickness = area / float(max(w, h, 1))
         track_structure = bool(
             area >= 900
-            and h >= height * 0.45
+            and h >= height * 0.40
             and effective_thickness >= 10.0
-            and (w >= width * 0.18 or fill >= 0.50)
+            # The capture-geometry ROI is much wider than the cruise crop.
+            # A real near-field L bend occupied only 15--17% of that ROI in
+            # run 20260715-185248, so the old 18% gate disabled the anchor
+            # exemption exactly when a floor reflection approached the tape.
+            and (w >= width * 0.14 or fill >= 0.50)
         )
         bbox_anchor_distance = float("inf")
         if anchor_x is not None:

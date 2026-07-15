@@ -150,37 +150,65 @@ def test_route_loss_clear_only_reaches_active_ring_executor():
     assert executor.missing_frames == 0
 
 
-def test_ring_radius_acquire_is_owned_fixed_arc_only():
+def test_ring_model_leg_is_owned_by_ring_executor_only():
     cfg = RaceConfig()
     stage = _RingEntryStage(cfg, FixedSessionMission(cfg.mission))
-    stage.executor.state = "radius_acquire"
+    stage.executor.state = "leg2_model"
+    stage.executor.leg_phase = "align"
+    stage.executor.model_turn_sign = 1
+    stage.executor.leg_turn_delta_rad = 1.0
 
     command, producer = stage._command(
         context(),
-        RingEntryResult(None, "ring_entry_radius_acquiring"),
-        MotionCommand(0.06, 0.15, "cruise", RaceState.TRACK),
-    )
-
-    assert producer == CandidateProducer.RING_EXECUTOR
-    assert command.v == cfg.path_memory.roundabout_arc_v
-    assert command.w == cfg.path_memory.roundabout_radius_initial_w
-    assert command.reason == "ring_entry_radius_acquiring"
-
-
-def test_ring_tangent_alignment_is_owned_right_pivot_only():
-    cfg = RaceConfig()
-    stage = _RingEntryStage(cfg, FixedSessionMission(cfg.mission))
-    stage.executor.state = "tangent_align"
-
-    command, producer = stage._command(
-        context(),
-        RingEntryResult(None, "ring_entry_tangent_aligning"),
+        RingEntryResult(None, "ring_leg2_model"),
         MotionCommand(0.06, 0.15, "cruise", RaceState.TRACK),
     )
 
     assert producer == CandidateProducer.RING_EXECUTOR
     assert command.v == 0.0
-    assert command.w == -cfg.path_memory.roundabout_entry_search_w
+    assert command.w == cfg.path_memory.roundabout_align_w
+
+    stage.executor.leg_phase = "drive"
+    command, producer = stage._command(
+        context(),
+        RingEntryResult(None, "ring_leg2_straight"),
+        MotionCommand(0.06, 0.15, "cruise", RaceState.TRACK),
+    )
+    assert producer == CandidateProducer.RING_EXECUTOR
+    assert command.v == cfg.path_memory.roundabout_arc_v
+    assert command.w == 0.0
+
+
+def test_ring_exit_reacquire_stops_instead_of_restarting_an_arc():
+    cfg = RaceConfig()
+    stage = _RingEntryStage(cfg, FixedSessionMission(cfg.mission))
+    stage.executor.state = "exit_reacquire"
+
+    command, producer = stage._command(
+        context(),
+        RingEntryResult(None, "ring_exit_reacquiring"),
+        MotionCommand(0.06, 0.15, "cruise", RaceState.TRACK),
+    )
+
+    assert producer == CandidateProducer.RING_EXECUTOR
+    assert command.v == command.w == 0.0
+
+
+def test_ring_final_line_alignment_is_owned_by_ring_executor_only():
+    cfg = RaceConfig()
+    stage = _RingEntryStage(cfg, FixedSessionMission(cfg.mission))
+    stage.executor._configure_fixed_chords()
+    stage.executor._begin_exit_line_align()
+
+    command, producer = stage._command(
+        context(),
+        RingEntryResult(None, "ring_exit_line_align"),
+        MotionCommand(0.06, 0.15, "cruise", RaceState.TRACK),
+    )
+
+    assert producer == CandidateProducer.RING_EXECUTOR
+    assert command.v == 0.0
+    assert command.w < 0.0
 
 
 def test_finished_stage_is_stationary_and_terminal():

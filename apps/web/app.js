@@ -176,6 +176,9 @@ async function loadConfig() {
   el("roundaboutDirection").value = String(cfg.mission.ring_entry_direction);
   el("roundaboutTurnW").value = cfg.path_memory.roundabout_replay_max_w;
   el("roundaboutMarginDistance").value = cfg.path_memory.roundabout_margin_distance_m;
+  el("roundaboutEntryLeftTurn").value = cfg.path_memory.roundabout_entry_left_turn_deg;
+  el("roundaboutFixedRadius").value = cfg.path_memory.roundabout_fixed_radius_m;
+  el("roundaboutChordScale").value = cfg.path_memory.roundabout_chord_distance_scale;
   el("roundaboutMargin").checked = !!cfg.path_memory.roundabout_margin_enabled;
   el("trackerVMax").value = cfg.tracker.v_max;
   el("trackerKE").value = cfg.tracker.k_e;
@@ -231,6 +234,9 @@ el("strategySaveBtn").addEventListener("click", () => guard("保存高级设置"
     corner_replay_max_w: Number(el("cornerTurnW").value),
     roundabout_replay_max_w: Number(el("roundaboutTurnW").value),
     roundabout_margin_distance_m: Number(el("roundaboutMarginDistance").value),
+    roundabout_entry_left_turn_deg: Number(el("roundaboutEntryLeftTurn").value),
+    roundabout_fixed_radius_m: Number(el("roundaboutFixedRadius").value),
+    roundabout_chord_distance_scale: Number(el("roundaboutChordScale").value),
     roundabout_margin_enabled: el("roundaboutMargin").checked,
   },
   mission: {

@@ -66,6 +66,23 @@ class OcclusionTests(unittest.TestCase):
         self.assertGreater(cv.countNonZero(anchored), 0)
         self.assertEqual(cv.countNonZero(off_corridor), 0)
 
+    def test_wide_geometry_roi_keeps_anchored_l_bend_near_reflection(self):
+        height, width, center = 285, 640, 365
+        mask = np.zeros((height, width), dtype=np.uint8)
+        cv.rectangle(mask, (center - 10, 116), (center + 10, 238), 255, -1)
+        cv.rectangle(mask, (center, 116), (center + 87, 136), 255, -1)
+        hard = np.zeros_like(mask)
+        near = np.zeros_like(mask)
+        cv.rectangle(near, (center - 28, 103), (center + 45, 176), 255, -1)
+
+        unanchored = _filter_preprocess_components(mask, hard, near)
+        anchored = _filter_preprocess_components(
+            mask, hard, near, anchor_x=float(center), anchor_margin_px=103.0,
+        )
+
+        self.assertEqual(cv.countNonZero(unanchored), 0)
+        self.assertGreater(cv.countNonZero(anchored), 0)
+
     def test_disabled_is_passthrough(self):
         mask = straight()
         out = apply_occlusion(mask, OcclusionConfig(enabled=False, rects=((0, 0, W, H),)))

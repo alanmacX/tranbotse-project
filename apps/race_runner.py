@@ -14,6 +14,7 @@ from dataclasses import asdict, fields, is_dataclass
 from pathlib import Path
 
 import cv2 as cv
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -29,6 +30,8 @@ from transbot_race.path_memory import (  # noqa: E402
 )
 from transbot_race.mission import DetectorKind  # noqa: E402
 from transbot_race.motor import MotorGateway  # noqa: E402
+from transbot_race.imu_feedback import TransbotImuFeedback  # noqa: E402
+from transbot_race.ring_entry import circle_model_chord_points  # noqa: E402
 from transbot_race.state_machine import (  # noqa: E402
     MotionCommand,
     RaceState,
@@ -115,36 +118,23 @@ def _validate_config(cfg: RaceConfig) -> None:
         raise ValueError("camera-to-axle distance cannot be negative")
     if cfg.path_memory.roundabout_margin_distance_m < 0.0:
         raise ValueError("roundabout margin distance cannot be negative")
-    if cfg.path_memory.roundabout_entry_search_w <= 0.0:
-        raise ValueError("roundabout entry search turn rate must be positive")
-    if cfg.path_memory.roundabout_entry_capture_frames < 1:
-        raise ValueError("roundabout entry capture frames must be positive")
-    if cfg.path_memory.roundabout_entry_search_max_angle_rad <= 0.0:
-        raise ValueError("roundabout entry search angle must be positive")
-    if cfg.path_memory.roundabout_entry_search_timeout_sec <= 0.0:
-        raise ValueError("roundabout entry search timeout must be positive")
-    if cfg.path_memory.roundabout_tangent_theta_tolerance < 0.0:
-        raise ValueError("roundabout tangent tolerance cannot be negative")
+    if (
+        not np.isfinite(cfg.path_memory.roundabout_entry_left_turn_deg)
+        or abs(cfg.path_memory.roundabout_entry_left_turn_deg) > 180.0
+    ):
+        raise ValueError("roundabout entry turn must be within [-180, 180] degrees")
+    if cfg.path_memory.roundabout_align_w <= 0.0:
+        raise ValueError("roundabout align turn rate must be positive")
+    if not 0.0 < cfg.path_memory.roundabout_align_slow_w <= cfg.path_memory.roundabout_align_w:
+        raise ValueError("roundabout slow align rate must be within (0, align_w]")
+    if cfg.path_memory.roundabout_align_slowdown_rad < 0.0:
+        raise ValueError("roundabout align slowdown angle cannot be negative")
     if cfg.path_memory.roundabout_arc_v <= 0.0:
         raise ValueError("roundabout arc speed must be positive")
-    if cfg.path_memory.roundabout_radius_initial_w <= 0.0:
-        raise ValueError("roundabout initial radius turn rate must be positive")
-    if cfg.path_memory.roundabout_radius_acquire_max_yaw_rad <= 0.0:
-        raise ValueError("roundabout radius acquisition yaw must be positive")
-    if cfg.path_memory.roundabout_radius_acquire_timeout_sec <= 0.0:
-        raise ValueError("roundabout radius acquisition timeout must be positive")
-    if cfg.path_memory.roundabout_radius_window_rad <= 0.0:
-        raise ValueError("roundabout radius window must be positive")
-    if cfg.path_memory.roundabout_radius_stable_e < 0.0:
-        raise ValueError("roundabout radius stability tolerance cannot be negative")
-    if cfg.path_memory.roundabout_radius_w_step < 0.0:
-        raise ValueError("roundabout radius turn-rate step cannot be negative")
-    if cfg.path_memory.roundabout_radius_confirm_windows < 1:
-        raise ValueError("roundabout radius confirmation windows must be positive")
-    if cfg.path_memory.roundabout_radius_min_w <= 0.0:
-        raise ValueError("roundabout minimum turn rate must be positive")
-    if cfg.path_memory.roundabout_radius_min_w > cfg.path_memory.roundabout_radius_initial_w:
-        raise ValueError("roundabout minimum turn rate cannot exceed its initial rate")
+    if cfg.path_memory.roundabout_fixed_radius_m <= 0.0:
+        raise ValueError("roundabout fixed radius must be positive")
+    if cfg.path_memory.roundabout_chord_distance_scale <= 0.0:
+        raise ValueError("roundabout chord distance scale must be positive")
     if cfg.path_memory.roundabout_half_arc_yaw_rad <= 0.0:
         raise ValueError("roundabout half arc yaw must be positive")
     if cfg.path_memory.roundabout_half_arc_timeout_sec <= 0.0:
@@ -238,7 +228,7 @@ def make_bot(dry_run: bool):
     sys.path.insert(0, "/home/pi/Transbot/py_install")
     from Transbot_Lib import Transbot  # type: ignore
 
-    return Transbot()
+    return TransbotImuFeedback(Transbot())
 
 
 def stop_chassis(bot, count: int = 20, delay: float = 0.04) -> None:
@@ -331,7 +321,12 @@ class DebugRecorder:
         self.overlays_dir = self.root / "overlays"
         self.masks_dir = self.root / "masks"
         self.geometry_dir = self.root / "geometry"
-        for path in (self.frames_dir, self.crops_dir, self.overlays_dir, self.masks_dir, self.geometry_dir):
+        self.ring_circle_dir = self.root / "ring_circle_fit"
+        self.ring_leg1_dir = self.root / "ring_leg1_fit"
+        for path in (
+            self.frames_dir, self.crops_dir, self.overlays_dir, self.masks_dir,
+            self.geometry_dir, self.ring_circle_dir, self.ring_leg1_dir,
+        ):
             path.mkdir(parents=True, exist_ok=True)
 
         with (self.root / "meta.json").open("w", encoding="utf-8") as f:
@@ -367,6 +362,7 @@ class DebugRecorder:
         self, summary: dict, frame, crop, mask, features, cfg: RaceConfig, crop_center: float,
         strategy_status: PathStrategyStatus | None = None,
         geometry_observation=None, geometry_debug=None,
+        ring_circle_model=None, ring_route_fit=None, ring_state=None,
     ) -> None:
         if not self.enabled or self.root is None:
             return
@@ -400,6 +396,9 @@ class DebugRecorder:
             "geometry_debug": geometry_debug,
             "geometry_event": summary.get("geometry_event"),
             "course_session": summary.get("course_session"),
+            "ring_circle_model": ring_circle_model,
+            "ring_route_fit": ring_route_fit,
+            "ring_state": ring_state,
         })
         self.last_frame_t = elapsed
 
@@ -461,6 +460,48 @@ class DebugRecorder:
                         geometry_overlay,
                         params,
                     )
+                circle_model = item["ring_circle_model"]
+                geometry_debug = item["geometry_debug"]
+                if circle_model is not None and geometry_debug is not None and geometry_debug.roi is not None:
+                    circle_overlay = geometry_debug.roi.copy()
+                    for p0, p1 in zip(geometry_debug.path, geometry_debug.path[1:]):
+                        cv.line(circle_overlay, p0, p1, (0, 0, 255), 2)
+                    ellipse_center = tuple(int(round(v)) for v in circle_model.center)
+                    ellipse_axes = tuple(max(1, int(round(v / 2.0))) for v in circle_model.axes)
+                    ellipse_angle = float(circle_model.angle_deg)
+                    cv.ellipse(
+                        circle_overlay, ellipse_center, ellipse_axes, ellipse_angle,
+                        0.0, 360.0, (120, 120, 120), 1, cv.LINE_AA,
+                    )
+                    chord_points = circle_model_chord_points(circle_model)
+                    def draw_model_leg(canvas, leg_index, color, thickness):
+                        p0 = tuple(int(round(v)) for v in chord_points[leg_index])
+                        p1 = tuple(int(round(v)) for v in chord_points[leg_index + 1])
+                        cv.line(canvas, p0, p1, color, thickness, cv.LINE_AA)
+                        cv.circle(canvas, p1, 4, color, -1, cv.LINE_AA)
+                    leg_colors = ((0, 255, 255), (0, 220, 0), (255, 180, 0), (255, 0, 255))
+                    for leg, color in enumerate(leg_colors, start=1):
+                        draw_model_leg(circle_overlay, leg - 1, color, 3)
+                    label = (
+                        f"entry ellipse axes={circle_model.axes[0]:.1f}x{circle_model.axes[1]:.1f} "
+                        f"state={item['ring_state'] or '-'}"
+                    )
+                    cv.rectangle(circle_overlay, (0, 0), (circle_overlay.shape[1], 24), (0, 0, 0), -1)
+                    cv.putText(circle_overlay, label, (6, 17), cv.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv.LINE_AA)
+                    cv.imwrite(str(self.ring_circle_dir / f"{stem}.jpg"), circle_overlay, params)
+
+                    if item["ring_state"] == "leg1_model":
+                        leg_overlay = geometry_debug.roi.copy()
+                        for p0, p1 in zip(geometry_debug.path, geometry_debug.path[1:]):
+                            cv.line(leg_overlay, p0, p1, (0, 0, 255), 2)
+                        draw_model_leg(leg_overlay, 0, (0, 255, 0), 4)
+                        route_label = (
+                            f"leg1 fitted chord coverage={circle_model.coverage_deg:.1f} "
+                            f"p95={circle_model.p95_residual_px:.1f}px"
+                        )
+                        cv.rectangle(leg_overlay, (0, 0), (leg_overlay.shape[1], 24), (0, 0, 0), -1)
+                        cv.putText(leg_overlay, route_label, (6, 17), cv.FONT_HERSHEY_SIMPLEX, 0.43, (255, 255, 255), 1, cv.LINE_AA)
+                        cv.imwrite(str(self.ring_leg1_dir / f"{stem}.jpg"), leg_overlay, params)
                 self.frame_count += 1
             except Exception as exc:
                 self.image_write_error_count += 1
@@ -503,6 +544,8 @@ class DebugRecorder:
                     "overlays": "overlays/",
                     "masks": "masks/",
                     "geometry": "geometry/",
+                    "ring_circle_fit": "ring_circle_fit/",
+                    "ring_leg1_fit": "ring_leg1_fit/",
                 },
                 f,
                 ensure_ascii=False,
@@ -819,38 +862,118 @@ def run(args: argparse.Namespace) -> int:
                 if ring_executor is not None and ring_executor.state == "margin"
                 else 0.0
             )
-            summary["ring_tangent_candidate_frames"] = (
-                None if ring_executor is None
-                else ring_executor.tangent_candidate_frames
-            )
             summary["ring_exit_reacquire_candidate_frames"] = (
                 None if ring_executor is None else ring_executor.entry_candidate_frames
             )
-            summary["ring_tangent_yaw_rad"] = (
-                None if ring_executor is None
-                else round(ring_executor.tangent_yaw_rad, 4)
+            circle_model = None if ring_executor is None else ring_executor.circle_model
+            circle_candidate = (
+                None if ring_executor is None else ring_executor.circle_model_candidate
             )
-            summary["ring_tangent_elapsed_sec"] = (
+            summary["ring_circle_model_locked"] = circle_model is not None
+            summary["ring_circle_candidate_available"] = circle_candidate is not None
+            summary["ring_circle_candidate_frames"] = (
                 None if ring_executor is None
-                else round(ring_executor.tangent_elapsed_sec, 4)
+                else ring_executor.circle_model_candidate_frames
             )
-            summary["ring_radius_acquire_yaw_rad"] = (
+            summary["ring_circle_candidate_score"] = (
+                None if circle_candidate is None else round(circle_candidate.quality_score, 2)
+            )
+            summary["ring_circle_model_center"] = (
+                None if circle_model is None else [round(v, 2) for v in circle_model.center]
+            )
+            summary["ring_circle_model_axes"] = (
+                None if circle_model is None else [round(v, 2) for v in circle_model.axes]
+            )
+            summary["ring_circle_model_angle_deg"] = (
+                None if circle_model is None else round(circle_model.angle_deg, 2)
+            )
+            summary["ring_circle_model_support_points"] = (
+                None if circle_model is None else circle_model.support_points
+            )
+            summary["ring_circle_model_entry_phase_deg"] = (
+                None if circle_model is None else round(circle_model.entry_phase_deg, 2)
+            )
+            summary["ring_circle_model_image_arc_sign"] = (
+                None if circle_model is None else circle_model.image_arc_sign
+            )
+            summary["ring_circle_model_coverage_deg"] = (
+                None if circle_model is None else round(circle_model.coverage_deg, 2)
+            )
+            summary["ring_circle_model_p95_residual_px"] = (
+                None if circle_model is None else round(circle_model.p95_residual_px, 2)
+            )
+            summary["ring_leg_index"] = None if ring_executor is None else ring_executor.leg_index
+            summary["ring_entry_left_target_deg"] = (
                 None if ring_executor is None
-                else round(ring_executor.radius_acquire_yaw_rad, 4)
+                else round(np.degrees(ring_executor.entry_left_turn_rad), 3)
             )
-            summary["ring_fixed_arc_elapsed_sec"] = (
+            summary["ring_entry_left_turned_deg"] = (
                 None if ring_executor is None
-                else round(ring_executor.arc_elapsed_sec, 4)
+                else round(np.degrees(ring_executor.entry_left_yaw_rad), 3)
             )
-            summary["ring_arc_turned_rad"] = (
+            summary["ring_leg_phase"] = (
+                None if ring_executor is None else ring_executor.leg_phase
+            )
+            summary["ring_leg_turned_rad"] = (
+                None if ring_executor is None else round(ring_executor.leg_yaw_rad, 4)
+            )
+            summary["ring_leg_target_rad"] = (
+                None if ring_executor is None else round(ring_executor.leg_target_yaw_rad, 4)
+            )
+            summary["ring_leg_distance_m"] = (
+                None if ring_executor is None else round(ring_executor.leg_distance_m, 4)
+            )
+            summary["ring_leg_chord_length_m"] = (
                 None if ring_executor is None
-                else round(ring_executor.arc_turned_rad, 4)
+                else round(ring_executor.leg_chord_length_m, 4)
             )
-            summary["ring_arc_v"] = (
+            summary["ring_chord_distance_scale"] = (
+                None if ring_executor is None
+                else round(ring_executor.chord_distance_scale, 4)
+            )
+            summary["ring_fixed_turn_template_deg"] = (
+                None if ring_executor is None
+                else [
+                    -67.5 * ring_executor.direction,
+                    45.0 * ring_executor.direction,
+                    45.0 * ring_executor.direction,
+                    45.0 * ring_executor.direction,
+                    -67.5 * ring_executor.direction,
+                ]
+            )
+            summary["ring_leg_turn_delta_rad"] = (
+                None if ring_executor is None
+                else round(ring_executor.leg_turn_delta_rad, 4)
+            )
+            summary["ring_model_turn_sign"] = (
+                None if ring_executor is None else ring_executor.model_turn_sign
+            )
+            summary["ring_model_elapsed_sec"] = (
+                None if ring_executor is None
+                else round(ring_executor.model_elapsed_sec, 4)
+            )
+            summary["ring_model_aligned_rad"] = (
+                None if ring_executor is None
+                else round(ring_executor.model_aligned_rad, 4)
+            )
+            summary["ring_model_drive_v"] = (
                 None if ring_executor is None else round(ring_executor.arc_v, 4)
             )
-            summary["ring_arc_w"] = (
-                None if ring_executor is None else round(ring_executor.arc_w, 4)
+            summary["ring_model_align_w"] = (
+                None if ring_executor is None
+                else round(ring_executor.align_w, 4)
+            )
+            summary["ring_model_align_slow_w"] = (
+                None if ring_executor is None
+                else round(ring_executor.align_slow_w, 4)
+            )
+            summary["ring_gyro_wrong_way_sec"] = (
+                None if ring_executor is None
+                else round(ring_executor.wrong_way_elapsed_sec, 4)
+            )
+            summary["ring_fixed_radius_m"] = (
+                None if ring_executor is None
+                else round(ring_executor.fixed_radius_m, 4)
             )
             summary["ring_radius_estimate_m"] = (
                 None if ring_executor is None or ring_executor.radius_estimate_m is None
@@ -858,9 +981,6 @@ def run(args: argparse.Namespace) -> int:
             )
             summary["ring_radius_source"] = (
                 None if ring_executor is None else ring_executor.radius_source
-            )
-            summary["ring_radius_stable_windows"] = (
-                None if ring_executor is None else ring_executor.radius_stable_windows
             )
             summary["ring_route_control_active"] = bool(
                 ring_result is not None
@@ -877,6 +997,9 @@ def run(args: argparse.Namespace) -> int:
                 strategy_status=memory_status,
                 geometry_observation=geometry_observation,
                 geometry_debug=geometry_debug,
+                ring_circle_model=circle_model,
+                ring_route_fit=route_fit,
+                ring_state=None if ring_executor is None else ring_executor.state,
             )
             if now - last_log >= args.log_period:
                 print(json.dumps(summary, ensure_ascii=False))

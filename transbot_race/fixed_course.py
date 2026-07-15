@@ -277,30 +277,17 @@ class _RingEntryStage(_Stage):
                 cfg.path_memory.roundabout_margin_distance_m,
                 cfg.path_memory.roundabout_margin_enabled,
             ),
-            entry_search_w=cfg.path_memory.roundabout_entry_search_w,
-            entry_capture_frames=cfg.path_memory.roundabout_entry_capture_frames,
-            entry_search_max_angle_rad=(
-                cfg.path_memory.roundabout_entry_search_max_angle_rad
+            entry_left_turn_rad=np.deg2rad(
+                cfg.path_memory.roundabout_entry_left_turn_deg
             ),
-            entry_search_timeout_sec=(
-                cfg.path_memory.roundabout_entry_search_timeout_sec
-            ),
-            tangent_theta_tolerance=(
-                cfg.path_memory.roundabout_tangent_theta_tolerance
-            ),
+            align_w=cfg.path_memory.roundabout_align_w,
+            align_slow_w=cfg.path_memory.roundabout_align_slow_w,
+            align_slowdown_rad=cfg.path_memory.roundabout_align_slowdown_rad,
             arc_v=cfg.path_memory.roundabout_arc_v,
-            radius_initial_w=cfg.path_memory.roundabout_radius_initial_w,
-            radius_acquire_max_yaw_rad=(
-                cfg.path_memory.roundabout_radius_acquire_max_yaw_rad
+            fixed_radius_m=cfg.path_memory.roundabout_fixed_radius_m,
+            chord_distance_scale=(
+                cfg.path_memory.roundabout_chord_distance_scale
             ),
-            radius_acquire_timeout_sec=(
-                cfg.path_memory.roundabout_radius_acquire_timeout_sec
-            ),
-            radius_window_rad=cfg.path_memory.roundabout_radius_window_rad,
-            radius_stable_e=cfg.path_memory.roundabout_radius_stable_e,
-            radius_w_step=cfg.path_memory.roundabout_radius_w_step,
-            radius_confirm_windows=cfg.path_memory.roundabout_radius_confirm_windows,
-            radius_min_w=cfg.path_memory.roundabout_radius_min_w,
             half_arc_yaw_rad=cfg.path_memory.roundabout_half_arc_yaw_rad,
             half_arc_timeout_sec=cfg.path_memory.roundabout_half_arc_timeout_sec,
             exit_reacquire_frames=(
@@ -333,29 +320,45 @@ class _RingEntryStage(_Stage):
         return transfer
 
     def step(self, context: FixedCourseFrameContext) -> ComponentStep:
-        if not self.seeded and self.seed_fit is not None:
-            cruise_command = self.cruise.reacquire_from(self.seed_fit, context.now)
-            self.seeded = True
+        if self.executor.state == "waiting":
+            if not self.seeded and self.seed_fit is not None:
+                cruise_command = self.cruise.reacquire_from(self.seed_fit, context.now)
+                self.seeded = True
+            else:
+                cruise_command = self.cruise.step(context.visual_fit, context.now)
         else:
-            cruise_command = self.cruise.step(context.visual_fit, context.now)
-        observation, debug, fresh_geometry, geometry_age = self._geometry_sample(
-            context,
-            self.cfg.ring_entry_geometry,
-            route_direction=self.cfg.mission.ring_entry_direction,
-        )
-        decision = self.geometry_filter.update(observation) if fresh_geometry else None
-        accepted = self.mission.gate(
-            decision,
-            observation,
-            context.visual_fit,
-            entry_takeover_ready=self.cruise.can_take_ring_entry(context.visual_fit),
-        )
-        route_fit = selected_path_fit(
-            debug,
-            observation,
-            frame_center_x=context.frame_center_x,
-            control_width=context.control_width,
-        )
+            cruise_command = zero_command("ring_fixed_route_owner")
+
+        observation = None
+        debug = None
+        fresh_geometry = False
+        geometry_age = 0
+        decision = None
+        accepted = None
+        route_fit = None
+        # Vision is only a boundary concern: trigger fixed execution before it,
+        # then reacquire the straight exit after it. The fixed body runs with no
+        # geometry detector, path fitting, or competing cruise controller.
+        if self.executor.state in {"waiting", "exit_reacquire"}:
+            observation, debug, fresh_geometry, geometry_age = self._geometry_sample(
+                context,
+                self.cfg.ring_entry_geometry,
+                route_direction=self.cfg.mission.ring_entry_direction,
+            )
+            decision = self.geometry_filter.update(observation) if fresh_geometry else None
+            route_fit = selected_path_fit(
+                debug,
+                observation,
+                frame_center_x=context.frame_center_x,
+                control_width=context.control_width,
+            )
+            if self.executor.state == "waiting":
+                accepted = self.mission.gate(
+                    decision,
+                    observation,
+                    context.visual_fit,
+                    entry_takeover_ready=self.cruise.can_take_ring_entry(context.visual_fit),
+                )
         result = self.executor.step(
             observation,
             route_fit,
@@ -428,20 +431,31 @@ class _RingEntryStage(_Stage):
                 RaceState.TRACK,
                 None,
             ), CandidateProducer.RING_EXECUTOR
-        if self.executor.state == "tangent_align":
-            v, w = self.executor.tangent_align_command(
+        if self.executor.state in {"entry_left_align", "entry_left_stop"}:
+            v, w = self.executor.entry_left_command(
                 invert_turn=self.cfg.tracker.invert_turn,
             )
             return MotionCommand(
                 v, w, result.reason, RaceState.TRACK, None,
             ), CandidateProducer.RING_EXECUTOR
-        if self.executor.state in {"radius_acquire", "half_arc", "exit_reacquire"}:
-            v, w = self.executor.fixed_arc_command(
+        if self.executor.state in {
+            "leg1_model", "leg2_model", "leg3_model", "leg4_exit_bridge",
+        }:
+            v, w = self.executor.model_leg_command(
                 invert_turn=self.cfg.tracker.invert_turn,
             )
             return MotionCommand(
                 v, w, result.reason, RaceState.TRACK, None,
             ), CandidateProducer.RING_EXECUTOR
+        if self.executor.state in {"exit_line_align", "exit_line_stop"}:
+            v, w = self.executor.exit_line_command(
+                invert_turn=self.cfg.tracker.invert_turn,
+            )
+            return MotionCommand(
+                v, w, result.reason, RaceState.TRACK, None,
+            ), CandidateProducer.RING_EXECUTOR
+        if self.executor.state == "exit_reacquire":
+            return zero_command(result.reason), CandidateProducer.RING_EXECUTOR
         if self.executor.state == "exit_ready":
             return zero_command(result.reason), CandidateProducer.RING_EXECUTOR
         if result.fit is None:

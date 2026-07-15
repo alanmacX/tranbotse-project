@@ -8,6 +8,7 @@ from transbot_race.capture_geometry import (
     CaptureGeometryFilter,
     CaptureGeometryObservation,
     CornerGeometryFilter,
+    _significant_candidate_paths,
     analyze_capture_geometry,
 )
 from transbot_race.config import RaceConfig
@@ -26,6 +27,15 @@ def observation(kind, direction=0, angle=0.0, vertex=0.5):
 
 
 class CaptureGeometryFilterTests(unittest.TestCase):
+    def test_short_opposite_leaf_is_not_a_route_branch(self):
+        main = [(365, 220 - index) for index in range(220)]
+        spur = [(365 + index, 220) for index in range(24)]
+
+        significant = _significant_candidate_paths([(1, main), (-1, spur)])
+
+        self.assertEqual(len(significant), 1)
+        self.assertEqual(significant[0][0], 1)
+
     def test_corner_requires_consistent_direction(self):
         geometry_filter = CaptureGeometryFilter(confirm_frames=3)
         self.assertIsNone(geometry_filter.update(observation("corner", 1, math.pi / 2)))
@@ -82,11 +92,27 @@ class CaptureGeometryFilterTests(unittest.TestCase):
         self.assertIsNone(geometry_filter.update(turn))
         self.assertIsNotNone(geometry_filter.update(turn))
 
-    def test_corner_session_rejects_curve_observations(self):
+    def test_corner_session_counts_curve_and_corner_as_one_confidence_epoch(self):
         geometry_filter = CornerGeometryFilter(confirm_frames=3)
-        for angle in (28, 34, 40, 45):
+        self.assertIsNone(geometry_filter.update(
+            observation("curve", 1, math.radians(70))
+        ))
+        self.assertIsNone(geometry_filter.update(
+            observation("curve", 1, math.radians(80))
+        ))
+        decision = geometry_filter.update(
+            observation("corner", 1, math.radians(75))
+        )
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.kind, "corner")
+        self.assertEqual(decision.direction, 1)
+        self.assertEqual(decision.votes, 3)
+
+    def test_pure_curve_confidence_never_commits_corner(self):
+        geometry_filter = CornerGeometryFilter(confirm_frames=3)
+        for _ in range(5):
             decision = geometry_filter.update(
-                observation("curve", 1, math.radians(angle))
+                observation("curve", 1, math.radians(80))
             )
             self.assertIsNone(decision)
 

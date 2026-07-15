@@ -135,13 +135,13 @@ def read_motion_sample(bot: object, fallback_v: float, fallback_w: float) -> Mot
             if isinstance(value, (tuple, list)) and len(value) >= 2:
                 linear, angular = float(value[0]), float(value[1])
                 valid = math.isfinite(linear) and math.isfinite(angular) and abs(linear) <= 0.5 and abs(angular) <= 3.0
+                fresh = bool(len(value) >= 3 and value[2] is True)
                 stale_linear = abs(fallback_v) > 0.01 and abs(linear) < 0.002
                 stale_angular = abs(fallback_w) > 0.03 and abs(angular) < 0.005
-                if valid and not (stale_linear or stale_angular):
+                if valid and (fresh or not (stale_linear or stale_angular)):
                     # The installed Transbot API returns only (v, w), without a
                     # timestamp or sequence. Such a sample may still be a
                     # frozen old value, so it cannot certify physical stop.
-                    fresh = bool(len(value) >= 3 and value[2] is True)
                     return MotionSample(
                         linear,
                         angular,

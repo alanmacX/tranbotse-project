@@ -91,10 +91,14 @@ def _geometry_mask(
     cfg: RaceConfig,
     geometry_cfg: StageGeometryConfig,
 ) -> np.ndarray:
-    # Geometry keeps the strict reflection guard.  The anchor-scoped exemption
-    # is only for cruise crops, where the incoming track centre is known; a
-    # wider geometry ROI also contains walls and stage furniture.
-    primary = preprocess_blackline(roi, cfg.vision)
+    # Keep the strict reflection pixels, but allow a thick, long component
+    # crossing the calibrated incoming-track corridor to survive the *near*
+    # reflection rejection.  Without this scoped exemption, run
+    # 20260715-185248 deleted the entire real L bend when only 17--19% of it
+    # entered the dilated glare neighbourhood.  Stage furniture remains
+    # ineligible unless it reaches the incoming corridor with track thickness.
+    center_x = 0.5 * (float(cfg.camera.crop[0]) + float(cfg.camera.crop[2]))
+    primary = preprocess_blackline(roi, cfg.vision, anchor_x=center_x)
     # The expanded geometry ROI intentionally looks above the cruise crop, but
     # its very top contains the stage fascia / wall tiles rather than drivable
     # floor.  Those long dark seams can connect to the tape in perspective and
@@ -302,6 +306,33 @@ def _path_exit_direction(path: list[tuple[int, int]]) -> int:
     return 0 if abs(exit_dx) < 12.0 else (1 if exit_dx > 0.0 else -1)
 
 
+def _significant_candidate_paths(
+    candidates: list[tuple[int, list[tuple[int, int]]]],
+) -> list[tuple[int, list[tuple[int, int]]]]:
+    """Discard short skeleton leaf spurs before topology classification.
+
+    Threshold noise at the chassis trim produced a 17--27 pixel leaf beside a
+    205--282 pixel real path in run 20260715-185248. Counting that leaf as a
+    route created a synthetic opposite-direction fork. A real route branch
+    must have both a modest absolute extent and a useful fraction of the main
+    path. Preserve the longest candidate for short isolated components so
+    their existing area/onset quality checks still decide eligibility.
+    """
+
+    if not candidates:
+        return []
+    longest = max(len(path) for _direction, path in candidates)
+    min_length = max(40, int(math.ceil(0.20 * longest)))
+    significant = [
+        (direction, path)
+        for direction, path in candidates
+        if len(path) >= min_length
+    ]
+    if significant:
+        return significant
+    return [max(candidates, key=lambda item: len(item[1]))]
+
+
 def analyze_capture_geometry(
     frame: np.ndarray,
     cfg: RaceConfig,
@@ -345,10 +376,20 @@ def analyze_capture_geometry(
         if endpoints else None
     )
     paths = _endpoint_paths(skeleton, endpoint_anchor or anchor, endpoints) if anchor else []
-    candidate_directions = [(_path_exit_direction(candidate), candidate) for candidate in paths]
+    candidate_directions = _significant_candidate_paths([
+        (_path_exit_direction(candidate), candidate) for candidate in paths
+    ])
+    effective_endpoint_count = (
+        1 + len(candidate_directions) if endpoint_anchor is not None else len(endpoints)
+    )
+    effective_endpoints = (
+        tuple([endpoint_anchor] + [candidate[-1] for _direction, candidate in candidate_directions])
+        if endpoint_anchor is not None
+        else tuple(endpoints)
+    )
     available_directions = {direction for direction, _candidate in candidate_directions if direction}
     is_fork = bool(
-        3 <= len(endpoints) <= 4
+        3 <= effective_endpoint_count <= 4
         and {-1, 1}.issubset(available_directions)
     )
     selected_direction = (
@@ -379,25 +420,25 @@ def analyze_capture_geometry(
 
     area = int(cv.countNonZero(component))
     topology_sane = bool(
-        2 <= len(endpoints) <= 4
+        2 <= effective_endpoint_count <= 4
         and 600 <= area <= int(component.size * 0.08)
     )
     hole_ratio = _hole_ratio(component)
     curved_loop = bool(
-        len(endpoints) == 3
+        effective_endpoint_count == 3
         and absolute_curvature is not None
         and absolute_curvature >= math.radians(220)
         and concentration is not None
         and concentration <= 0.50
     )
     split_loop = bool(
-        len(endpoints) == 3
+        effective_endpoint_count == 3
         and any(abs(turn) >= math.radians(45) for turn in branch_turns)
         and curved_loop
     )
-    cycle = hole_ratio >= 0.012 and len(endpoints) <= 4
+    cycle = hole_ratio >= 0.012 and effective_endpoint_count <= 4
     sharp_corner = bool(
-        len(endpoints) == 2
+        effective_endpoint_count == 2
         and angle is not None
         and abs(angle) >= math.radians(30)
         and total_turn is not None
@@ -470,7 +511,7 @@ def analyze_capture_geometry(
         vertex_y_frac=vertex_y_frac,
         incoming_e=incoming_e,
         incoming_theta=incoming_theta,
-        endpoints=len(endpoints),
+        endpoints=effective_endpoint_count,
         component_area=area,
         is_fork=is_fork,
     )
@@ -482,7 +523,7 @@ def analyze_capture_geometry(
         path=tuple(path),
         candidate_paths=tuple(tuple(candidate) for _direction, candidate in candidate_directions),
         candidate_directions=tuple(direction for direction, _candidate in candidate_directions),
-        endpoints=tuple(endpoints),
+        endpoints=effective_endpoints,
         roi_y0=roi_y0,
     )
     return observation, debug
@@ -606,12 +647,22 @@ class CornerGeometryFilter(CaptureGeometryFilter):
         self.window.append(observation)
         if len(self.window) < self.confirm_frames:
             return None
-        return self._session_decision(
+        # Lighting can make one physical bend alternate between ``curve`` and
+        # ``corner``. Both shapes count as one continuous confidence epoch, but
+        # only an explicit current ``corner`` frame may commit motor ownership.
+        if (
+            observation.kind != "corner"
+            or observation.is_fork
+            or observation.direction == 0
+        ):
+            return None
+        candidates = self._trailing_candidates(
             observation,
-            event_kind="corner",
-            allowed_shapes={"corner"},
-            require_fork=False,
+            lambda item: item.kind in {"corner", "curve"} and not item.is_fork,
         )
+        if len(candidates) < self.confirm_frames:
+            return None
+        return self._decision("corner", candidates, direction=observation.direction)
 
 
 class RingEntryGeometryFilter(CaptureGeometryFilter):

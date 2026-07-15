@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 
 
 def coerce_bool(value: object) -> bool:
@@ -80,24 +81,18 @@ class PathMemoryConfig:
     # detected from a different image-space landmark.
     roundabout_margin_enabled: bool = True
     roundabout_margin_distance_m: float = 0.45
-    # The bounded entry-search state is a fixed right pivot that establishes
-    # the upward tangent before the opposite-side circle arc begins.
-    roundabout_entry_search_w: float = 0.08
-    roundabout_entry_capture_frames: int = 3
-    roundabout_entry_search_max_angle_rad: float = 0.75
-    roundabout_entry_search_timeout_sec: float = 12.0
-    roundabout_tangent_theta_tolerance: float = 0.20
+    # Signed physical yaw: positive turns left, negative turns right.
+    roundabout_entry_left_turn_deg: float = 45.0
+    # The ring body is four fixed equal turn/straight legs. Entry vision only
+    # triggers margin and never changes their runtime geometry.
+    roundabout_align_w: float = 0.20
+    roundabout_align_slow_w: float = 0.12
+    roundabout_align_slowdown_rad: float = 0.08726646259971647
     roundabout_arc_v: float = 0.020
-    roundabout_radius_initial_w: float = 0.08
-    roundabout_radius_acquire_max_yaw_rad: float = 0.75
-    roundabout_radius_acquire_timeout_sec: float = 12.0
-    roundabout_radius_window_rad: float = 0.15
-    roundabout_radius_stable_e: float = 0.08
-    roundabout_radius_w_step: float = 0.01
-    roundabout_radius_confirm_windows: int = 2
-    roundabout_radius_min_w: float = 0.05
+    roundabout_fixed_radius_m: float = 0.25
+    roundabout_chord_distance_scale: float = 2.0
     roundabout_half_arc_yaw_rad: float = 3.141592653589793
-    roundabout_half_arc_timeout_sec: float = 50.0
+    roundabout_half_arc_timeout_sec: float = 90.0
     roundabout_exit_reacquire_frames: int = 3
     roundabout_exit_reacquire_extra_rad: float = 0.35
     roundabout_replay_max_w: float = 0.20

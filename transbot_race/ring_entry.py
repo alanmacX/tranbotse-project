@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 import math
 
+import cv2 as cv
 import numpy as np
 
 from .capture_geometry import CaptureGeometryDebug, CaptureGeometryObservation
@@ -38,6 +39,168 @@ class RingStageTransfer:
     last_fit: TrajectoryFit | None
     missing_frames: int
     command_w: float
+
+
+@dataclass(frozen=True, slots=True)
+class RingCircleModel:
+    """Entry-time image-space ellipse used to register four straight chords."""
+
+    center: tuple[float, float]
+    axes: tuple[float, float]
+    angle_deg: float
+    support_points: int
+    branch_count: int = 0
+    median_residual_px: float = 0.0
+    p95_residual_px: float = 0.0
+    coverage_deg: float = 0.0
+    quality_score: float = 0.0
+    entry_phase_deg: float = 0.0
+    image_arc_sign: int = 1
+
+
+def circle_model_chord_points(model: RingCircleModel) -> tuple[tuple[float, float], ...]:
+    """Return the five fitted ellipse points bounding the four half-ring chords."""
+    cx, cy = model.center
+    short_radius, long_radius = (0.5 * model.axes[0], 0.5 * model.axes[1])
+    rotation = math.radians(model.angle_deg)
+    cosine, sine = math.cos(rotation), math.sin(rotation)
+    entry_phase = math.radians(model.entry_phase_deg)
+    points: list[tuple[float, float]] = []
+    for index in range(5):
+        phase = entry_phase + model.image_arc_sign * index * math.pi / 4.0
+        local_x = short_radius * math.cos(phase)
+        local_y = long_radius * math.sin(phase)
+        points.append((
+            cx + local_x * cosine - local_y * sine,
+            cy + local_x * sine + local_y * cosine,
+        ))
+    return tuple(points)
+
+
+def fit_entry_circle_model(
+    debug: CaptureGeometryDebug | None,
+    frame_shape: tuple[int, ...] | None = None,
+    route_direction: int = 1,
+) -> RingCircleModel | None:
+    if debug is None:
+        return None
+    branch_pairs = [
+        (direction, path)
+        for direction, path in zip(
+            debug.candidate_directions, debug.candidate_paths,
+        )
+        if len(path) >= 80
+    ]
+    branches = [path for _direction, path in branch_pairs]
+    if len(branches) < 2:
+        return None
+    # All candidates start on the incoming stem. Remove their common prefix so
+    # the line into the roundabout cannot pull the fitted centre/radius.
+    common = 0
+    common_limit = min(len(path) for path in branches)
+    while (
+        common < common_limit
+        and all(path[common] == branches[0][common] for path in branches[1:])
+    ):
+        common += 1
+    points = np.unique(np.asarray(
+        [point for path in branches for point in path[common:]],
+        dtype=np.float32,
+    ), axis=0)
+    if len(points) < 250:
+        return None
+    try:
+        (cx, cy), (axis_a, axis_b), angle = cv.fitEllipseDirect(
+            points.reshape(-1, 1, 2),
+        )
+    except cv.error:
+        return None
+    axis_a, axis_b = float(axis_a), float(axis_b)
+    if axis_a <= axis_b:
+        short_axis, long_axis = axis_a, axis_b
+    else:
+        short_axis, long_axis = axis_b, axis_a
+        angle = (float(angle) + 90.0) % 180.0
+    if short_axis <= 1e-6:
+        return None
+    axis_ratio = long_axis / short_axis
+    theta = math.radians(float(angle))
+    cosine, sine = math.cos(theta), math.sin(theta)
+    centered = points - np.asarray([cx, cy], dtype=np.float32)
+    local_x = centered[:, 0] * cosine + centered[:, 1] * sine
+    local_y = -centered[:, 0] * sine + centered[:, 1] * cosine
+    normalized_radius = np.sqrt(
+        (local_x / (0.5 * short_axis)) ** 2
+        + (local_y / (0.5 * long_axis)) ** 2
+    )
+    residuals = np.abs(normalized_radius - 1.0) * (0.5 * short_axis)
+    median_residual = float(np.median(residuals))
+    p95_residual = float(np.percentile(residuals, 95))
+    angles = np.sort(np.mod(np.arctan2(
+        local_y / (0.5 * long_axis),
+        local_x / (0.5 * short_axis),
+    ), 2.0 * math.pi))
+    gaps = np.diff(np.concatenate((angles, [angles[0] + 2.0 * math.pi])))
+    coverage_deg = math.degrees(2.0 * math.pi - float(np.max(gaps)))
+    if debug.roi is not None:
+        height, width = debug.roi.shape[:2]
+    elif frame_shape is not None and len(frame_shape) >= 2:
+        width = int(frame_shape[1])
+        height = max(1, int(frame_shape[0]) - 10 - int(debug.roi_y0))
+    else:
+        width = max(1, int(np.max(points[:, 0])) + 1)
+        height = max(1, int(np.max(points[:, 1])) + 1)
+    if (
+        short_axis < 85.0
+        or long_axis < 270.0
+        or not 1.7 <= axis_ratio <= 4.2
+        or median_residual > 3.0
+        or p95_residual > 8.0
+        or coverage_deg < 180.0
+        or not -0.15 * width <= cx <= 1.15 * width
+        or not -0.25 * height <= cy <= 0.85 * height
+    ):
+        return None
+    quality_score = (
+        short_axis * long_axis
+        * min(1.5, coverage_deg / 180.0)
+        / max(1.0, 1.0 + median_residual)
+    )
+    entry_point = np.asarray(
+        branches[0][max(0, common - 1)], dtype=np.float32,
+    )
+
+    def ellipse_phase(point: np.ndarray) -> float:
+        delta = point - np.asarray([cx, cy], dtype=np.float32)
+        phase_x = (
+            delta[0] * cosine + delta[1] * sine
+        ) / (0.5 * short_axis)
+        phase_y = (
+            -delta[0] * sine + delta[1] * cosine
+        ) / (0.5 * long_axis)
+        return math.atan2(float(phase_y), float(phase_x))
+
+    entry_phase = ellipse_phase(entry_point)
+    desired = 1 if int(route_direction) >= 0 else -1
+    selected_branch = next(
+        (path for direction, path in branch_pairs if direction == desired),
+        max(branches, key=len),
+    )
+    probe_index = min(len(selected_branch) - 1, common + 24)
+    probe_phase = ellipse_phase(np.asarray(
+        selected_branch[probe_index], dtype=np.float32,
+    ))
+    phase_delta = math.atan2(
+        math.sin(probe_phase - entry_phase),
+        math.cos(probe_phase - entry_phase),
+    )
+    image_arc_sign = 1 if phase_delta >= 0.0 else -1
+    return RingCircleModel(
+        (float(cx), float(cy)), (short_axis, long_axis),
+        float(angle), len(points), len(branches), median_residual,
+        p95_residual, coverage_deg, quality_score,
+        math.degrees(entry_phase) % 360.0, image_arc_sign,
+    )
 
 
 def effective_ring_margin_distance(margin_distance_m: float, enabled: bool) -> float:
@@ -101,7 +264,15 @@ def selected_path_fit(
 
 
 class RingEntryExecutor:
-    """Linear fixed-arc entry followed by visual circulation and exit."""
+    """Fixed four-leg ring traversal with one linear owner."""
+
+    _REFERENCE_ELLIPSE_AXES = (203.36, 394.51)
+    _MODEL_CONFIRM_FRAMES = 3
+    # The real IMU keeps roughly 0.015 rad/s of residual yaw after the chassis
+    # has stopped.  Keep the stop gate above that measured floor, while still
+    # rejecting visible rotation before advancing to the next linear state.
+    _STOP_LINEAR_RATE_MPS = 0.002
+    _STOP_ANGULAR_RATE_RAD_SEC = 0.025
 
     def __init__(
         self,
@@ -110,20 +281,13 @@ class RingEntryExecutor:
         inside_arm_distance_m: float = 0.18,
         exit_distance_m: float = 0.08,
         margin_distance_m: float = 0.0,
-        entry_search_w: float = 0.20,
-        entry_capture_frames: int = 1,
-        entry_search_max_angle_rad: float = 1.75,
-        entry_search_timeout_sec: float = 9.0,
-        tangent_theta_tolerance: float = 0.20,
+        entry_left_turn_rad: float = math.radians(45.0),
+        align_w: float = 0.20,
+        align_slow_w: float = 0.12,
+        align_slowdown_rad: float = math.radians(5.0),
         arc_v: float = 0.020,
-        radius_initial_w: float | None = None,
-        radius_acquire_max_yaw_rad: float = 0.75,
-        radius_acquire_timeout_sec: float = 12.0,
-        radius_window_rad: float = 0.15,
-        radius_stable_e: float = 0.08,
-        radius_w_step: float = 0.01,
-        radius_confirm_windows: int = 2,
-        radius_min_w: float = 0.05,
+        fixed_radius_m: float | None = None,
+        chord_distance_scale: float = 2.0,
         half_arc_yaw_rad: float = math.pi,
         half_arc_timeout_sec: float = 50.0,
         exit_reacquire_frames: int = 3,
@@ -135,30 +299,18 @@ class RingEntryExecutor:
         self.inside_arm_distance_m = max(0.0, float(inside_arm_distance_m))
         self.exit_distance_m = max(0.0, float(exit_distance_m))
         self.margin_distance_m = max(0.0, float(margin_distance_m))
-        self.entry_search_w = abs(float(entry_search_w))
-        self.entry_capture_frames_required = max(1, int(entry_capture_frames))
-        self.entry_search_max_angle_rad = max(
-            0.0, float(entry_search_max_angle_rad),
-        )
-        self.entry_search_timeout_sec = max(
-            0.0, float(entry_search_timeout_sec),
-        )
-        self.tangent_theta_tolerance = max(0.0, float(tangent_theta_tolerance))
+        self.entry_left_turn_rad = float(entry_left_turn_rad)
+        self.align_w = abs(float(align_w))
+        self.align_slow_w = min(self.align_w, abs(float(align_slow_w)))
+        self.align_slowdown_rad = max(0.0, float(align_slowdown_rad))
         self.arc_v = max(0.0, float(arc_v))
-        self.radius_initial_w = abs(float(
-            self.entry_search_w if radius_initial_w is None else radius_initial_w
-        ))
-        self.radius_acquire_max_yaw_rad = max(
-            0.0, float(radius_acquire_max_yaw_rad),
+        self.fixed_radius_m = max(
+            0.01,
+            float(fixed_radius_m)
+            if fixed_radius_m is not None
+            else self.arc_v / max(self.align_w, 1e-4),
         )
-        self.radius_acquire_timeout_sec = max(
-            0.0, float(radius_acquire_timeout_sec),
-        )
-        self.radius_window_rad = max(0.01, float(radius_window_rad))
-        self.radius_stable_e = max(0.0, float(radius_stable_e))
-        self.radius_w_step = max(0.0, float(radius_w_step))
-        self.radius_confirm_windows_required = max(1, int(radius_confirm_windows))
-        self.radius_min_w = max(0.01, abs(float(radius_min_w)))
+        self.chord_distance_scale = max(0.05, float(chord_distance_scale))
         self.half_arc_yaw_rad = max(0.1, float(half_arc_yaw_rad))
         self.half_arc_timeout_sec = max(0.1, float(half_arc_timeout_sec))
         self.exit_reacquire_frames_required = max(1, int(exit_reacquire_frames))
@@ -181,21 +333,26 @@ class RingEntryExecutor:
         self.missing_frames = 0
         self.entry_candidate_fit: TrajectoryFit | None = None
         self.entry_candidate_frames = 0
-        self.tangent_yaw_rad = 0.0
-        self.tangent_elapsed_sec = 0.0
-        self.tangent_candidate_frames = 0
-        self.radius_acquire_yaw_rad = 0.0
-        self.arc_elapsed_sec = 0.0
-        self.arc_w = self.radius_initial_w
-        self.arc_turned_rad = 0.0
-        self.radius_window_yaw_rad = 0.0
-        self.radius_window_distance_m = 0.0
-        self.radius_window_e_sum = 0.0
-        self.radius_window_e_frames = 0
-        self.radius_previous_e: float | None = None
-        self.radius_stable_windows = 0
+        self.circle_model: RingCircleModel | None = None
+        self.circle_model_candidate: RingCircleModel | None = None
+        self.circle_model_candidate_frames = 0
+        self.leg_index = 0
+        self.leg_phase = "idle"
+        self.leg_yaw_rad = 0.0
+        self.leg_distance_m = 0.0
+        self.leg_chord_length_m = 0.0
+        self.leg_turn_deltas_rad: tuple[float, ...] = ()
+        self.leg_turn_delta_rad = 0.0
+        self.settled_frames = 0
+        self.model_turn_sign = 0
+        self.command_turn_sign = 0
+        self.wrong_way_elapsed_sec = 0.0
+        self.entry_left_yaw_rad = 0.0
+        self.entry_left_command_sign = 0
+        self.model_elapsed_sec = 0.0
+        self.model_aligned_rad = 0.0
         self.radius_estimate_m: float | None = None
-        self.radius_source = "command_proxy"
+        self.radius_source = "configured_fixed"
         self.failure_reason = "ring_entry_search_path_lost"
 
     def reset(self) -> None:
@@ -208,21 +365,26 @@ class RingEntryExecutor:
         self.margin_w = 0.0
         self.entry_candidate_fit = None
         self.entry_candidate_frames = 0
-        self.tangent_yaw_rad = 0.0
-        self.tangent_elapsed_sec = 0.0
-        self.tangent_candidate_frames = 0
-        self.radius_acquire_yaw_rad = 0.0
-        self.arc_elapsed_sec = 0.0
-        self.arc_w = self.radius_initial_w
-        self.arc_turned_rad = 0.0
-        self.radius_window_yaw_rad = 0.0
-        self.radius_window_distance_m = 0.0
-        self.radius_window_e_sum = 0.0
-        self.radius_window_e_frames = 0
-        self.radius_previous_e = None
-        self.radius_stable_windows = 0
+        self.circle_model = None
+        self.circle_model_candidate = None
+        self.circle_model_candidate_frames = 0
+        self.leg_index = 0
+        self.leg_phase = "idle"
+        self.leg_yaw_rad = 0.0
+        self.leg_distance_m = 0.0
+        self.leg_chord_length_m = 0.0
+        self.leg_turn_deltas_rad = ()
+        self.leg_turn_delta_rad = 0.0
+        self.settled_frames = 0
+        self.model_turn_sign = 0
+        self.command_turn_sign = 0
+        self.wrong_way_elapsed_sec = 0.0
+        self.entry_left_yaw_rad = 0.0
+        self.entry_left_command_sign = 0
+        self.model_elapsed_sec = 0.0
+        self.model_aligned_rad = 0.0
         self.radius_estimate_m = None
-        self.radius_source = "command_proxy"
+        self.radius_source = "configured_fixed"
         self.failure_reason = "ring_entry_search_path_lost"
         self.last_now = None
         self._reset_route_control()
@@ -236,13 +398,15 @@ class RingEntryExecutor:
         self.last_fit = None
         self.missing_frames = 0
 
+    @classmethod
+    def _is_chassis_settled(cls, linear: float, angular: float) -> bool:
+        return bool(
+            abs(float(linear)) < cls._STOP_LINEAR_RATE_MPS
+            and abs(float(angular)) < cls._STOP_ANGULAR_RATE_RAD_SEC
+        )
+
     def set_direction(self, direction: int) -> None:
         self.direction = 1 if direction >= 0 else -1
-
-    @property
-    def arc_direction(self) -> int:
-        """The circle bends opposite the entry pivot around the tangent point."""
-        return -self.direction
 
     def clear_route_loss(self) -> bool:
         if self.state not in {"inside", "exiting"}:
@@ -369,50 +533,110 @@ class RingEntryExecutor:
         self.entry_candidate_frames = self.entry_candidate_frames + 1 if continuous else 1
         self.entry_candidate_fit = route_fit
 
-    def fixed_arc_command(self, *, invert_turn: bool = False) -> tuple[float, float]:
-        """Drive forward along the circle, opposite the entry-pivot side."""
-        image_to_motor_sign = 1.0 if invert_turn else -1.0
-        return (
-            self.arc_v,
-            image_to_motor_sign * self.arc_direction * self.arc_w,
+    def model_leg_command(self, *, invert_turn: bool = False) -> tuple[float, float]:
+        """Execute exactly one owner action using gyro-closed-loop phases."""
+        if self.leg_phase == "align":
+            sign = -self.model_turn_sign if invert_turn else self.model_turn_sign
+            self.command_turn_sign = sign
+            remaining = max(0.0, self.leg_target_yaw_rad - self.leg_yaw_rad)
+            speed = (
+                self.align_slow_w
+                if remaining <= self.align_slowdown_rad else self.align_w
+            )
+            return 0.0, sign * speed
+        if self.leg_phase == "drive":
+            return self.arc_v, 0.0
+        return 0.0, 0.0
+
+    def exit_line_command(self, *, invert_turn: bool = False) -> tuple[float, float]:
+        """Final fixed tangent alignment after the fourth equal chord."""
+        if self.state != "exit_line_align":
+            return 0.0, 0.0
+        sign = -self.model_turn_sign if invert_turn else self.model_turn_sign
+        self.command_turn_sign = sign
+        remaining = max(0.0, abs(self.leg_turn_delta_rad) - self.leg_yaw_rad)
+        speed = self.align_slow_w if remaining <= self.align_slowdown_rad else self.align_w
+        return 0.0, sign * speed
+
+    def entry_left_command(self, *, invert_turn: bool = False) -> tuple[float, float]:
+        """Signed margin handoff: positive is left and negative is right."""
+        if self.state != "entry_left_align":
+            return 0.0, 0.0
+        physical_sign = 1 if self.entry_left_turn_rad >= 0.0 else -1
+        self.entry_left_command_sign = -physical_sign if invert_turn else physical_sign
+        remaining = max(
+            0.0,
+            abs(self.entry_left_turn_rad) - abs(self.entry_left_yaw_rad),
         )
+        if abs(self.entry_left_turn_rad) <= 1e-6:
+            return 0.0, 0.0
+        speed = self.align_slow_w if remaining <= self.align_slowdown_rad else self.align_w
+        return 0.0, self.entry_left_command_sign * speed
 
-    def tangent_align_command(
-        self, *, invert_turn: bool = False,
-    ) -> tuple[float, float]:
-        """Pivot toward the requested entry side without translating."""
-        image_to_motor_sign = 1.0 if invert_turn else -1.0
-        return 0.0, image_to_motor_sign * self.direction * self.entry_search_w
+    @property
+    def leg_target_yaw_rad(self) -> float:
+        return abs(self.leg_turn_delta_rad)
 
-    def _observe_tangent_candidate(
-        self, route_fit: TrajectoryFit | None, *, fresh_geometry: bool,
-    ) -> None:
-        aligned = bool(
-            fresh_geometry
-            and route_fit is not None
-            and route_fit.control_valid
-            and route_fit.conf >= 0.55
-            and abs(route_fit.theta) <= self.tangent_theta_tolerance
+    def _begin_model_leg(self, index: int) -> None:
+        states = (
+            "leg1_model", "leg2_model", "leg3_model", "leg4_exit_bridge",
         )
-        self.tangent_candidate_frames = (
-            self.tangent_candidate_frames + 1 if aligned else 0
+        self.leg_index = index
+        self.state = states[index - 1]
+        self.leg_phase = "align"
+        self.leg_yaw_rad = 0.0
+        self.leg_distance_m = 0.0
+        self.leg_turn_delta_rad = self.leg_turn_deltas_rad[index - 1]
+        self.model_turn_sign = 1 if self.leg_turn_delta_rad >= 0.0 else -1
+        self.command_turn_sign = 0
+        self.wrong_way_elapsed_sec = 0.0
+        self.settled_frames = 0
+
+    def _configure_fixed_chords(self) -> None:
+        """Generate four immutable equal legs without visual geometry."""
+        arc_segment_angle = math.pi / 4.0
+        chord_half_angle = arc_segment_angle / 2.0
+        endpoint_alignment_angle = 3.0 * math.pi / 8.0
+        # Route direction +1 means right, while positive physical yaw is left.
+        # The configurable post-margin correction establishes the local radial
+        # heading and is deliberately outside this model.  The fixed polygon is
+        # self-contained: turn 67.5 degrees onto the first chord, advance around
+        # the selected half with three 45-degree turns, then turn 67.5 degrees
+        # back to the same local radial heading at the exit.  The left route is
+        # the exact mirror of the right route.
+        first_chord_sign = -self.direction
+        circle_progress_sign = self.direction
+        self.leg_turn_deltas_rad = (
+            first_chord_sign * endpoint_alignment_angle,
+            circle_progress_sign * arc_segment_angle,
+            circle_progress_sign * arc_segment_angle,
+            circle_progress_sign * arc_segment_angle,
         )
+        self.radius_estimate_m = self.fixed_radius_m
+        self.radius_source = "configured_fixed_four_leg"
+        base_chord = 2.0 * self.radius_estimate_m * math.sin(chord_half_angle)
+        self.leg_chord_length_m = base_chord * self.chord_distance_scale
 
-    def _reset_radius_window(self) -> None:
-        self.radius_window_yaw_rad = 0.0
-        self.radius_window_distance_m = 0.0
-        self.radius_window_e_sum = 0.0
-        self.radius_window_e_frames = 0
+    def _begin_exit_line_align(self) -> None:
+        self.state = "exit_line_align"
+        self.leg_phase = "idle"
+        self.leg_yaw_rad = 0.0
+        # The fourth chord ends 67.5 degrees away from the vertical exit line.
+        self.leg_turn_delta_rad = -self.direction * (3.0 * math.pi / 8.0)
+        self.model_turn_sign = 1 if self.leg_turn_delta_rad >= 0.0 else -1
+        self.command_turn_sign = 0
+        self.wrong_way_elapsed_sec = 0.0
+        self.settled_frames = 0
 
-    def _observe_radius_anchor(
-        self, route_fit: TrajectoryFit | None, *, fresh_geometry: bool,
-    ) -> None:
-        if not fresh_geometry or route_fit is None:
+    def _apply_circle_model_radius(self) -> None:
+        if self.circle_model is None:
             return
-        if not route_fit.control_valid or route_fit.conf < 0.55 or abs(route_fit.e0) > 0.90:
-            return
-        self.radius_window_e_sum += route_fit.e0
-        self.radius_window_e_frames += 1
+        reference_area = math.prod(self._REFERENCE_ELLIPSE_AXES)
+        observed_area = math.prod(self.circle_model.axes)
+        scale = math.sqrt(max(1e-6, observed_area / reference_area))
+        scale = float(np.clip(scale, 0.60, 1.60))
+        self.radius_estimate_m = self.fixed_radius_m * scale
+        self.radius_source = "entry_ellipse_four_leg"
 
     def step(
         self,
@@ -427,12 +651,11 @@ class RingEntryExecutor:
         cruise_fit: TrajectoryFit | None = None,
         incoming_v: float = 0.0,
         fresh_geometry: bool = True,
+        circle_model: RingCircleModel | None = None,
     ) -> RingEntryResult:
         dt = 0.0 if self.last_now is None else max(0.0, min(1.0, now - self.last_now))
         self.last_now = now
         forward_travelled = max(0.0, float(linear)) * dt
-        arc_travelled = abs(float(linear)) * dt
-        rotated = abs(float(angular)) * dt
         started = False
         margin_started = False
         if self.state == "completed":
@@ -469,143 +692,201 @@ class RingEntryExecutor:
                 return RingEntryResult(
                     None, "ring_entry_waiting_margin", started, False,
                 )
-            self.state = "tangent_align"
+            self.state = "entry_left_align"
             self.travelled_m = 0.0
             self.clear_frames = 0
             self.entry_candidate_fit = None
             self.entry_candidate_frames = 0
-            self.tangent_yaw_rad = 0.0
-            self.tangent_elapsed_sec = 0.0
-            self.tangent_candidate_frames = 0
-            self.radius_acquire_yaw_rad = 0.0
-            self.arc_elapsed_sec = 0.0
-            self.arc_w = self.radius_initial_w
-            self.arc_turned_rad = 0.0
-            self.radius_previous_e = None
-            self.radius_stable_windows = 0
-            self.radius_estimate_m = None
-            self._reset_radius_window()
+            self.model_elapsed_sec = 0.0
+            self.model_aligned_rad = 0.0
+            self.entry_left_yaw_rad = 0.0
+            self.entry_left_command_sign = 0
+            self.settled_frames = 0
+            self.wrong_way_elapsed_sec = 0.0
+            # Generate all four legs here. No detected ellipse, path, or image
+            # direction is allowed to modify this fixed runtime route.
+            self._configure_fixed_chords()
             self._reset_route_control()
             return RingEntryResult(
-                None, "ring_entry_tangent_aligning", started, False,
+                None, "ring_entry_left_align", started, False,
             )
 
-        if self.state == "tangent_align":
-            self.tangent_yaw_rad += rotated
-            self.tangent_elapsed_sec += dt
-            self._observe_tangent_candidate(
-                route_fit, fresh_geometry=fresh_geometry,
-            )
-            if self.tangent_candidate_frames >= self.entry_capture_frames_required:
-                self.state = "radius_acquire"
-                # The right pivot establishes the tangent only. The geometric
-                # half-circle starts from zero with the forward-left arc.
-                self.radius_acquire_yaw_rad = 0.0
-                self.arc_elapsed_sec = 0.0
-                self.arc_turned_rad = 0.0
-                self.arc_w = self.radius_initial_w
-                self.radius_previous_e = None
-                self.radius_stable_windows = 0
-                self.radius_estimate_m = None
-                self._reset_radius_window()
-                self._reset_route_control()
-                return RingEntryResult(
-                    None, "ring_entry_radius_acquiring", started, False,
-                )
-            if (
-                self.tangent_yaw_rad >= self.entry_search_max_angle_rad
-                or self.tangent_elapsed_sec >= self.entry_search_timeout_sec
-            ):
+        if self.state in {"entry_left_align", "entry_left_stop"}:
+            if motion_source != "measured":
                 self.state = "failed"
-                self.failure_reason = "ring_entry_tangent_align_timeout"
+                self.failure_reason = "ring_gyro_feedback_lost"
                 return RingEntryResult(
                     None, self.failure_reason, started, False,
                     RingPhaseEvent.ROUTE_LOST,
                 )
-            return RingEntryResult(
-                None, "ring_entry_tangent_aligning", started, False,
-            )
-
-        if self.state == "radius_acquire":
-            self.radius_acquire_yaw_rad += rotated
-            self.arc_elapsed_sec += dt
-            self.arc_turned_rad += rotated
-            self.radius_window_yaw_rad += rotated
-            self.radius_window_distance_m += arc_travelled
-            self._observe_radius_anchor(route_fit, fresh_geometry=fresh_geometry)
-            timed_out = bool(
-                self.radius_acquire_yaw_rad >= self.radius_acquire_max_yaw_rad
-                or self.arc_elapsed_sec >= self.radius_acquire_timeout_sec
-            )
-            if timed_out:
+            self.model_elapsed_sec += dt
+            if self.model_elapsed_sec >= self.half_arc_timeout_sec:
                 self.state = "failed"
-                self.failure_reason = "ring_entry_radius_acquire_timeout"
+                self.failure_reason = "ring_entry_left_turn_timeout"
                 return RingEntryResult(
                     None, self.failure_reason, started, False,
                     RingPhaseEvent.ROUTE_LOST,
                 )
-            if self.radius_window_yaw_rad >= self.radius_window_rad:
-                enough_path = self.radius_window_e_frames >= 2
-                mean_e = (
-                    self.radius_window_e_sum / self.radius_window_e_frames
-                    if enough_path else None
-                )
-                stable = bool(
-                    mean_e is not None
-                    and self.radius_previous_e is not None
-                    and abs(mean_e - self.radius_previous_e) <= self.radius_stable_e
-                )
-                self.radius_stable_windows = self.radius_stable_windows + 1 if stable else 0
-                if mean_e is not None and self.radius_previous_e is not None and not stable:
-                    drift = self.arc_direction * (mean_e - self.radius_previous_e)
-                    if abs(drift) > self.radius_stable_e:
-                        self.arc_w += math.copysign(self.radius_w_step, drift)
-                        self.arc_w = float(np.clip(
-                            self.arc_w, self.radius_min_w, self.radius_initial_w * 2.0,
-                        ))
-                if mean_e is not None:
-                    self.radius_previous_e = mean_e
-                if self.radius_window_yaw_rad > 1e-4 and self.radius_window_distance_m > 0.0:
-                    self.radius_estimate_m = (
-                        self.radius_window_distance_m / self.radius_window_yaw_rad
-                    )
+            if self.state == "entry_left_align":
+                physical_sign = 1 if self.entry_left_turn_rad >= 0.0 else -1
+                directed_rate = float(angular) * physical_sign
+                if directed_rate < -0.02:
+                    self.wrong_way_elapsed_sec += dt
+                    if self.wrong_way_elapsed_sec >= 0.35:
+                        self.state = "failed"
+                        self.failure_reason = "ring_gyro_wrong_direction"
+                        return RingEntryResult(
+                            None, self.failure_reason, started, False,
+                            RingPhaseEvent.ROUTE_LOST,
+                        )
                 else:
-                    self.radius_estimate_m = self.arc_v / max(self.arc_w, 1e-4)
-                self.radius_source = (
-                    str(motion_source)
-                    if motion_source != "command_fallback" else "command_proxy"
-                )
-                self._reset_radius_window()
-            if self.radius_stable_windows >= self.radius_confirm_windows_required:
-                self.state = "half_arc"
-                # Radius acquisition is the first portion of this same circle;
-                # retain its yaw so the total tangent-to-exit arc is exactly pi.
-                return RingEntryResult(
-                    None, "ring_entry_radius_locked", started,
-                )
-            return RingEntryResult(
-                None, "ring_entry_radius_acquiring", started, False,
-            )
+                    self.wrong_way_elapsed_sec = 0.0
+                rotated = max(0.0, directed_rate) * dt
+                self.entry_left_yaw_rad += physical_sign * rotated
+                if abs(self.entry_left_yaw_rad) >= abs(self.entry_left_turn_rad):
+                    self.state = "entry_left_stop"
+                    self.settled_frames = 0
+                    return RingEntryResult(None, "ring_entry_left_stop", started)
+                return RingEntryResult(None, "ring_entry_left_align", started)
 
-        if self.state == "half_arc":
-            self.arc_turned_rad += rotated
-            self.arc_elapsed_sec += dt
-            if self.arc_elapsed_sec >= self.half_arc_timeout_sec:
+            stationary = self._is_chassis_settled(linear, angular)
+            self.settled_frames = self.settled_frames + 1 if stationary else 0
+            if self.settled_frames >= 2:
+                # The mandatory entry turn is a separate state.  Its time and
+                # yaw must not alter the fixed four-leg route that follows.
+                self.model_elapsed_sec = 0.0
+                self.model_aligned_rad = 0.0
+                self._begin_model_leg(1)
+                return RingEntryResult(None, "ring_leg1_align", started)
+            return RingEntryResult(None, "ring_entry_left_stop", started)
+
+        if self.state in {
+            "leg1_model", "leg2_model", "leg3_model", "leg4_exit_bridge",
+        }:
+            if motion_source != "measured":
+                self.state = "failed"
+                self.failure_reason = "ring_gyro_feedback_lost"
+                return RingEntryResult(
+                    None, self.failure_reason, started, False,
+                    RingPhaseEvent.ROUTE_LOST,
+                )
+            self.model_elapsed_sec += dt
+            if self.model_elapsed_sec >= self.half_arc_timeout_sec:
                 self.state = "failed"
                 self.failure_reason = "ring_half_arc_timeout"
                 return RingEntryResult(
                     None, self.failure_reason, started, False,
                     RingPhaseEvent.ROUTE_LOST,
                 )
-            if self.arc_turned_rad >= self.half_arc_yaw_rad:
+            reason_root = {
+                "leg1_model": "ring_leg1",
+                "leg2_model": "ring_leg2",
+                "leg3_model": "ring_leg3",
+                "leg4_exit_bridge": "ring_leg4_exit_bridge",
+            }[self.state]
+            if self.leg_phase == "align":
+                directed_rate = float(angular) * self.model_turn_sign
+                if self.command_turn_sign and directed_rate < -0.02:
+                    self.wrong_way_elapsed_sec += dt
+                    if self.wrong_way_elapsed_sec >= 0.35:
+                        self.state = "failed"
+                        self.failure_reason = "ring_gyro_wrong_direction"
+                        return RingEntryResult(
+                            None, self.failure_reason, started, False,
+                            RingPhaseEvent.ROUTE_LOST,
+                        )
+                else:
+                    self.wrong_way_elapsed_sec = 0.0
+                rotated = max(0.0, directed_rate) * dt
+                self.leg_yaw_rad += rotated
+                self.model_aligned_rad += rotated
+                if self.leg_yaw_rad >= self.leg_target_yaw_rad:
+                    self.leg_phase = "align_stop"
+                    self.settled_frames = 0
+                    self.leg_distance_m = 0.0
+                    return RingEntryResult(None, f"{reason_root}_align_stop", started)
+                return RingEntryResult(None, f"{reason_root}_align", started)
+
+            if self.leg_phase == "align_stop":
+                stationary = self._is_chassis_settled(linear, angular)
+                self.settled_frames = self.settled_frames + 1 if stationary else 0
+                if self.settled_frames >= 2:
+                    self.leg_phase = "drive"
+                    self.settled_frames = 0
+                    return RingEntryResult(None, f"{reason_root}_straight", started)
+                return RingEntryResult(None, f"{reason_root}_align_stop", started)
+
+            if self.leg_phase == "drive":
+                self.leg_distance_m += forward_travelled
+                if self.leg_distance_m < self.leg_chord_length_m:
+                    return RingEntryResult(None, f"{reason_root}_straight", started)
+                self.leg_phase = "drive_stop"
+                self.settled_frames = 0
+                return RingEntryResult(None, f"{reason_root}_straight_stop", started)
+
+            stationary = self._is_chassis_settled(linear, angular)
+            self.settled_frames = self.settled_frames + 1 if stationary else 0
+            if self.settled_frames >= 2:
+                if self.leg_index < 4:
+                    self._begin_model_leg(self.leg_index + 1)
+                    next_root = (
+                        f"ring_leg{self.leg_index}"
+                        if self.leg_index < 4 else "ring_leg4_exit_bridge"
+                    )
+                    return RingEntryResult(None, f"{next_root}_align", started)
+                self._begin_exit_line_align()
+                return RingEntryResult(None, "ring_exit_line_align", started)
+            return RingEntryResult(None, f"{reason_root}_straight_stop", started)
+
+        if self.state in {"exit_line_align", "exit_line_stop"}:
+            if motion_source != "measured":
+                self.state = "failed"
+                self.failure_reason = "ring_gyro_feedback_lost"
+                return RingEntryResult(
+                    None, self.failure_reason, started, False,
+                    RingPhaseEvent.ROUTE_LOST,
+                )
+            self.model_elapsed_sec += dt
+            if self.model_elapsed_sec >= self.half_arc_timeout_sec:
+                self.state = "failed"
+                self.failure_reason = "ring_exit_line_align_timeout"
+                return RingEntryResult(
+                    None, self.failure_reason, started, False,
+                    RingPhaseEvent.ROUTE_LOST,
+                )
+            if self.state == "exit_line_align":
+                directed_rate = float(angular) * self.model_turn_sign
+                if self.command_turn_sign and directed_rate < -0.02:
+                    self.wrong_way_elapsed_sec += dt
+                    if self.wrong_way_elapsed_sec >= 0.35:
+                        self.state = "failed"
+                        self.failure_reason = "ring_gyro_wrong_direction"
+                        return RingEntryResult(
+                            None, self.failure_reason, started, False,
+                            RingPhaseEvent.ROUTE_LOST,
+                        )
+                else:
+                    self.wrong_way_elapsed_sec = 0.0
+                rotated = max(0.0, directed_rate) * dt
+                self.leg_yaw_rad += rotated
+                self.model_aligned_rad += rotated
+                if self.leg_yaw_rad >= abs(self.leg_turn_delta_rad):
+                    self.state = "exit_line_stop"
+                    self.settled_frames = 0
+                    return RingEntryResult(None, "ring_exit_line_stop", started)
+                return RingEntryResult(None, "ring_exit_line_align", started)
+
+            stationary = self._is_chassis_settled(linear, angular)
+            self.settled_frames = self.settled_frames + 1 if stationary else 0
+            if self.settled_frames >= 2:
                 self.state = "exit_reacquire"
                 self.entry_candidate_fit = None
                 self.entry_candidate_frames = 0
                 return RingEntryResult(None, "ring_exit_reacquiring", started)
-            return RingEntryResult(None, "ring_half_arc_running", started)
+            return RingEntryResult(None, "ring_exit_line_stop", started)
 
         if self.state == "exit_reacquire":
-            self.arc_turned_rad += rotated
+            self.model_elapsed_sec += dt
             self._observe_entry_candidate(
                 observation, route_fit, fresh_geometry=fresh_geometry,
             )
@@ -622,7 +903,7 @@ class RingEntryExecutor:
                     True,
                     RingPhaseEvent.ENTRY_ESTABLISHED,
                 )
-            if self.arc_turned_rad >= self.half_arc_yaw_rad + self.exit_reacquire_extra_rad:
+            if self.model_elapsed_sec >= self.half_arc_timeout_sec:
                 self.state = "failed"
                 self.failure_reason = "ring_half_arc_exit_path_lost"
                 return RingEntryResult(

@@ -73,6 +73,9 @@ class MotorGateway:
                 if stop_delay > 0.0:
                     time.sleep(stop_delay)
         finally:
+            close_feedback = getattr(self._bot, "close_feedback", None)
+            if callable(close_feedback):
+                close_feedback()
             self._held = False
             fcntl.flock(self._lease.fileno(), fcntl.LOCK_UN)
             self._lease.close()
